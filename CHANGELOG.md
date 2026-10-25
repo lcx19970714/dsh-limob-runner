@@ -1,0 +1,27 @@
+# Changelog
+
+## 0.2.0
+
+### Added
+
+- GitHub Releases 更新检查：
+  - dock 按钮旁出现「可更新 vX.Y.Z」小提示（有新版时）；
+  - 菜单底部新增「检查更新」，可手动检查（忽略 6 小时缓存）；
+  - DSH「插件」页面新增本插件的更新说明区（当前版本 / 最新版本 / 升级命令 / 发布页）；
+  - 更新说明区通过 DSH 插件管理页声明的 `plugins.detail.badge`、`plugins.detail.section` slots 注册，无需改 DSH 源码。
+- 离线冒烟测试 `scripts/smoke.mjs`（含版本比较与更新检查的 mock 测试）与 GitHub Actions CI。
+
+### Changed
+
+- 含中文的 `pnpm 客户端-调试` / `pnpm 构建桌面端` 改为两段式写入：先单独写 `chcp 65001 | Out-Null`，等 Host 确认后再写命令，修复 Windows PowerShell 5.1 中文乱码。
+- 重复点击同一任务时，复用判定增加「固定 id / 终端标题」兜底，减少 localStorage 丢失时的重复启动。
+- 插件注册失败只写日志，避免影响 DSH 正常聊天。
+
+### Packaging
+
+- `package.json` 补齐 GitHub 仓库、License、keywords 等发布元数据。
+- 增加 MIT 许可证、README、CHANGELOG、`.github/workflows`。
+
+## 0.1.0
+
+- 初版：对话输入框 dock 的「运行 Limob」菜单、4 个固定白名单任务、通过 DSH 内置终端执行、停止与复用。

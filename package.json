@@ -1,0 +1,55 @@
+{
+  "name": "dsh-limob-runner",
+  "version": "0.2.0",
+  "private": false,
+  "description": "DSH 客户端插件：在对话输入框 dock 增加「运行 Limob」菜单，通过 DSH 自带终端（remote.terminal + 右侧栏终端页签）执行固定白名单命令，并检查 GitHub 新版本。",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "harness:check": "node --check index.js && node --check client.js && node scripts/smoke.mjs"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "terminal",
+    "run-button",
+    "limob"
+  ],
+  "author": "lcx19970714",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lcx19970714/dsh-limob-runner.git"
+  },
+  "homepage": "https://github.com/lcx19970714/dsh-limob-runner",
+  "bugs": {
+    "url": "https://github.com/lcx19970714/dsh-limob-runner/issues"
+  },
+  "engines": {
+    "node": ">=22",
+    "dsh": ">=0.2.1-0 <0.3.0-0"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "immediately": true
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
