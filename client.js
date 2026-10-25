@@ -102,7 +102,7 @@ window.__ModuleLoader__.load({
     // 发布仓库：更新提示读取这个仓库的 latest release；安装/升级都用 pnpm 的 github: 规格。
     // 发布新版本时：把 package.json 与下面的 PLUGIN_VERSION 一起改掉，再打 tag 发 release。
     var PLUGIN_NAME = "dsh-limob-runner";
-    var PLUGIN_VERSION = "0.2.0";
+    var PLUGIN_VERSION = "0.2.1";
     var REPO_SLUG = "lcx19970714/dsh-limob-runner";
     var INSTALL_SPEC = "github:" + REPO_SLUG;
     var UPGRADE_COMMAND = "dsh plugin --profile desktop add " + INSTALL_SPEC;
@@ -925,7 +925,7 @@ window.__ModuleLoader__.load({
       var setStatus = statusState[1];
 
       // 更新检查状态：{ phase: "idle"|"checking"|"ready"|"error", available, latestVersion, message, releaseUrl }
-      var updatePair = react.useState({ phase: "idle" });
+      var updatePair = react.useState({ phase: "checking" });
       var updateStatus = updatePair[0];
       var setUpdateStatus = updatePair[1];
 
@@ -1241,7 +1241,7 @@ window.__ModuleLoader__.load({
 
     /** 多个组件共用的「检查更新」hook：挂载后延迟检查，返回 [state, setState]。 */
     function useUpdateStatus() {
-      var pair = react.useState({ phase: "idle" });
+      var pair = react.useState({ phase: "checking" });
       var state = pair[0];
       var setState = pair[1];
       react.useEffect(function () {
@@ -1301,8 +1301,10 @@ window.__ModuleLoader__.load({
         hint = "检查失败：" + update.message + "（不影响终端功能）";
       } else if (update !== undefined && update !== null && update.available) {
         hint = "发现新版本 v" + update.latestVersion + "，建议升级。";
-      } else {
+      } else if (update !== undefined && update !== null && update.phase === "ready") {
         hint = "已是最新版本。";
+      } else {
+        hint = "正在检查 GitHub 更新…";
       }
 
       function handleCheckNow() {

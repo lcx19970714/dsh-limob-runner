@@ -1,6 +1,6 @@
 {
   "name": "dsh-limob-runner",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": false,
   "description": "DSH 客户端插件：在对话输入框 dock 增加「运行 Limob」菜单，通过 DSH 自带终端（remote.terminal + 右侧栏终端页签）执行固定白名单命令，并检查 GitHub 新版本。",
   "type": "module",
