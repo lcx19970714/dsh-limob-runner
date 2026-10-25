@@ -1,21 +1,21 @@
-/* dsh-limob-runner —— 客户端半体（浏览器侧）
+/* dsh-limob-runner —— 客户端半体（浏览器侧）v0.3
  *
- * 目标：在 DSH 对话输入框上方的 dock 槽位里加一个「运行 Limob」菜单，
- * 点击后不打开系统终端，而是使用 DSH 自带的 Web 终端：
- *   1) 通过客户端已挂载的 `remote.terminal` 命名空间在 Host 侧创建 PTY；
- *   2) 通过 `terminal/attach` 双向流把固定命令写进 shell（只写一次，来自白名单）；
- *   3) 通过右侧栏内置的 `terminal` 页签展示终端画面（实时滚动输出）；
- *   4) 再点同一任务时复用已有终端，避免重复启动 dev 进程。
+ * 功能总览：
+ *   1) 一个可拖动的浮动按钮（shell.overlay）：点击打开命令菜单，长按/拖动可移动，
+ *      位置保存在 localStorage，下次打开保持原位；
+ *   2) 命令配置页（settings.section）：在 DSH 设置弹窗里新增「Limob 运行器」页，
+ *      支持命令的增删改查、排序、启停、全局/项目作用域；
+ *   3) 运行命令仍通过 DSH 自带终端（remote.terminal + 右侧栏 terminal 页签），
+ *      输出实时滚动；重复点击复用已有终端，支持一键停止；
+ *   4) GitHub Releases 更新检查（dock/菜单/插件页提示），只提示不自动升级。
  *
- * 调用链（都是同一个浏览器页面里的 Cordis 客户端服务）：
- *   remote.terminal.create/list/rename/close/attach
- *     <- @deepseek-ai/dsh-api-terminal-controller（客户端） + Host 的 terminalController
- *   webTerminals.recover / sidebarRight.openTab("terminal", { params: { terminalId } })
- *     <- @deepseek-ai/dsh-client-ui-sidebar-terminal 注册的内置终端页签
+ * 数据流：
+ *   配置：localStorage(dsh.limob-runner.config.v1) <-> 设置页/浮动按钮共用同一个 store
+ *   终端：remote.terminal.create/list/attach/rename/close
+ *   页签：webTerminals.recover + sidebarRight.openTab("terminal",{params:{terminalId}})
  *
- * 注意：这些是 DSH 内部的客户端服务接口（不是官方文档承诺的稳定插件 API），
- * 所有调用都做了能力检测；DSH 升级后若接口改名，按钮仍在，只会显示一条错误提示，
- * 不会影响 DSH 正常聊天。
+ * 依赖的 DSH 客户端服务是内部接口（非官方稳定 API），调用都有能力检测与 try/catch；
+ * 任何失败只影响对应提示，不影响 DSH 正常聊天。
  */
 window.__ModuleLoader__.load({
   id: "dsh-limob-runner",
@@ -26,27 +26,47 @@ window.__ModuleLoader__.load({
     var exports = module.exports;
     Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
 
-    // 只用基线共享模块 react，避免额外 bundle 依赖。
+    // 只用基线共享模块 react。
     var react = require("react");
     var h = react.createElement;
 
     // =====================================================================
-    // 一、固定任务白名单（这是唯一的“命令来源”，不接受任何用户输入拼接）
+    // 一、常量与内置命令
     // =====================================================================
-    // 每个任务：
-    //   id            稳定标识，用来复用终端 / 记录状态
-    //   title         菜单里显示的中文名称
-    //   terminalTitle 终端页签标题（会写进 Host 终端元数据）
-    //   cwd           命令执行前先切换到的目录（Windows 绝对路径）
-    //   command       固定命令，不做字符串拼装
-    //   utf8CodePage  是否先 chcp 65001（命令里含中文脚本名时，保证 PowerShell 交互输入按 UTF-8 解码）
-    var TASKS = [
+    var PLUGIN_NAME = "dsh-limob-runner";
+    var PLUGIN_VERSION = "0.3.0";
+
+    // 更新检查（GitHub Releases）
+    var REPO_SLUG = "lcx19970714/dsh-limob-runner";
+    var INSTALL_SPEC = "github:" + REPO_SLUG;
+    var UPGRADE_COMMAND = "dsh plugin --profile desktop add " + INSTALL_SPEC;
+    var GITHUB_REPO_PAGE = "https://github.com/" + REPO_SLUG;
+    var GITHUB_RELEASES_PAGE = GITHUB_REPO_PAGE + "/releases";
+    var GITHUB_API_LATEST = "https://api.github.com/repos/" + REPO_SLUG + "/releases/latest";
+    var GITHUB_RAW_PACKAGE = "https://raw.githubusercontent.com/" + REPO_SLUG + "/main/package.json";
+    var UPDATE_CACHE_KEY = "dsh.limob-runner.update.v1";
+    var UPDATE_TTL_MS = 6 * 60 * 60 * 1000; // 6 小时
+
+    // 配置与旧终端映射
+    var CONFIG_KEY = "dsh.limob-runner.config.v1";
+    var TERMINAL_KEY = "dsh.limob-runner.v1";
+    var CONFIG_VERSION = 1;
+
+    // apply(ctx) 时保存客户端根 Context，组件里按需取 DSH 服务。
+    var runtimeCtx = null;
+
+    // 内置默认命令：命令文本全部是常量，不接受用户输入拼接。
+    // scope 默认 global，保持旧版行为；用户可在设置页改成「仅项目」。
+    var BUILTIN_COMMANDS = [
       {
         id: "dev",
         title: "开发调试",
         terminalTitle: "Limob-dev",
         cwd: "H:\\Limob-windows",
         command: "pnpm 客户端-调试",
+        scope: "global",
+        projectRoot: "",
+        enabled: true,
         utf8CodePage: true,
         longRunning: true
       },
@@ -56,6 +76,9 @@ window.__ModuleLoader__.load({
         terminalTitle: "Limob-cargo-check",
         cwd: "H:\\Limob-windows\\src-tauri",
         command: "cargo check",
+        scope: "global",
+        projectRoot: "",
+        enabled: true,
         utf8CodePage: false,
         longRunning: false
       },
@@ -65,6 +88,9 @@ window.__ModuleLoader__.load({
         terminalTitle: "Limob-build-debug",
         cwd: "H:\\Limob-windows",
         command: "pnpm exec tauri build --debug --no-bundle",
+        scope: "global",
+        projectRoot: "",
+        enabled: true,
         utf8CodePage: false,
         longRunning: false
       },
@@ -74,82 +100,78 @@ window.__ModuleLoader__.load({
         terminalTitle: "Limob-build-release",
         cwd: "H:\\Limob-windows",
         command: "pnpm 构建桌面端",
+        scope: "global",
+        projectRoot: "",
+        enabled: true,
         utf8CodePage: true,
         longRunning: false
       }
     ];
 
-    // 任务 id -> 任务定义，供状态恢复时取标题。
-    var TASK_BY_ID = {};
-    for (var taskIndex = 0; taskIndex < TASKS.length; taskIndex += 1) {
-      TASK_BY_ID[TASKS[taskIndex].id] = TASKS[taskIndex];
-    }
-
     // =====================================================================
-    // 二、模块级运行时上下文
-    // =====================================================================
-    // `apply(ctx)` 时保存客户端根 Context。组件里通过它按需取服务：
-    //   ctx.get("remote.terminal") / ctx.get("webTerminals") / ctx.get("sidebarRight")
-    // 用 ctx.get 而不是在 exports.inject 里写死，是因为：
-    //   - 只有 slots 是按钮渲染的硬依赖；终端服务缺失时按钮仍应出现并给出可读错误；
-    //   - Cordis 的 ctx.get 对未注册服务返回 undefined，正好用来做能力检测。
-    var runtimeCtx = null;
-
-    // 本地持久化：记住「某个会话的某个任务上一次用的终端 id」，用于刷新页面后复用。
-    var STORAGE_KEY = "dsh.limob-runner.v1";
-
-    // ---- 版本与更新检查（GitHub Releases）----
-    // 发布仓库：更新提示读取这个仓库的 latest release；安装/升级都用 pnpm 的 github: 规格。
-    // 发布新版本时：把 package.json 与下面的 PLUGIN_VERSION 一起改掉，再打 tag 发 release。
-    var PLUGIN_NAME = "dsh-limob-runner";
-    var PLUGIN_VERSION = "0.2.1";
-    var REPO_SLUG = "lcx19970714/dsh-limob-runner";
-    var INSTALL_SPEC = "github:" + REPO_SLUG;
-    var UPGRADE_COMMAND = "dsh plugin --profile desktop add " + INSTALL_SPEC;
-    var GITHUB_REPO_PAGE = "https://github.com/" + REPO_SLUG;
-    var GITHUB_RELEASES_PAGE = GITHUB_REPO_PAGE + "/releases";
-    var GITHUB_API_LATEST = "https://api.github.com/repos/" + REPO_SLUG + "/releases/latest";
-    var GITHUB_RAW_PACKAGE = "https://raw.githubusercontent.com/" + REPO_SLUG + "/main/package.json";
-    var UPDATE_CACHE_KEY = "dsh.limob-runner.update.v1";
-    var UPDATE_TTL_MS = 6 * 60 * 60 * 1000; // 6 小时内不重复请求 GitHub
-
-    // =====================================================================
-    // 三、样式（只注入一次，插件卸载时移除；不污染全局样式）
+    // 二、样式（factory 阶段注入一次，模块系统会随插件卸载清理）
     // =====================================================================
     var STYLE_ID = "dsh-limob-runner-css";
     var CSS = [
-      ".dshLimob-root{position:relative;display:flex;align-items:center;gap:8px;width:100%;min-width:0;padding:2px 2px 6px;font-family:inherit;font-size:12px;line-height:18px;color:inherit}",
-      ".dshLimob-trigger{display:inline-flex;align-items:center;gap:6px;height:26px;padding:0 10px;border-radius:7px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));background:var(--dsw-alias-bg-layer-1,rgba(128,128,128,.08));color:inherit;font:inherit;cursor:pointer;user-select:none;white-space:nowrap}",
-      ".dshLimob-trigger:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.16))}",
-      ".dshLimob-trigger[data-busy=true]{cursor:progress;opacity:.75}",
-      ".dshLimob-caret{width:0;height:0;border-left:4px solid transparent;border-right:4px solid transparent;border-top:5px solid currentColor;opacity:.65;margin-left:1px}",
-      ".dshLimob-menu{position:absolute;left:0;bottom:calc(100% + 6px);z-index:60;min-width:300px;max-width:min(460px,90vw);padding:6px;border-radius:10px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));background:var(--dsw-alias-bg-layer-2,#26282c);box-shadow:0 10px 28px rgba(0,0,0,.32)}",
-      ".dshLimob-menuTitle{padding:5px 9px 4px;font-size:11px;opacity:.6;user-select:none}",
-      ".dshLimob-item{display:flex;flex-direction:column;gap:2px;width:100%;padding:7px 9px;border:0;border-radius:7px;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}",
-      ".dshLimob-item:hover{background:rgba(103,158,254,.14)}",
-      ".dshLimob-item:disabled{opacity:.55;cursor:default}",
-      ".dshLimob-title{font-size:13px;line-height:18px}",
-      ".dshLimob-cmd{font-size:11px;line-height:16px;opacity:.62;font-family:ui-monospace,Consolas,'Courier New',monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
-      ".dshLimob-sep{height:1px;margin:5px 4px;background:var(--dsw-alias-border-l3,rgba(128,128,128,.3))}",
-      ".dshLimob-stop{color:#f87171}",
-      ".dshLimob-status{display:inline-flex;align-items:center;gap:5px;min-width:0;font-size:11px;line-height:16px;opacity:.85}",
-      ".dshLimob-statusText{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
-      ".dshLimob-dot{width:6px;height:6px;border-radius:50%;background:#22c55e;flex:none}",
-      ".dshLimob-dot[data-phase=starting]{background:#f59e0b;animation:dshLimobPulse 1s ease-in-out infinite}",
-      ".dshLimob-dot[data-phase=error]{background:#ef4444}",
-      ".dshLimob-dot[data-phase=idle]{background:#94a3b8}",
-      ".dshLimob-updateChip{display:inline-flex;align-items:center;height:20px;padding:0 7px;border-radius:999px;border:.5px solid rgba(245,158,11,.5);background:rgba(245,158,11,.12);color:#f59e0b;font:inherit;font-size:11px;cursor:pointer;white-space:nowrap}",
-      ".dshLimob-updateChip:hover{background:rgba(245,158,11,.2)}",
-      ".dshLimob-updateBadge{display:inline-flex;align-items:center;height:20px;padding:0 8px;border-radius:999px;border:.5px solid rgba(245,158,11,.5);background:rgba(245,158,11,.12);color:#f59e0b;font-size:11px;line-height:18px;white-space:nowrap}",
-      ".dshLimob-detailSection{display:flex;flex-direction:column;gap:8px;padding:14px 16px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));border-radius:10px;background:var(--dsw-alias-bg-layer-1,rgba(128,128,128,.06));font-size:12px;line-height:18px}",
-      ".dshLimob-detailTitle{font-size:13px;font-weight:600}",
-      ".dshLimob-detailMuted{opacity:.65}",
-      ".dshLimob-detailCode{display:block;padding:8px 10px;border-radius:7px;background:rgba(0,0,0,.22);font-family:ui-monospace,Consolas,'Courier New',monospace;font-size:11px;line-height:16px;word-break:break-all;user-select:text}",
-      ".dshLimob-detailActions{display:flex;flex-wrap:wrap;gap:8px}",
-      ".dshLimob-detailBtn{display:inline-flex;align-items:center;height:26px;padding:0 10px;border-radius:7px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));background:transparent;color:inherit;font:inherit;font-size:12px;text-decoration:none;cursor:pointer}",
-      ".dshLimob-detailBtn:hover{background:rgba(103,158,254,.14)}",
-      ".dshLimob-detailBtn[disabled]{opacity:.55;cursor:default}",
-      "@keyframes dshLimobPulse{0%,100%{opacity:1}50%{opacity:.3}}"
+      // ---- 浮动按钮 ----
+      ".dshLimobFabRoot{position:fixed;z-index:40;pointer-events:none}",
+      ".dshLimobFabBtn{pointer-events:auto;display:inline-flex;align-items:center;justify-content:center;width:44px;height:44px;border-radius:50%;border:.5px solid rgba(103,158,254,.55);background:linear-gradient(135deg,#4561ee,#679efe);color:#fff;font-size:15px;line-height:1;cursor:grab;user-select:none;touch-action:none;box-shadow:0 6px 18px rgba(0,0,0,.32)}",
+      ".dshLimobFabBtn:hover{filter:brightness(1.08)}",
+      ".dshLimobFabBtn[data-dragging=true]{cursor:grabbing;filter:brightness(1.12)}",
+      ".dshLimobFabBtn .dshLimobFabDot{position:absolute;right:5px;top:5px;width:8px;height:8px;border-radius:50%;background:#f59e0b;border:1.5px solid #1b1d22}",
+      ".dshLimobFabBadge{position:absolute;left:0;top:calc(100% + 6px);padding:2px 7px;border-radius:999px;background:rgba(0,0,0,.62);color:#fff;font-size:10px;line-height:16px;white-space:nowrap;pointer-events:none}",
+      // ---- 浮动菜单 ----
+      ".dshLimobFabMenu{pointer-events:auto;box-sizing:border-box;position:fixed;z-index:41;min-width:260px;max-width:min(380px,92vw);max-height:min(70vh,560px);overflow:auto;padding:6px;border-radius:11px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));background:var(--dsw-alias-bg-layer-2,#26282c);box-shadow:0 12px 32px rgba(0,0,0,.38);font-family:inherit;font-size:12px;line-height:18px;color:inherit}",
+      ".dshLimobFabMenuTitle{padding:5px 9px 3px;font-size:11px;opacity:.6;user-select:none;display:flex;justify-content:space-between;gap:8px}",
+      ".dshLimobFabItem{display:flex;align-items:flex-start;gap:7px;width:100%;padding:7px 9px;border:0;border-radius:7px;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}",
+      ".dshLimobFabItem:hover{background:rgba(103,158,254,.14)}",
+      ".dshLimobFabItem[disabled]{opacity:.55;cursor:default}",
+      ".dshLimobFabItemMain{display:flex;flex-direction:column;gap:1px;min-width:0;flex:1}",
+      ".dshLimobFabItemTitle{font-size:13px;line-height:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+      ".dshLimobFabItemCmd{font-size:11px;line-height:15px;opacity:.6;font-family:ui-monospace,Consolas,'Courier New',monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+      ".dshLimobFabTag{flex:none;padding:0 6px;border-radius:999px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));font-size:10px;line-height:16px;opacity:.75}",
+      ".dshLimobFabRunDot{flex:none;width:6px;height:6px;margin-top:7px;border-radius:50%;background:#22c55e}",
+      ".dshLimobFabSep{height:1px;margin:5px 4px;background:var(--dsw-alias-border-l3,rgba(128,128,128,.3))}",
+      ".dshLimobFabToast{pointer-events:none;box-sizing:border-box;position:fixed;z-index:41;max-width:min(360px,90vw);padding:6px 10px;border-radius:8px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));background:var(--dsw-alias-bg-layer-2,#26282c);box-shadow:0 8px 22px rgba(0,0,0,.3);font-size:11px;line-height:16px;opacity:.96}",
+      ".dshLimobFabToast[data-phase=error]{border-color:rgba(239,68,68,.5);color:#fca5a5}",
+      // ---- 配置编辑器 ----
+      ".dshLimobCfg{display:flex;flex-direction:column;gap:12px;font-size:12px;line-height:18px;color:inherit}",
+      ".dshLimobCfgCard{display:flex;flex-direction:column;gap:8px;padding:12px 14px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));border-radius:10px;background:var(--dsw-alias-bg-layer-1,rgba(128,128,128,.06))}",
+      ".dshLimobCfgH{font-size:13px;font-weight:600;display:flex;align-items:center;justify-content:space-between;gap:8px}",
+      ".dshLimobCfgMuted{opacity:.65}",
+      ".dshLimobCfgRow{display:flex;flex-wrap:wrap;align-items:center;gap:8px}",
+      ".dshLimobCfgField{display:flex;flex-direction:column;gap:3px;flex:1 1 220px;min-width:0}",
+      ".dshLimobCfgField > span{font-size:11px;opacity:.7}",
+      ".dshLimobCfgInput,.dshLimobCfgTextarea,.dshLimobCfgSelect{width:100%;box-sizing:border-box;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.4));border-radius:7px;background:var(--dsw-alias-bg-base,transparent);color:inherit;font:inherit;padding:5px 8px}",
+      ".dshLimobCfgTextarea{min-height:52px;resize:vertical;font-family:ui-monospace,Consolas,'Courier New',monospace;font-size:11px}",
+      ".dshLimobCfgBtn{display:inline-flex;align-items:center;justify-content:center;height:26px;padding:0 10px;border-radius:7px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));background:transparent;color:inherit;font:inherit;font-size:12px;cursor:pointer;white-space:nowrap}",
+      ".dshLimobCfgBtn:hover{background:rgba(103,158,254,.14)}",
+      ".dshLimobCfgBtn[disabled]{opacity:.5;cursor:default}",
+      ".dshLimobCfgBtnPrimary{border-color:rgba(103,158,254,.55);background:rgba(103,158,254,.16)}",
+      ".dshLimobCfgBtnDanger{border-color:rgba(239,68,68,.5);color:#f87171}",
+      ".dshLimobCfgList{display:flex;flex-direction:column;gap:6px}",
+      ".dshLimobCfgItem{display:flex;flex-wrap:wrap;align-items:center;gap:7px;padding:8px 10px;border-radius:8px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.25));background:var(--dsw-alias-bg-layer-1,rgba(128,128,128,.04))}",
+      ".dshLimobCfgItem[data-disabled=true]{opacity:.55}",
+      ".dshLimobCfgItemMain{display:flex;flex-direction:column;gap:1px;min-width:0;flex:1 1 180px}",
+      ".dshLimobCfgItemTitle{font-size:12px;line-height:17px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+      ".dshLimobCfgItemCmd{font-size:10px;line-height:14px;opacity:.55;font-family:ui-monospace,Consolas,'Courier New',monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+      ".dshLimobCfgTag{flex:none;padding:0 6px;border-radius:999px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));font-size:10px;line-height:16px;opacity:.75;white-space:nowrap}",
+      ".dshLimobCfgError{color:#f87171;font-size:11px}",
+      ".dshLimobCfgNotice{color:#22c55e;font-size:11px}",
+      ".dshLimobCfgCheck{display:inline-flex;align-items:center;gap:5px;font-size:11px;opacity:.85;user-select:none}",
+      ".dshLimobCfgModalBackdrop{pointer-events:auto;position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,.42);display:flex;align-items:center;justify-content:center;padding:24px}",
+      ".dshLimobCfgModal{box-sizing:border-box;width:min(760px,92vw);max-height:min(84vh,760px);overflow:auto;border-radius:12px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));background:var(--dsw-alias-bg-layer-2,#26282c);box-shadow:0 18px 48px rgba(0,0,0,.45);padding:16px}",
+      ".dshLimobCfgPage{max-width:720px;padding:2px 2px 24px}",
+      // ---- 插件详情页更新区 ----
+      ".dshLimobUpdateBadge{display:inline-flex;align-items:center;height:20px;padding:0 8px;border-radius:999px;border:.5px solid rgba(245,158,11,.5);background:rgba(245,158,11,.12);color:#f59e0b;font-size:11px;line-height:18px;white-space:nowrap}",
+      ".dshLimobDetailSection{display:flex;flex-direction:column;gap:8px;padding:14px 16px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));border-radius:10px;background:var(--dsw-alias-bg-layer-1,rgba(128,128,128,.06));font-size:12px;line-height:18px}",
+      ".dshLimobDetailTitle{font-size:13px;font-weight:600}",
+      ".dshLimobDetailMuted{opacity:.65}",
+      ".dshLimobDetailCode{display:block;padding:8px 10px;border-radius:7px;background:rgba(0,0,0,.22);font-family:ui-monospace,Consolas,'Courier New',monospace;font-size:11px;line-height:16px;word-break:break-all;user-select:text}",
+      ".dshLimobDetailActions{display:flex;flex-wrap:wrap;gap:8px}",
+      ".dshLimobDetailBtn{display:inline-flex;align-items:center;height:26px;padding:0 10px;border-radius:7px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));background:transparent;color:inherit;font:inherit;font-size:12px;text-decoration:none;cursor:pointer}",
+      ".dshLimobDetailBtn:hover{background:rgba(103,158,254,.14)}",
+      ".dshLimobDetailBtn[disabled]{opacity:.55;cursor:default}"
     ].join("");
 
     function ensureStyles() {
@@ -161,16 +183,12 @@ window.__ModuleLoader__.load({
       document.head.appendChild(style);
     }
 
-    // 在 factory 执行阶段注入一次样式：dsh-client-modules 会把 factory 期间新增的 <style>
-    // 认领给本插件，插件卸载时统一清理。这样即使只打开「插件」页、没有渲染 dock，
-    // 插件详情页里的更新说明区也有样式。
+    // factory 阶段注入，模块系统认领并在插件卸载时清理。
     ensureStyles();
 
     // =====================================================================
-    // 四、通用小工具
+    // 三、通用小工具
     // =====================================================================
-
-    /** 从 Cordis Context 安全取服务；未注册 / 已卸载时返回 undefined。 */
     function getService(ctx, name) {
       if (!ctx) return undefined;
       try {
@@ -180,11 +198,6 @@ window.__ModuleLoader__.load({
       }
     }
 
-    /**
-     * 取终端 Remote 命名空间。
-     * DSH 把它注册成 `remote.terminal`（ClientRemoteService 的命名空间服务），
-     * 老一点的写法也可能只能从 `remote` 上取到 `.terminal`，两种都兼容。
-     */
     function getTerminalRemote(ctx) {
       var direct = getService(ctx, "remote.terminal");
       if (direct !== undefined && direct !== null) return direct;
@@ -193,10 +206,6 @@ window.__ModuleLoader__.load({
       return undefined;
     }
 
-    /**
-     * DSH 的 Remote 调用统一返回 Result：{ ok: true, value } 或 { ok: false, error }。
-     * 这里把失败分支转成异常，方便上层统一 try/catch；非 Result 的返回值原样返回。
-     */
     function unwrapResult(result) {
       if (result !== null && typeof result === "object" && "ok" in result) {
         if (!result.ok) {
@@ -207,7 +216,6 @@ window.__ModuleLoader__.load({
       return result;
     }
 
-    /** 把任意异常转成可展示的中文文本。 */
     function messageOf(error) {
       if (error === undefined || error === null) return "未知错误";
       if (typeof error === "string") return error;
@@ -215,7 +223,6 @@ window.__ModuleLoader__.load({
       return String(error);
     }
 
-    /** 给 Promise 加超时，避免某一步卡住整个按钮。 */
     function withTimeout(promise, timeoutMs, message) {
       return new Promise(function (resolve, reject) {
         var timer = setTimeout(function () {
@@ -234,14 +241,45 @@ window.__ModuleLoader__.load({
       });
     }
 
-    // =====================================================================
-    // 四之二、版本比较与 GitHub 更新检查
-    // =====================================================================
-    // 设计目标：本插件不自动安装任何东西（安装/升级都要经过 DSH 插件管理器），
-    // 只在 GitHub 上有更新的 release 时给出提示和升级命令；所有网络失败都静默降级，
-    // 不会影响终端功能。
+    function logPluginError(ctx, message, error) {
+      if (ctx !== null && ctx.logger !== undefined && ctx.logger !== null && typeof ctx.logger.error === "function") {
+        ctx.logger.error("dsh-limob-runner: " + message, error);
+      } else if (typeof console !== "undefined") {
+        console.error("dsh-limob-runner: " + message, error);
+      }
+    }
 
-    /** 解析 v1.2.3 / 1.2.3-beta.1 这类版本号；解析失败返回 null。 */
+    function copyTextToClipboard(text) {
+      try {
+        if (typeof navigator !== "undefined" && navigator.clipboard !== undefined
+          && typeof navigator.clipboard.writeText === "function") {
+          navigator.clipboard.writeText(text);
+          return true;
+        }
+      } catch (_error) {
+        /* 回退 */
+      }
+      try {
+        if (typeof document !== "undefined") {
+          var area = document.createElement("textarea");
+          area.value = text;
+          area.style.position = "fixed";
+          area.style.opacity = "0";
+          document.body.appendChild(area);
+          area.select();
+          var copied = document.execCommand("copy");
+          area.remove();
+          return copied;
+        }
+      } catch (_error) {
+        /* ignore */
+      }
+      return false;
+    }
+
+    // =====================================================================
+    // 四、版本比较与更新检查
+    // =====================================================================
     function parseVersion(text) {
       var match = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(String(text === undefined || text === null ? "" : text).trim());
       if (match === null) return null;
@@ -253,7 +291,6 @@ window.__ModuleLoader__.load({
       };
     }
 
-    /** 按 semver 规则比较两个版本：a>b 返回 1，相等 0，a<b 返回 -1；解析失败按相等处理。 */
     function compareVersions(left, right) {
       var a = parseVersion(left);
       var b = parseVersion(right);
@@ -263,7 +300,6 @@ window.__ModuleLoader__.load({
       for (var i = 0; i < 3; i += 1) {
         if (coreA[i] !== coreB[i]) return coreA[i] > coreB[i] ? 1 : -1;
       }
-      // 带 prerelease 的版本小于同核心的正式版（1.0.0-beta < 1.0.0）。
       if (a.prerelease.length === 0 && b.prerelease.length > 0) return 1;
       if (a.prerelease.length > 0 && b.prerelease.length === 0) return -1;
       var length = Math.max(a.prerelease.length, b.prerelease.length);
@@ -277,7 +313,7 @@ window.__ModuleLoader__.load({
         if (numericA && numericB) {
           if (Number(partA) !== Number(partB)) return Number(partA) > Number(partB) ? 1 : -1;
         } else if (numericA !== numericB) {
-          return numericA ? -1 : 1; // 数字标识符优先级低于字母标识符
+          return numericA ? -1 : 1;
         } else if (partA !== partB) {
           return partA > partB ? 1 : -1;
         }
@@ -308,11 +344,10 @@ window.__ModuleLoader__.load({
         if (typeof localStorage === "undefined") return;
         localStorage.setItem(UPDATE_CACHE_KEY, JSON.stringify(value));
       } catch (_error) {
-        /* 缓存失败不影响本次结果 */
+        /* ignore */
       }
     }
 
-    /** 查询 GitHub 最新 release（tag 即版本）；仓库还没有 release 时回退到 main 分支 package.json。 */
     async function fetchLatestVersion() {
       if (typeof fetch !== "function") throw new Error("当前环境没有 fetch，无法检查更新");
       var controller = new AbortController();
@@ -332,7 +367,6 @@ window.__ModuleLoader__.load({
             return { version: stripVersionPrefix(tag), url: release.html_url || GITHUB_RELEASES_PAGE };
           }
         }
-        // 404 通常表示仓库还没有任何 release；回退读 main 分支的 package.json 版本号。
         var packageResponse = await fetch(GITHUB_RAW_PACKAGE + "?t=" + Date.now(), {
           signal: controller.signal,
           cache: "no-store"
@@ -348,11 +382,6 @@ window.__ModuleLoader__.load({
       }
     }
 
-    /**
-     * 检查更新（带 6 小时缓存）。
-     * force=true 时忽略缓存（菜单里的「检查更新」）。
-     * 失败返回 { phase:"error", message }，不抛出，避免打扰终端功能。
-     */
     async function checkForUpdate(force) {
       var cached = readUpdateCache();
       var now = Date.now();
@@ -384,7 +413,6 @@ window.__ModuleLoader__.load({
       }
     }
 
-    // 同一页面里多个组件（dock / 插件详情页）同时挂载时，共享同一个进行中的请求。
     var pendingUpdateCheck = null;
     function checkForUpdateShared(force) {
       if (!force && pendingUpdateCheck !== null) return pendingUpdateCheck;
@@ -398,40 +426,6 @@ window.__ModuleLoader__.load({
       return promise;
     }
 
-    /** 复制文本到剪贴板；失败返回 false。 */
-    function copyTextToClipboard(text) {
-      try {
-        if (typeof navigator !== "undefined" && navigator.clipboard !== undefined
-          && typeof navigator.clipboard.writeText === "function") {
-          navigator.clipboard.writeText(text);
-          return true;
-        }
-      } catch (_error) {
-        /* 回退到 execCommand */
-      }
-      try {
-        if (typeof document !== "undefined") {
-          var area = document.createElement("textarea");
-          area.value = text;
-          area.style.position = "fixed";
-          area.style.opacity = "0";
-          document.body.appendChild(area);
-          area.select();
-          var copied = document.execCommand("copy");
-          area.remove();
-          return copied;
-        }
-      } catch (_error) {
-        /* 复制失败由调用方提示 */
-      }
-      return false;
-    }
-
-    /**
-     * 打开「本插件的更新/安装说明」：
-     * 优先用 DSH 插件页的 pluginNavigation.openBundle() 直接跳到本插件详情；
-     * 没这个服务时退化为复制 release 地址并提示用户手动打开。
-     */
     function openPluginUpdatePage(ctx, releaseUrl, notify) {
       var navigation = getService(ctx, "pluginNavigation");
       if (navigation !== undefined && navigation !== null && typeof navigation.openBundle === "function") {
@@ -439,7 +433,7 @@ window.__ModuleLoader__.load({
           navigation.openBundle(PLUGIN_NAME);
           return true;
         } catch (_error) {
-          /* 回退到复制地址 */
+          /* 回退 */
         }
       }
       var url = releaseUrl || GITHUB_RELEASES_PAGE;
@@ -451,23 +445,292 @@ window.__ModuleLoader__.load({
     }
 
     // =====================================================================
-    // 五、终端操作封装（全部通过 DSH 客户端服务，不碰系统终端）
+    // 五、配置 store（localStorage）+ 作用域匹配
     // =====================================================================
+    function makeId() {
+      return "cmd-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 6);
+    }
 
-    /** 读取会话保留的 Host 终端列表（不激活 Agent）。 */
+    function normalizeCommand(raw) {
+      if (raw === null || typeof raw !== "object") return null;
+      var id = typeof raw.id === "string" && raw.id.trim() !== "" ? raw.id.trim() : makeId();
+      var title = typeof raw.title === "string" ? raw.title.trim() : "";
+      var command = typeof raw.command === "string" ? raw.command.trim() : "";
+      var cwd = typeof raw.cwd === "string" ? raw.cwd.trim() : "";
+      if (title === "" || command === "") return null;
+      var scope = raw.scope === "project" ? "project" : "global";
+      var projectRoot = typeof raw.projectRoot === "string" ? raw.projectRoot.trim() : "";
+      if (scope === "project" && projectRoot === "") {
+        // 项目命令必须有项目根目录，否则无法判断何时显示。
+        return null;
+      }
+      return {
+        id: id,
+        title: title,
+        terminalTitle: typeof raw.terminalTitle === "string" ? raw.terminalTitle.trim() : "",
+        cwd: cwd,
+        command: command,
+        scope: scope,
+        projectRoot: projectRoot,
+        enabled: raw.enabled !== false,
+        utf8CodePage: raw.utf8CodePage === true,
+        longRunning: raw.longRunning === true
+      };
+    }
+
+    function defaultConfig() {
+      return {
+        version: CONFIG_VERSION,
+        commands: BUILTIN_COMMANDS.map(function (item) {
+          return {
+            id: item.id,
+            title: item.title,
+            terminalTitle: item.terminalTitle,
+            cwd: item.cwd,
+            command: item.command,
+            scope: item.scope,
+            projectRoot: item.projectRoot,
+            enabled: true,
+            utf8CodePage: item.utf8CodePage,
+            longRunning: item.longRunning
+          };
+        }),
+        ui: { floating: null, visible: true }
+      };
+    }
+
+    function normalizeConfig(raw) {
+      var fallback = defaultConfig();
+      if (raw === null || typeof raw !== "object") return fallback;
+      var commands = [];
+      if (Array.isArray(raw.commands)) {
+        for (var i = 0; i < raw.commands.length; i += 1) {
+          var normalized = normalizeCommand(raw.commands[i]);
+          if (normalized !== null) commands.push(normalized);
+        }
+      }
+      var ui = raw.ui !== null && typeof raw.ui === "object" ? raw.ui : {};
+      var floating = null;
+      if (ui.floating !== null && ui.floating !== undefined && typeof ui.floating === "object"
+        && typeof ui.floating.x === "number" && typeof ui.floating.y === "number"
+        && isFinite(ui.floating.x) && isFinite(ui.floating.y)) {
+        floating = { x: Math.round(ui.floating.x), y: Math.round(ui.floating.y) };
+      }
+      return {
+        version: CONFIG_VERSION,
+        commands: commands,
+        ui: {
+          floating: floating,
+          visible: ui.visible !== false
+        }
+      };
+    }
+
+    var configCache = null;
+    var configListeners = new Set();
+
+    function readConfigFromStorage() {
+      try {
+        if (typeof localStorage === "undefined") return defaultConfig();
+        var raw = localStorage.getItem(CONFIG_KEY);
+        if (raw === null) return defaultConfig();
+        return normalizeConfig(JSON.parse(raw));
+      } catch (_error) {
+        return defaultConfig();
+      }
+    }
+
+    function getConfigSnapshot() {
+      if (configCache === null) configCache = readConfigFromStorage();
+      return configCache;
+    }
+
+    function saveConfig(next) {
+      var normalized = normalizeConfig(next);
+      configCache = normalized;
+      try {
+        if (typeof localStorage !== "undefined") localStorage.setItem(CONFIG_KEY, JSON.stringify(normalized));
+      } catch (_error) {
+        /* 存不下时本次会话内仍有效 */
+      }
+      configListeners.forEach(function (listener) {
+        try {
+          listener();
+        } catch (_error) {
+          /* ignore */
+        }
+      });
+      return normalized;
+    }
+
+    function subscribeConfig(listener) {
+      configListeners.add(listener);
+      return function () {
+        configListeners.delete(listener);
+      };
+    }
+
+    function useStoreFallback(subscribe, getSnapshot) {
+      var pair = react.useState(getSnapshot());
+      react.useEffect(function () {
+        return subscribe(function () {
+          pair[1](getSnapshot());
+        });
+      }, []);
+      return pair[0];
+    }
+
+    function useConfig() {
+      if (typeof react.useSyncExternalStore === "function") {
+        return react.useSyncExternalStore(subscribeConfig, getConfigSnapshot, getConfigSnapshot);
+      }
+      return useStoreFallback(subscribeConfig, getConfigSnapshot);
+    }
+
+    function normalizePath(path) {
+      return String(path === undefined || path === null ? "" : path)
+        .trim()
+        .replace(/\//g, "\\")
+        .replace(/\\+$/g, "")
+        .toLowerCase();
+    }
+
+    /** 命令是否属于当前项目：项目根目录相同，或当前项目位于该根目录之下。 */
+    function commandMatchesProject(command, projectPath) {
+      if (command === null || command === undefined || command.scope !== "project") return false;
+      var root = normalizePath(command.projectRoot);
+      var current = normalizePath(projectPath);
+      if (root === "" || current === "") return false;
+      return current === root || current.indexOf(root + "\\") === 0;
+    }
+
+    /** 当前会话应显示的命令：启用的全局命令 + 匹配当前项目的项目命令。 */
+    function visibleCommands(config, projectPath, hasSession) {
+      var list = [];
+      var commands = config !== null && config !== undefined && Array.isArray(config.commands) ? config.commands : [];
+      for (var i = 0; i < commands.length; i += 1) {
+        var command = commands[i];
+        if (command.enabled !== true) continue;
+        if (command.scope === "global") {
+          list.push(command);
+        } else if (hasSession && commandMatchesProject(command, projectPath)) {
+          list.push(command);
+        }
+      }
+      return list;
+    }
+
+    /** 从壳层 slots 提供的 hooks 里解析「当前会话 + 当前工作区路径」。 */
+    function useActiveSession(hooks) {
+      var sessions = typeof hooks.useSessions === "function" ? hooks.useSessions(function (state) { return state; }) : undefined;
+      var workspaces = typeof hooks.useWorkspaces === "function" ? hooks.useWorkspaces(function (state) { return state; }) : undefined;
+      var active = null;
+      if (sessions !== undefined && sessions !== null && sessions.byId !== undefined && sessions.byId !== null) {
+        var ids = Object.keys(sessions.byId);
+        for (var i = 0; i < ids.length; i += 1) {
+          var record = sessions.byId[ids[i]];
+          if (record !== null && record !== undefined && record.retainedBy !== undefined
+            && record.retainedBy !== null && (record.retainedBy.mainView || 0) > 0) {
+            active = record;
+            break;
+          }
+        }
+      }
+      var sessionId = active !== null ? (active.id || active.sessionId) : undefined;
+      var projectPath = undefined;
+      if (sessionId !== undefined && workspaces !== undefined && workspaces !== null
+        && Array.isArray(workspaces.items)) {
+        for (var j = 0; j < workspaces.items.length; j += 1) {
+          var workspace = workspaces.items[j];
+          if (workspace !== null && workspace !== undefined && Array.isArray(workspace.sessionIds)
+            && workspace.sessionIds.indexOf(sessionId) !== -1) {
+            projectPath = workspace.path;
+            break;
+          }
+        }
+      }
+      if (projectPath === undefined && active !== null && typeof active.cwd === "string") {
+        projectPath = active.cwd;
+      }
+      return {
+        sessionId: sessionId,
+        projectPath: projectPath,
+        sessionTitle: active !== null ? active.title : undefined
+      };
+    }
+
+    function useViewport() {
+      var pair = react.useState(function () {
+        if (typeof window === "undefined" || typeof window.innerWidth !== "number") return { width: 1280, height: 800 };
+        return { width: window.innerWidth, height: window.innerHeight };
+      });
+      react.useEffect(function () {
+        function onResize() {
+          if (typeof window === "undefined") return;
+          pair[1]({ width: window.innerWidth, height: window.innerHeight });
+        }
+        window.addEventListener("resize", onResize);
+        return function () {
+          window.removeEventListener("resize", onResize);
+        };
+      }, []);
+      return pair[0];
+    }
+
+    // =====================================================================
+    // 六、旧终端映射（sessionId + commandId -> terminalId）
+    // =====================================================================
+    function loadRegistry() {
+      try {
+        if (typeof localStorage === "undefined") return { sessions: {} };
+        var raw = localStorage.getItem(TERMINAL_KEY);
+        if (raw === null) return { sessions: {} };
+        var parsed = JSON.parse(raw);
+        if (parsed !== null && typeof parsed === "object" && parsed.sessions !== null && typeof parsed.sessions === "object") {
+          return parsed;
+        }
+      } catch (_error) {
+        /* ignore */
+      }
+      return { sessions: {} };
+    }
+
+    function saveRegistry(registry) {
+      try {
+        if (typeof localStorage === "undefined") return;
+        localStorage.setItem(TERMINAL_KEY, JSON.stringify(registry));
+      } catch (_error) {
+        /* ignore */
+      }
+    }
+
+    function getSavedTerminalId(registry, sessionId, commandId) {
+      var session = registry.sessions[sessionId];
+      if (session === undefined || session === null) return undefined;
+      var entry = session[commandId];
+      if (entry === undefined || entry === null) return undefined;
+      return typeof entry.terminalId === "string" ? entry.terminalId : undefined;
+    }
+
+    function setSavedTerminalId(registry, sessionId, commandId, terminalId, title) {
+      if (registry.sessions[sessionId] === undefined || registry.sessions[sessionId] === null) {
+        registry.sessions[sessionId] = {};
+      }
+      registry.sessions[sessionId][commandId] = {
+        terminalId: terminalId,
+        title: title,
+        savedAt: Date.now()
+      };
+    }
+
+    // =====================================================================
+    // 七、终端操作（DSH 内置终端）
+    // =====================================================================
     async function listTerminals(remote, sessionId) {
       var list = unwrapResult(await remote.list(sessionId));
       return Array.isArray(list) ? list : [];
     }
 
-    /**
-     * 选一个 PowerShell 作为终端 shell。
-     * 为什么必须选 PowerShell：
-     *   - DSH 终端默认 shell 可能是 cmd.exe；
-     *   - 我们的命令用 PowerShell 语法（$env:PATH、Set-Location），且 pnpm 脚本名含中文；
-     *   - pwsh（PowerShell 7）对 UTF-8 交互输入最稳，所以优先 pwsh，其次 Windows PowerShell。
-     * 找不到时返回 undefined，交给 Host 默认 shell（命令可能失败，会原样显示在终端里）。
-     */
     async function pickShellPath(remote, sessionId) {
       var shells = [];
       try {
@@ -487,48 +750,34 @@ window.__ModuleLoader__.load({
         var name = String(shell.name || "");
         return /powershell(\.exe)?$/i.test(path) || /powershell/i.test(name);
       });
-      if (powershell !== undefined) return powershell.path;
-      return undefined;
+      return powershell !== undefined ? powershell.path : undefined;
     }
 
     /**
-     * 组装要写进终端的 PowerShell 命令序列（每条对应一次回车）。
-     *
-     * 为什么可能返回两条：
-     *   Windows PowerShell 5.1 在中文 Windows 上默认按 GBK 解码控制台输入，
-     *   而 DSH 终端把我们的命令按 UTF-8 字节写进 PTY。如果同一条命令行里含中文
-     *   （例如 `pnpm 客户端-调试`），这一行会在 chcp 生效之前就被解码，从而乱码。
-     *   因此对 utf8CodePage 任务先单独发一条 `chcp 65001`，等 Host ack 后再发真正的
-     *   命令；第二行被 shell 读取时，控制台输入代码页已经是 UTF-8。
-     *
-     * 输入：固定任务定义（cwd / command 都来自 TASKS 白名单）。
-     * 输出：字符串数组，数组顺序就是写入顺序。
+     * 组装 PowerShell 命令序列。
+     * utf8CodePage：先单独发一条 chcp 65001，避免 Windows PowerShell 5.1 把中文命令按 GBK 解码。
      */
-    function buildCommandLines(task) {
+    function buildCommandLines(command) {
       var lines = [];
-      if (task.utf8CodePage) lines.push("chcp 65001 | Out-Null");
-      // 按需求把 %USERPROFILE%\.cargo\bin 拼到 PATH 最前面，
-      // 这样 cargo / rustc 与 pnpm 的子进程都能找到 Rust 工具链。
+      if (command.utf8CodePage) lines.push("chcp 65001 | Out-Null");
       var parts = [
-        "$env:PATH = (Join-Path $env:USERPROFILE '.cargo\\bin') + ';' + $env:PATH",
-        "Set-Location -LiteralPath '" + task.cwd + "'",
-        task.command
+        "$env:PATH = (Join-Path $env:USERPROFILE '.cargo\\bin') + ';' + $env:PATH"
       ];
+      if (typeof command.cwd === "string" && command.cwd.trim() !== "") {
+        parts.push("Set-Location -LiteralPath '" + command.cwd.trim().replace(/'/g, "''") + "'");
+      }
+      parts.push(command.command);
       lines.push(parts.join("; "));
-      // 说明：这里没有把任何用户输入拼进命令；cwd / command 都是源码里的常量。
       return lines;
     }
 
-    /** 创建终端；如果该 id 在本会话里已经被关闭过，用时间戳后缀换一个新 id 重试。 */
-    async function createTerminal(remote, sessionId, baseId, shellPath) {
+    async function createTerminal(remote, sessionId, baseId, shellPath, title) {
       var request = { id: baseId, cols: 120, rows: 30 };
       if (shellPath !== undefined) request.shellPath = shellPath;
       try {
         var info = unwrapResult(await remote.create(sessionId, request));
         return { id: baseId, info: info };
       } catch (error) {
-        // Host 会记住本会话内被关闭过的 terminal id（closedIds），
-        // 同一个 id 再次 create 会得到 terminal/unavailable。
         var code = error && error.code;
         var text = messageOf(error);
         var retryable = code === "terminal/unavailable" || /closed|unavailable/i.test(text);
@@ -541,87 +790,63 @@ window.__ModuleLoader__.load({
       }
     }
 
-    /** 重命名 Host 终端（显示在页签标题上）；失败不影响主流程。 */
     async function safeRename(remote, sessionId, terminalId, title) {
       try {
         unwrapResult(await remote.rename(sessionId, terminalId, title));
       } catch (_error) {
-        /* 标题只是展示信息，失败忽略 */
+        /* 标题只是展示信息 */
       }
     }
 
-    /**
-     * 通过 terminal/attach 双向流把一组命令行写进 PTY（每条后面补一个回车）。
-     *
-     * 为什么需要 attach：
-     *   Host 的远程 API 没有直接的 terminal/write，输入只能走 attach 流的 uplink：
-     *   handle.send({ type: "write", sequence, data: "命令行\r" })。
-     *
-     * 时序：
-     *   1. 此时终端刚创建、侧栏里还没有它的 view，所以我们是唯一附件，输入权限在我们手里；
-     *   2. 按顺序发送每一条写帧，并等待 Host 对应当前 sequence 的 ack（确认 shell 已收到），
-     *      每条最多等 10 秒；chcp 与真正命令分两条发送时，这个顺序保证第二行被读取时
-     *      控制台代码页已经切换完成；
-     *   3. 立刻 dispose 这条附件。之后侧栏终端页签再 attach 时会成为输入控制者，
-     *      用户可以在终端里继续输入（例如 Ctrl+C 停 dev）。
-     */
     async function sendCommands(remote, sessionId, terminalId, commandLines) {
       var controller = new AbortController();
       var handle = remote.attach(sessionId, terminalId, controller.signal);
       var iterator = null;
       try {
         if (typeof handle[Symbol.asyncIterator] !== "function") {
-          // 极少数实现可能不是可迭代句柄：把全部写帧发出后返回，让侧栏页签显示结果。
           for (var directIndex = 0; directIndex < commandLines.length; directIndex += 1) {
             handle.send({ type: "write", sequence: directIndex + 1, data: commandLines[directIndex] + "\r" });
           }
           return;
         }
         iterator = handle[Symbol.asyncIterator]();
-
         for (var index = 0; index < commandLines.length; index += 1) {
           var sequence = index + 1;
-          // sequence 从 1 开始且必须连续，Host 会校验。
           handle.send({ type: "write", sequence: sequence, data: commandLines[index] + "\r" });
-
           var acknowledged = false;
           while (!acknowledged) {
             var next = await withTimeout(iterator.next(), 10000, "等待 DSH 终端确认输入超时（10 秒）");
             if (next.done === true) throw new Error("DSH 终端连接在确认命令前结束");
             var frame = next.value;
             if (frame !== null && typeof frame === "object" && frame.type === "ack" && frame.sequence >= sequence) {
-              if (frame.refusal !== undefined) {
-                throw new Error("DSH 终端拒绝输入：" + String(frame.refusal));
-              }
+              if (frame.refusal !== undefined) throw new Error("DSH 终端拒绝输入：" + String(frame.refusal));
               acknowledged = true;
             }
           }
         }
       } finally {
-        // 中止并释放我们的附件：进程保留，只是不再占用输入控制。
         try {
           controller.abort();
         } catch (_error) {
-          /* AbortController.abort 不会失败 */
+          /* ignore */
         }
         if (handle !== null && typeof handle.dispose === "function") {
           try {
             handle.dispose();
           } catch (_error) {
-            /* 已释放 */
+            /* ignore */
           }
         }
         if (iterator !== null && typeof iterator.return === "function") {
           try {
             await iterator.return();
           } catch (_error) {
-            /* 流已关闭 */
+            /* ignore */
           }
         }
       }
     }
 
-    /** 刷新侧栏终端模型共用的「Host 终端列表」，否则新终端不会出现在页签恢复逻辑里。 */
     async function refreshTerminalInventory(ctx, sessionId) {
       var webTerminals = getService(ctx, "webTerminals");
       if (webTerminals === undefined || webTerminals === null) return;
@@ -629,17 +854,10 @@ window.__ModuleLoader__.load({
       try {
         await webTerminals.recover(sessionId, true);
       } catch (_error) {
-        // 列表刷新失败时 openTab 仍可能通过首次装载拿到列表；不阻断启动。
+        /* ignore */
       }
     }
 
-    /**
-     * 在侧栏已打开的 terminal 页签里找「已经绑定到这个 Host 终端 id」的那一个。
-     * 依次用三种来源判断（从最准确到最兜底）：
-     *   1. webTerminals.views：当前已挂载终端视图的 id（最准）；
-     *   2. webTerminals.bindings：localStorage 里 contentId -> terminalId 的持久绑定（刷新后也有）；
-     *   3. 页签导航参数 params.terminalId（刚 openTab 时写入的参数）。
-     */
     function findTerminalTab(ctx, sessionId, terminalId) {
       var sidebarRight = getService(ctx, "sidebarRight");
       var webTerminals = getService(ctx, "webTerminals");
@@ -649,22 +867,19 @@ window.__ModuleLoader__.load({
       for (var i = 0; i < tabs.length; i += 1) {
         var tab = tabs[i];
         if (tab.sessionId !== sessionId || tab.kind !== "terminal") continue;
-
         if (webTerminals !== undefined && webTerminals !== null && webTerminals.views !== undefined) {
           var views = webTerminals.views.get(sessionId);
           var view = views !== undefined ? views.get(tab.tabId) : undefined;
           if (view !== undefined && view.id === terminalId) return tab.tabId;
         }
-
         if (webTerminals !== undefined && webTerminals !== null && webTerminals.bindings !== undefined
           && typeof webTerminals.bindings.get === "function") {
           try {
             if (webTerminals.bindings.get(sessionId, tab.contentId) === terminalId) return tab.tabId;
           } catch (_error) {
-            /* bindings 是内部结构，读失败就换下一种方式 */
+            /* ignore */
           }
         }
-
         try {
           if (sidebarRight.tabDomain !== undefined && typeof sidebarRight.tabDomain.occurrence === "function") {
             var occurrence = sidebarRight.tabDomain.occurrence(sessionId, { id: tab.tabId });
@@ -672,24 +887,17 @@ window.__ModuleLoader__.load({
             if (params !== undefined && params !== null && params.terminalId === terminalId) return tab.tabId;
           }
         } catch (_error) {
-          /* 页签尚未完成 reconcile，跳过 */
+          /* ignore */
         }
       }
       return undefined;
     }
 
-    /**
-     * 打开 / 聚焦侧栏里的内置 terminal 页签，让用户立刻看到实时输出。
-     * - 已经存在同一终端的页签：聚焦它（必要时先展开右侧栏），不重复开页签；
-     * - 不存在：先刷新终端列表，再 openTab("terminal", { params: { terminalId } })，
-     *   内置终端组件会按 params.terminalId attach 到我们刚创建的 Host 终端，而不是新建进程。
-     */
     async function openOrFocusTab(ctx, sessionId, terminalId) {
       var sidebarRight = getService(ctx, "sidebarRight");
       if (sidebarRight === undefined || sidebarRight === null) {
         throw new Error("DSH 右侧栏服务（sidebarRight）不可用，无法打开内置终端面板");
       }
-
       var existingTabId = findTerminalTab(ctx, sessionId, terminalId);
       if (existingTabId !== undefined) {
         try {
@@ -698,27 +906,22 @@ window.__ModuleLoader__.load({
             sidebarRight.toggleExpanded();
           }
         } catch (_error) {
-          /* 展开失败也继续尝试聚焦 */
+          /* ignore */
         }
         try {
           if (typeof sidebarRight.focus === "function") sidebarRight.focus(existingTabId);
         } catch (_error) {
-          /* 聚焦失败不影响终端进程 */
+          /* ignore */
         }
         return;
       }
-
       await refreshTerminalInventory(ctx, sessionId);
-
       if (typeof sidebarRight.openTab !== "function") {
         throw new Error("DSH 右侧栏不支持 openTab，无法打开内置终端面板");
       }
-      // params 是页签导航参数：内置 terminal 类型会把它交给 webTerminals.view()，
-      // view() 看到 terminalId 就恢复已有终端（createWhenMissing=false），不会额外 spawn 进程。
       sidebarRight.openTab("terminal", { params: { terminalId: terminalId } });
     }
 
-    /** 关闭一个 Host 终端：优先走侧栏内置的关闭流程（会终止进程并移除页签）。 */
     async function closeTerminal(ctx, sessionId, terminalId) {
       var sidebarRight = getService(ctx, "sidebarRight");
       var tabId = findTerminalTab(ctx, sessionId, terminalId);
@@ -728,7 +931,7 @@ window.__ModuleLoader__.load({
           sidebarRight.closeIn(sessionId, tabId);
           return;
         } catch (_error) {
-          /* 找不到已收编的布局时退回 Remote close */
+          /* 回退 */
         }
       }
       var remote = getTerminalRemote(ctx);
@@ -736,24 +939,21 @@ window.__ModuleLoader__.load({
       try {
         unwrapResult(await remote.close(sessionId, terminalId));
       } catch (_error) {
-        /* 已关闭 / 已不存在都算成功 */
+        /* ignore */
       }
     }
 
-    /** 停止当前会话下所有由本插件创建的 Limob 终端。 */
     async function stopAllTerminals(ctx, sessionId) {
       var remote = getTerminalRemote(ctx);
       var registry = loadRegistry();
       var savedForSession = registry.sessions[sessionId] || {};
       var targets = {};
-      Object.keys(savedForSession).forEach(function (taskId) {
-        var entry = savedForSession[taskId];
+      Object.keys(savedForSession).forEach(function (commandId) {
+        var entry = savedForSession[commandId];
         if (entry !== undefined && entry !== null && typeof entry.terminalId === "string") {
           targets[entry.terminalId] = true;
         }
       });
-
-      // 兜底：Host 里还有以 limob- 开头、但本地记录丢了的终端，也一并收掉。
       if (remote !== undefined && remote !== null) {
         try {
           var list = await listTerminals(remote, sessionId);
@@ -765,238 +965,642 @@ window.__ModuleLoader__.load({
             }
           }
         } catch (_error) {
-          /* 列表读不到就只按本地记录关 */
+          /* ignore */
         }
       }
-
       var closedCount = 0;
       var ids = Object.keys(targets);
       for (var j = 0; j < ids.length; j += 1) {
         await closeTerminal(ctx, sessionId, ids[j]);
         closedCount += 1;
       }
-
       registry.sessions[sessionId] = {};
       saveRegistry(registry);
       return closedCount;
     }
 
-    // =====================================================================
-    // 六、本地记录（sessionId + taskId -> terminalId）
-    // =====================================================================
-    function loadRegistry() {
-      try {
-        if (typeof localStorage === "undefined") return { sessions: {} };
-        var raw = localStorage.getItem(STORAGE_KEY);
-        if (raw === null) return { sessions: {} };
-        var parsed = JSON.parse(raw);
-        if (parsed !== null && typeof parsed === "object" && parsed.sessions !== null && typeof parsed.sessions === "object") {
-          return parsed;
-        }
-      } catch (_error) {
-        /* 隐私模式 / 配额满时退回内存态 */
-      }
-      return { sessions: {} };
-    }
-
-    function saveRegistry(registry) {
-      try {
-        if (typeof localStorage === "undefined") return;
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(registry));
-      } catch (_error) {
-        /* 存不下也不影响本次会话内复用 */
-      }
-    }
-
-    function getSavedTerminalId(registry, sessionId, taskId) {
-      var session = registry.sessions[sessionId];
-      if (session === undefined || session === null) return undefined;
-      var entry = session[taskId];
-      if (entry === undefined || entry === null) return undefined;
-      return typeof entry.terminalId === "string" ? entry.terminalId : undefined;
-    }
-
-    function setSavedTerminalId(registry, sessionId, taskId, terminalId, title) {
-      if (registry.sessions[sessionId] === undefined || registry.sessions[sessionId] === null) {
-        registry.sessions[sessionId] = {};
-      }
-      registry.sessions[sessionId][taskId] = {
-        terminalId: terminalId,
-        title: title,
-        savedAt: Date.now()
-      };
-    }
-
-    // =====================================================================
-    // 七、React 组件：dock 里的「运行 Limob」按钮 + 下拉菜单
-    // =====================================================================
-
     /**
-     * 单个任务的启动流程：
-     *   - 已有同任务终端且仍在运行：聚焦终端页签，提示「已在运行」，绝不重复 spawn；
-     *   - 已有终端但进程已退出：先关掉旧终端释放配额，再创建新的；
-     *   - 没有终端：创建 -> 改名 -> 写命令 -> 打开内置终端页签。
+     * 运行一条配置命令：
+     *   - 同一命令已有运行中的终端 -> 聚焦，不重复启动；
+     *   - 已有终端但已退出 -> 关闭后重建；
+     *   - 否则创建终端、写命令、打开内置终端页签。
      */
-    async function runTask(ctx, sessionId, task) {
+    async function runCommand(ctx, sessionId, command) {
       var remote = getTerminalRemote(ctx);
       if (remote === undefined || remote === null) {
-        throw new Error("当前 DSH 没有暴露终端服务（remote.terminal），无法创建内置终端。请确认 DSH 版本支持 Web 终端。");
+        throw new Error("当前 DSH 没有暴露终端服务（remote.terminal），无法创建内置终端。");
       }
-
       var registry = loadRegistry();
-      var savedId = getSavedTerminalId(registry, sessionId, task.id);
+      var savedId = getSavedTerminalId(registry, sessionId, command.id);
       var list = await listTerminals(remote, sessionId);
-
-      // 寻找「同一个任务」的终端：先按本地记录 id，再按固定 id（limob-<taskId>）
-      // 或终端标题兜底。兜底很重要：localStorage 被清掉、或换了浏览器窗口时，
-      // 仍能认出上次开的 dev 终端，避免重复点击时多开一个 dev 进程。
-      var preferredIds = ["limob-" + task.id];
+      var preferredIds = ["limob-" + command.id];
       if (savedId !== undefined) preferredIds.unshift(savedId);
+      var terminalTitle = command.terminalTitle !== "" ? command.terminalTitle : ("Limob-" + command.id);
       var matches = list.filter(function (info) {
         if (info === null || info === undefined) return false;
         if (preferredIds.indexOf(info.id) !== -1) return true;
-        return info.title === task.terminalTitle;
+        return info.title === terminalTitle;
       });
       var existing = matches.find(function (info) {
         return info.state === "running";
       });
       if (existing === undefined) existing = matches[0];
       if (existing !== undefined && savedId !== existing.id) {
-        // 兜底命中时同步本地记录，后续复用 / 停止都走同一条路径。
-        setSavedTerminalId(registry, sessionId, task.id, existing.id, task.title);
+        setSavedTerminalId(registry, sessionId, command.id, existing.id, command.title);
         saveRegistry(registry);
         savedId = existing.id;
       }
-
       if (existing !== undefined && existing.state === "running") {
         await openOrFocusTab(ctx, sessionId, existing.id);
-        return { status: "reused", title: existing.title || task.terminalTitle };
+        return { status: "reused", title: existing.title || terminalTitle };
       }
-
       if (existing !== undefined && existing.state !== "running") {
-        // 上一轮命令已结束（例如构建完成）或启动失败：关闭以释放 maxTerminals 配额。
         await closeTerminal(ctx, sessionId, existing.id);
         if (registry.sessions[sessionId] !== undefined && registry.sessions[sessionId] !== null) {
-          delete registry.sessions[sessionId][task.id];
+          delete registry.sessions[sessionId][command.id];
         }
         saveRegistry(registry);
         savedId = undefined;
       }
-
       var shellPath = await pickShellPath(remote, sessionId);
-      var baseId = savedId !== undefined ? savedId : "limob-" + task.id;
-      var created = await createTerminal(remote, sessionId, baseId, shellPath);
-      await safeRename(remote, sessionId, created.id, task.terminalTitle);
-
-      setSavedTerminalId(registry, sessionId, task.id, created.id, task.title);
+      var baseId = savedId !== undefined ? savedId : ("limob-" + command.id);
+      var created = await createTerminal(remote, sessionId, baseId, shellPath, terminalTitle);
+      await safeRename(remote, sessionId, created.id, terminalTitle);
+      setSavedTerminalId(registry, sessionId, command.id, created.id, command.title);
       saveRegistry(registry);
-
       await refreshTerminalInventory(ctx, sessionId);
       try {
-        await sendCommands(remote, sessionId, created.id, buildCommandLines(task));
+        await sendCommands(remote, sessionId, created.id, buildCommandLines(command));
       } catch (error) {
-        // 命令没送进去时也把终端页签打开：用户至少能看到终端本身并手动输入。
         try {
           await openOrFocusTab(ctx, sessionId, created.id);
         } catch (_ignored) {
-          /* 打不开页签时保留原始错误 */
+          /* ignore */
         }
         throw error;
       }
       await openOrFocusTab(ctx, sessionId, created.id);
-      return { status: "created", title: task.terminalTitle };
+      return { status: "created", title: terminalTitle };
     }
 
-    function RunLimobDock(props) {
-      // sessionId 是 conversation.input.dock 的标准注入属性；
-      // 另外 owner props 里还有 session，可作兜底。
-      var sessionId = props && (props.sessionId || (props.session !== undefined && props.session !== null ? props.session.id : undefined));
-
-      var menuState = react.useState(false);
-      var menuOpen = menuState[0];
-      var setMenuOpen = menuState[1];
-
-      var busyState = react.useState(null);
-      var busy = busyState[0];
-      var setBusy = busyState[1];
-
-      var statusState = react.useState(null);
-      var status = statusState[0];
-      var setStatus = statusState[1];
-
-      // 更新检查状态：{ phase: "idle"|"checking"|"ready"|"error", available, latestVersion, message, releaseUrl }
-      var updatePair = react.useState({ phase: "checking" });
-      var updateStatus = updatePair[0];
-      var setUpdateStatus = updatePair[1];
-
-      var rootRef = react.useRef(null);
-
-      // 样式已在 factory 执行阶段注入（见 ensureStyles 调用处），这里只做兜底。
-      react.useEffect(function () {
-        ensureStyles();
-      }, []);
-
-      // 延迟检查 GitHub 是否有新 release（不阻塞 UI；失败静默，不打扰终端功能）。
+    // =====================================================================
+    // 八、更新状态 hook
+    // =====================================================================
+    function useUpdateStatus() {
+      var pair = react.useState({ phase: "checking" });
+      var state = pair[0];
+      var setState = pair[1];
       react.useEffect(function () {
         var alive = true;
         var timer = setTimeout(function () {
           checkForUpdateShared(false).then(function (result) {
-            if (alive) setUpdateStatus(result);
+            if (alive) setState(result);
           });
-        }, 1500);
+        }, 900);
         return function () {
           alive = false;
           clearTimeout(timer);
         };
       }, []);
+      return [state, setState];
+    }
 
-      // 挂载 / 切换会话时，从 Host 终端列表恢复「运行中」状态（刷新页面后也能显示）。
-      react.useEffect(function () {
-        var alive = true;
-        if (sessionId === undefined) return undefined;
+    function isOwnBundleSubject(subject) {
+      return subject !== undefined && subject !== null && subject.kind === "bundle"
+        && subject.pkg !== undefined && subject.pkg !== null && subject.pkg.name === PLUGIN_NAME;
+    }
 
-        var ctx = runtimeCtx;
-        var remote = getTerminalRemote(ctx);
-        if (remote === undefined || remote === null) {
-          setStatus({ phase: "error", text: "当前 DSH 未提供内置终端服务（remote.terminal）" });
-          return undefined;
+    /** 插件详情页标题旁：只有发现新版本时才显示。 */
+    function LimobUpdateBadge(props) {
+      if (!isOwnBundleSubject(props && props.subject)) return null;
+      var pair = useUpdateStatus();
+      var update = pair[0];
+      if (update === undefined || update === null || !update.available) return null;
+      return h("span", {
+        className: "dshLimobUpdateBadge",
+        title: "发现新版本 v" + update.latestVersion + "，打开本插件详情查看升级方式"
+      }, "可更新 v" + update.latestVersion);
+    }
+
+    /** 插件详情页底部：版本、检查按钮、升级命令与发布页。 */
+    function LimobUpdateSection(props) {
+      var subject = props && props.subject;
+      if (!isOwnBundleSubject(subject)) return null;
+      var updatePair = useUpdateStatus();
+      var update = updatePair[0];
+      var setUpdate = updatePair[1];
+      var copiedPair = react.useState(false);
+      var copied = copiedPair[0];
+      var setCopied = copiedPair[1];
+      var installed = subject.pkg !== undefined && subject.pkg !== null && typeof subject.pkg.version === "string"
+        ? subject.pkg.version
+        : PLUGIN_VERSION;
+      var checking = update !== undefined && update !== null && update.phase === "checking";
+      var latest = update !== undefined && update !== null && typeof update.latestVersion === "string"
+        ? ("v" + update.latestVersion)
+        : (checking ? "检查中…" : "未知");
+      var hint;
+      if (update !== undefined && update !== null && update.phase === "error") {
+        hint = "检查失败：" + update.message + "（不影响终端功能）";
+      } else if (update !== undefined && update !== null && update.available) {
+        hint = "发现新版本 v" + update.latestVersion + "，建议升级。";
+      } else if (update !== undefined && update !== null && update.phase === "ready") {
+        hint = "已是最新版本。";
+      } else {
+        hint = "正在检查 GitHub 更新…";
+      }
+      function handleCheckNow() {
+        setUpdate({ phase: "checking" });
+        checkForUpdateShared(true).then(function (result) {
+          setUpdate(result);
+        });
+      }
+      return h("section", { className: "dshLimobDetailSection" },
+        h("div", { className: "dshLimobDetailTitle" }, "Limob 运行器更新"),
+        h("div", { className: "dshLimobDetailMuted" }, "当前版本 v" + installed + " · GitHub 最新 " + latest),
+        h("div", null, hint),
+        h("div", { className: "dshLimobDetailMuted" },
+          "升级方式：退出 DeepSeek Harness 后在 profile 目录执行下面的命令；或在「插件 → 添加插件」里粘贴 "
+            + INSTALL_SPEC + " 重新安装（先卸载旧版）。"),
+        h("code", { className: "dshLimobDetailCode" }, UPGRADE_COMMAND),
+        h("div", { className: "dshLimobDetailActions" },
+          h("button", { type: "button", className: "dshLimobDetailBtn", disabled: checking, onClick: handleCheckNow },
+            checking ? "检查中…" : "检查更新"),
+          h("button", {
+            type: "button",
+            className: "dshLimobDetailBtn",
+            onClick: function () { setCopied(copyTextToClipboard(UPGRADE_COMMAND)); }
+          }, copied ? "已复制" : "复制升级命令"),
+          h("a", {
+            className: "dshLimobDetailBtn",
+            href: GITHUB_RELEASES_PAGE,
+            target: "_blank",
+            rel: "noreferrer"
+          }, "打开发布页")));
+    }
+
+    // =====================================================================
+    // 九、配置编辑器（设置页与浮动按钮弹窗共用）
+    // =====================================================================
+    function LimobConfigEditor(props) {
+      var config = useConfig();
+      var currentProjectPath = props.currentProjectPath;
+      var editingPair = react.useState(null);
+      var editing = editingPair[0];
+      var setEditing = editingPair[1];
+      var errorPair = react.useState("");
+      var error = errorPair[0];
+      var setError = errorPair[1];
+      var noticePair = react.useState("");
+      var notice = noticePair[0];
+      var setNotice = noticePair[1];
+      var deletePair = react.useState(null);
+      var pendingDelete = deletePair[0];
+      var setPendingDelete = deletePair[1];
+      var importPair = react.useState(false);
+      var importOpen = importPair[0];
+      var setImportOpen = importPair[1];
+      var importTextPair = react.useState("");
+      var importText = importTextPair[0];
+      var setImportText = importTextPair[1];
+      var resetPair = react.useState(false);
+      var resetArmed = resetPair[0];
+      var setResetArmed = resetPair[1];
+
+      function flash(text) {
+        setNotice(text);
+        setError("");
+      }
+
+      function startCreate() {
+        setEditing({
+          id: "",
+          title: "",
+          terminalTitle: "",
+          cwd: currentProjectPath !== undefined ? currentProjectPath : "",
+          command: "",
+          scope: "global",
+          projectRoot: "",
+          enabled: true,
+          utf8CodePage: false,
+          longRunning: false
+        });
+        setError("");
+      }
+
+      function startEdit(command) {
+        setEditing(Object.assign({}, command, { terminalTitle: command.terminalTitle || "" }));
+        setError("");
+      }
+
+      function updateDraft(field, value) {
+        if (editing === null) return;
+        var next = Object.assign({}, editing);
+        next[field] = value;
+        if (field === "command") {
+          // 含中文时自动建议 UTF-8（用户可手动关闭）。
+          if (/[^\x00-\x7f]/.test(String(value))) next.utf8CodePage = true;
         }
+        setEditing(next);
+      }
 
-        (async function () {
-          try {
-            var list = await listTerminals(remote, sessionId);
-            var registry = loadRegistry();
-            var saved = registry.sessions[sessionId] || {};
-            var taskIds = Object.keys(saved);
-            for (var i = 0; i < taskIds.length; i += 1) {
-              var taskId = taskIds[i];
-              var entry = saved[taskId];
-              if (entry === undefined || entry === null) continue;
-              var live = list.find(function (info) {
-                return info !== null && info !== undefined && info.id === entry.terminalId;
-              });
-              if (live !== undefined && live.state === "running") {
-                var task = TASK_BY_ID[taskId];
-                if (alive) {
-                  setStatus({
-                    phase: "running",
-                    text: "运行中 · " + (task !== undefined ? task.title : live.title || "Limob 终端")
-                  });
-                }
-                break;
-              }
-            }
-          } catch (_error) {
-            /* 状态恢复失败不打扰用户 */
+      function saveDraft() {
+        if (editing === null) return;
+        var normalized = normalizeCommand(editing);
+        if (normalized === null) {
+          setError("请填写名称、工作目录、命令；作用域为「仅项目」时还要填写项目根目录。");
+          return;
+        }
+        if (normalized.id === "") normalized.id = makeId();
+        var next = Object.assign({}, config, { commands: config.commands.slice() });
+        var index = -1;
+        for (var i = 0; i < next.commands.length; i += 1) {
+          if (next.commands[i].id === normalized.id) {
+            index = i;
+            break;
           }
-        })();
+        }
+        if (index === -1) next.commands.push(normalized);
+        else next.commands[index] = normalized;
+        saveConfig(next);
+        setEditing(null);
+        setError("");
+        flash("已保存命令：" + normalized.title);
+      }
 
+      function removeCommand(id) {
+        var next = Object.assign({}, config, {
+          commands: config.commands.filter(function (command) {
+            return command.id !== id;
+          })
+        });
+        saveConfig(next);
+        setPendingDelete(null);
+        flash("已删除命令");
+      }
+
+      function moveCommand(index, delta) {
+        var target = index + delta;
+        if (target < 0 || target >= config.commands.length) return;
+        var commands = config.commands.slice();
+        var moved = commands[index];
+        commands[index] = commands[target];
+        commands[target] = moved;
+        saveConfig(Object.assign({}, config, { commands: commands }));
+      }
+
+      function toggleEnabled(command) {
+        var commands = config.commands.map(function (item) {
+          if (item.id !== command.id) return item;
+          return Object.assign({}, item, { enabled: !item.enabled });
+        });
+        saveConfig(Object.assign({}, config, { commands: commands }));
+      }
+
+      function resetDefaults() {
+        if (!resetArmed) {
+          setResetArmed(true);
+          flash("再点一次「确认恢复内置命令」：会清空自定义命令（浮动按钮设置保留）。");
+          return;
+        }
+        var defaults = defaultConfig();
+        defaults.ui = config.ui;
+        saveConfig(defaults);
+        setEditing(null);
+        setResetArmed(false);
+        flash("已恢复内置的 4 条命令");
+      }
+
+      function resetFloating() {
+        var next = Object.assign({}, config, { ui: Object.assign({}, config.ui, { floating: null }) });
+        saveConfig(next);
+        flash("浮动按钮位置已重置");
+      }
+
+      function toggleVisible() {
+        var next = Object.assign({}, config, {
+          ui: Object.assign({}, config.ui, { visible: !config.ui.visible })
+        });
+        saveConfig(next);
+        flash(config.ui.visible ? "已隐藏浮动按钮（在设置里可重新显示）" : "已显示浮动按钮");
+      }
+
+      function exportConfig() {
+        var copied = copyTextToClipboard(JSON.stringify(config, null, 2));
+        flash(copied ? "配置 JSON 已复制到剪贴板" : "复制失败，请重试");
+      }
+
+      function applyImport() {
+        try {
+          var parsed = JSON.parse(importText);
+          var normalized = normalizeConfig(parsed);
+          saveConfig(normalized);
+          setImportOpen(false);
+          setImportText("");
+          setEditing(null);
+          setResetArmed(false);
+          flash("已导入配置（" + normalized.commands.length + " 条命令）");
+        } catch (importError) {
+          setError("导入失败：" + messageOf(importError));
+        }
+      }
+
+      function scopeTag(command) {
+        if (command.scope === "project") {
+          return "项目 · " + (command.projectRoot || "未设置");
+        }
+        return "全局";
+      }
+
+      return h("div", { className: "dshLimobCfg" },
+        h("div", { className: "dshLimobCfgMuted" },
+          currentProjectPath !== undefined && currentProjectPath !== ""
+            ? "当前工作区：" + currentProjectPath + "（项目命令只在这个项目里显示）"
+            : "当前不在会话里；项目命令需要进入对应工作区的会话后才显示。"),
+
+        // 浮动按钮设置
+        h("div", { className: "dshLimobCfgCard" },
+          h("div", { className: "dshLimobCfgH" }, h("span", null, "浮动按钮"), h("span", { className: "dshLimobCfgMuted" }, "v" + PLUGIN_VERSION)),
+          h("div", { className: "dshLimobCfgRow" },
+            h("label", { className: "dshLimobCfgCheck" },
+              h("input", { type: "checkbox", checked: config.ui.visible, onChange: toggleVisible }),
+              "显示浮动按钮"),
+            h("button", { type: "button", className: "dshLimobCfgBtn", onClick: resetFloating }, "重置按钮位置"),
+            h("span", { className: "dshLimobCfgMuted" }, "按钮可拖动，位置会自动记住。"))),
+
+        // 命令列表
+        h("div", { className: "dshLimobCfgCard" },
+          h("div", { className: "dshLimobCfgH" },
+            h("span", null, "命令（" + config.commands.length + "）"),
+            h("button", { type: "button", className: "dshLimobCfgBtn dshLimobCfgBtnPrimary", onClick: startCreate }, "新增命令")),
+          config.commands.length === 0
+            ? h("div", { className: "dshLimobCfgMuted" }, "还没有命令，点「新增命令」添加一条。")
+            : h("div", { className: "dshLimobCfgList" },
+              config.commands.map(function (command, index) {
+                return h("div", {
+                  key: command.id,
+                  className: "dshLimobCfgItem",
+                  "data-disabled": command.enabled ? "false" : "true"
+                },
+                  h("div", { className: "dshLimobCfgItemMain" },
+                    h("div", { className: "dshLimobCfgItemTitle" }, command.title),
+                    h("div", { className: "dshLimobCfgItemCmd" }, command.command)),
+                  h("span", { className: "dshLimobCfgTag" }, scopeTag(command)),
+                  h("label", { className: "dshLimobCfgCheck" },
+                    h("input", {
+                      type: "checkbox",
+                      checked: command.enabled,
+                      onChange: function () { toggleEnabled(command); }
+                    }),
+                    "启用"),
+                  h("button", {
+                    type: "button",
+                    className: "dshLimobCfgBtn",
+                    disabled: index === 0,
+                    title: "上移",
+                    onClick: function () { moveCommand(index, -1); }
+                  }, "↑"),
+                  h("button", {
+                    type: "button",
+                    className: "dshLimobCfgBtn",
+                    disabled: index === config.commands.length - 1,
+                    title: "下移",
+                    onClick: function () { moveCommand(index, 1); }
+                  }, "↓"),
+                  h("button", {
+                    type: "button",
+                    className: "dshLimobCfgBtn",
+                    onClick: function () { startEdit(command); }
+                  }, "编辑"),
+                  pendingDelete === command.id
+                    ? h("span", { className: "dshLimobCfgRow" },
+                        h("button", {
+                          type: "button",
+                          className: "dshLimobCfgBtn dshLimobCfgBtnDanger",
+                          onClick: function () { removeCommand(command.id); }
+                        }, "确认删除"),
+                        h("button", {
+                          type: "button",
+                          className: "dshLimobCfgBtn",
+                          onClick: function () { setPendingDelete(null); }
+                        }, "取消"))
+                    : h("button", {
+                        type: "button",
+                        className: "dshLimobCfgBtn dshLimobCfgBtnDanger",
+                        onClick: function () { setPendingDelete(command.id); }
+                      }, "删除"));
+              }))),
+
+        // 编辑表单
+        editing !== null
+          ? h("div", { className: "dshLimobCfgCard" },
+            h("div", { className: "dshLimobCfgH" },
+              h("span", null, editing.id === "" ? "新增命令" : "编辑命令"),
+              h("button", {
+                type: "button",
+                className: "dshLimobCfgBtn",
+                onClick: function () { setEditing(null); setError(""); }
+              }, "取消")),
+            h("div", { className: "dshLimobCfgRow" },
+              h("label", { className: "dshLimobCfgField" },
+                h("span", null, "名称 *"),
+                h("input", {
+                  className: "dshLimobCfgInput",
+                  value: editing.title,
+                  placeholder: "例如：开发调试",
+                  onChange: function (event) { updateDraft("title", event.target.value); }
+                })),
+              h("label", { className: "dshLimobCfgField" },
+                h("span", null, "终端标题（可选）"),
+                h("input", {
+                  className: "dshLimobCfgInput",
+                  value: editing.terminalTitle,
+                  placeholder: "默认 Limob-<id>",
+                  onChange: function (event) { updateDraft("terminalTitle", event.target.value); }
+                }))),
+            h("label", { className: "dshLimobCfgField" },
+              h("span", null, "工作目录 *"),
+              h("input", {
+                className: "dshLimobCfgInput",
+                value: editing.cwd,
+                placeholder: "H:\\Limob-windows",
+                onChange: function (event) { updateDraft("cwd", event.target.value); }
+              })),
+            h("label", { className: "dshLimobCfgField" },
+              h("span", null, "命令（PowerShell，固定文本）*"),
+              h("textarea", {
+                className: "dshLimobCfgTextarea",
+                value: editing.command,
+                placeholder: "pnpm 客户端-调试",
+                onChange: function (event) { updateDraft("command", event.target.value); }
+              })),
+            h("div", { className: "dshLimobCfgRow" },
+              h("label", { className: "dshLimobCfgField" },
+                h("span", null, "作用域"),
+                h("select", {
+                  className: "dshLimobCfgSelect",
+                  value: editing.scope,
+                  onChange: function (event) { updateDraft("scope", event.target.value); }
+                },
+                  h("option", { value: "global" }, "全局（所有项目都显示）"),
+                  h("option", { value: "project" }, "仅项目（只在指定项目显示）"))),
+              editing.scope === "project"
+                ? h("label", { className: "dshLimobCfgField" },
+                    h("span", null, "项目根目录 *"),
+                    h("input", {
+                      className: "dshLimobCfgInput",
+                      value: editing.projectRoot,
+                      placeholder: "H:\\Limob-windows",
+                      onChange: function (event) { updateDraft("projectRoot", event.target.value); }
+                    }))
+                : null),
+            editing.scope === "project"
+              ? h("div", { className: "dshLimobCfgRow" },
+                  h("button", {
+                    type: "button",
+                    className: "dshLimobCfgBtn",
+                    disabled: currentProjectPath === undefined || currentProjectPath === "",
+                    onClick: function () { updateDraft("projectRoot", currentProjectPath || ""); }
+                  }, "填入当前工作区"))
+              : null,
+            h("div", { className: "dshLimobCfgRow" },
+              h("label", { className: "dshLimobCfgCheck" },
+                h("input", {
+                  type: "checkbox",
+                  checked: editing.utf8CodePage,
+                  onChange: function (event) { updateDraft("utf8CodePage", event.target.checked); }
+                }),
+                "命令含中文时先执行 chcp 65001（推荐）"),
+              h("label", { className: "dshLimobCfgCheck" },
+                h("input", {
+                  type: "checkbox",
+                  checked: editing.enabled,
+                  onChange: function (event) { updateDraft("enabled", event.target.checked); }
+                }),
+                "启用")),
+            h("div", { className: "dshLimobCfgRow" },
+              h("button", { type: "button", className: "dshLimobCfgBtn dshLimobCfgBtnPrimary", onClick: saveDraft }, "保存"),
+              h("button", {
+                type: "button",
+                className: "dshLimobCfgBtn",
+                onClick: function () { setEditing(null); setError(""); }
+              }, "取消")))
+          : null,
+
+        // 导入/导出/重置
+        h("div", { className: "dshLimobCfgCard" },
+          h("div", { className: "dshLimobCfgH" }, h("span", null, "备份与维护")),
+          h("div", { className: "dshLimobCfgRow" },
+            h("button", { type: "button", className: "dshLimobCfgBtn", onClick: exportConfig }, "导出配置 JSON"),
+            h("button", {
+              type: "button",
+              className: "dshLimobCfgBtn",
+              onClick: function () { setImportOpen(!importOpen); setError(""); }
+            }, importOpen ? "收起导入" : "导入配置"),
+            h("button", {
+              type: "button",
+              className: "dshLimobCfgBtn dshLimobCfgBtnDanger",
+              onClick: resetDefaults
+            }, resetArmed ? "确认恢复内置命令" : "恢复内置命令")),
+          importOpen
+            ? h("div", { className: "dshLimobCfgRow" },
+                h("textarea", {
+                  className: "dshLimobCfgTextarea",
+                  style: { flex: "1 1 100%", minHeight: "90px" },
+                  value: importText,
+                  placeholder: "粘贴导出的配置 JSON"
+                , onChange: function (event) { setImportText(event.target.value); } }),
+                h("button", { type: "button", className: "dshLimobCfgBtn dshLimobCfgBtnPrimary", onClick: applyImport }, "导入"),
+                h("button", {
+                  type: "button",
+                  className: "dshLimobCfgBtn",
+                  onClick: function () { setImportOpen(false); setImportText(""); }
+                }, "取消"))
+            : null),
+
+        error !== "" ? h("div", { className: "dshLimobCfgError" }, error) : null,
+        notice !== "" ? h("div", { className: "dshLimobCfgNotice" }, notice) : null
+      );
+    }
+
+    // =====================================================================
+    // 十、设置页 section（Settings 弹窗左侧新增一个 Tab）
+    // =====================================================================
+    function LimobSettingsSection(props) {
+      var active = useActiveSession(props);
+      return h("div", { className: "dshLimobCfgPage" },
+        h("div", { className: "dshLimobCfgCard" },
+          h("div", { className: "dshLimobCfgH" },
+            h("span", null, "Limob 运行器"),
+            h("span", { className: "dshLimobCfgMuted" }, "v" + PLUGIN_VERSION)),
+          h("div", { className: "dshLimobCfgMuted" },
+            "配置「运行 Limob」浮动按钮里出现的命令：新增/编辑/删除/排序/启停，以及全局或仅当前项目显示。")),
+        h(LimobConfigEditor, { currentProjectPath: active.projectPath }));
+    }
+
+    // =====================================================================
+    // 十一、浮动按钮（shell.overlay，可拖动 + 位置记忆）
+    // =====================================================================
+    function clampNumber(value, min, max) {
+      if (value < min) return min;
+      if (value > max) return max;
+      return value;
+    }
+
+    function defaultFabPosition(viewport) {
+      return {
+        x: clampNumber(viewport.width - 72, 8, Math.max(8, viewport.width - 52)),
+        y: clampNumber(viewport.height - 250, 8, Math.max(8, viewport.height - 52))
+      };
+    }
+
+    function LimobFab(props) {
+      var config = useConfig();
+      var active = useActiveSession(props);
+      var viewport = useViewport();
+      var updatePair = useUpdateStatus();
+      var updateStatus = updatePair[0];
+
+      var menuPair = react.useState(false);
+      var menuOpen = menuPair[0];
+      var setMenuOpen = menuPair[1];
+      var dragPair = react.useState(null);
+      var dragover = dragPair[0];
+      var setDragover = dragPair[1];
+      var dragInfoRef = react.useRef(null);
+      var rootRef = react.useRef(null);
+      var busyPair = react.useState(null);
+      var busy = busyPair[0];
+      var setBusy = busyPair[1];
+      var statusPair = react.useState(null);
+      var status = statusPair[0];
+      var setStatus = statusPair[1];
+      var runningPair = react.useState({});
+      var running = runningPair[0];
+      var setRunning = runningPair[1];
+      var configOpenPair = react.useState(false);
+      var configOpen = configOpenPair[0];
+      var setConfigOpen = configOpenPair[1];
+
+      var commands = visibleCommands(config, active.projectPath, active.sessionId !== undefined);
+      var stored = config.ui.floating;
+      var basePos = stored !== null && stored !== undefined ? stored : defaultFabPosition(viewport);
+      var fabPos = {
+        x: clampNumber(dragover !== null ? dragover.x : basePos.x, 8, Math.max(8, viewport.width - 52)),
+        y: clampNumber(dragover !== null ? dragover.y : basePos.y, 8, Math.max(8, viewport.height - 52))
+      };
+
+      react.useEffect(function () {
+        if (status === null) return undefined;
+        var timer = setTimeout(function () {
+          setStatus(null);
+        }, 6000);
         return function () {
-          alive = false;
+          clearTimeout(timer);
         };
-      }, [sessionId]);
+      }, [status]);
 
-      // 点菜单外部 / 按 Esc 关闭菜单。
+      // 点菜单外部关闭菜单。
       react.useEffect(function () {
         if (!menuOpen) return undefined;
         function onPointerDown(event) {
@@ -1014,25 +1618,113 @@ window.__ModuleLoader__.load({
         };
       }, [menuOpen]);
 
-      function handleTaskClick(task) {
+      async function refreshRunning() {
+        if (active.sessionId === undefined) {
+          setRunning({});
+          return;
+        }
+        var remote = getTerminalRemote(runtimeCtx);
+        if (remote === undefined || remote === null) return;
+        try {
+          var list = await listTerminals(remote, active.sessionId);
+          var registry = loadRegistry();
+          var saved = registry.sessions[active.sessionId] || {};
+          var next = {};
+          Object.keys(saved).forEach(function (commandId) {
+            var entry = saved[commandId];
+            if (entry === undefined || entry === null) return;
+            var live = list.find(function (info) {
+              return info !== null && info !== undefined && info.id === entry.terminalId;
+            });
+            if (live !== undefined && live.state === "running") next[commandId] = true;
+          });
+          setRunning(next);
+        } catch (_error) {
+          /* ignore */
+        }
+      }
+
+      function toggleMenu() {
+        if (!menuOpen) refreshRunning();
+        setMenuOpen(!menuOpen);
+      }
+
+      function onPointerDown(event) {
+        if (event.button !== undefined && event.button !== 0) return;
         if (busy !== null) return;
-        var ctx = runtimeCtx;
-        if (ctx === null) return;
-        if (sessionId === undefined) {
-          setStatus({ phase: "error", text: "请先进入一个会话，再运行 Limob 命令" });
+        dragInfoRef.current = {
+          pointerId: event.pointerId,
+          startX: event.clientX,
+          startY: event.clientY,
+          originX: fabPos.x,
+          originY: fabPos.y,
+          lastX: fabPos.x,
+          lastY: fabPos.y,
+          moved: false
+        };
+        try {
+          event.currentTarget.setPointerCapture(event.pointerId);
+        } catch (_error) {
+          /* ignore */
+        }
+        event.preventDefault();
+      }
+
+      function onPointerMove(event) {
+        var info = dragInfoRef.current;
+        if (info === null || info.pointerId !== event.pointerId) return;
+        var dx = event.clientX - info.startX;
+        var dy = event.clientY - info.startY;
+        if (!info.moved && Math.abs(dx) + Math.abs(dy) > 4) {
+          info.moved = true;
+          setMenuOpen(false);
+        }
+        if (info.moved) {
+          var nextX = clampNumber(info.originX + dx, 8, Math.max(8, viewport.width - 52));
+          var nextY = clampNumber(info.originY + dy, 8, Math.max(8, viewport.height - 52));
+          info.lastX = nextX;
+          info.lastY = nextY;
+          setDragover({ x: nextX, y: nextY });
+        }
+      }
+
+      function onPointerUp(event) {
+        var info = dragInfoRef.current;
+        dragInfoRef.current = null;
+        try {
+          event.currentTarget.releasePointerCapture(event.pointerId);
+        } catch (_error) {
+          /* ignore */
+        }
+        if (info === null) return;
+        if (info.moved) {
+          var next = Object.assign({}, config, {
+            ui: Object.assign({}, config.ui, { floating: { x: info.lastX, y: info.lastY } })
+          });
+          saveConfig(next);
+          setDragover(null);
+          setStatus({ phase: "idle", text: "浮动按钮位置已记住" });
+        } else {
+          toggleMenu();
+        }
+      }
+
+      function handleRun(command) {
+        if (busy !== null) return;
+        if (active.sessionId === undefined) {
+          setStatus({ phase: "error", text: "请先进入一个会话，再运行命令" });
           return;
         }
         setMenuOpen(false);
-        setBusy(task.id);
-        setStatus({ phase: "starting", text: "正在创建 DSH 终端 · " + task.title });
-
-        runTask(ctx, sessionId, task).then(
+        setBusy(command.id);
+        setStatus({ phase: "starting", text: "正在启动：" + command.title });
+        runCommand(runtimeCtx, active.sessionId, command).then(
           function (result) {
-            if (result.status === "reused") {
-              setStatus({ phase: "running", text: "已在运行 · 已切换到 " + result.title });
-            } else {
-              setStatus({ phase: "running", text: "运行中 · " + result.title + "（右侧栏终端）" });
-            }
+            setStatus({
+              phase: "running",
+              text: result.status === "reused" ? ("已在运行 · 已切换到 " + result.title) : ("运行中 · " + result.title)
+            });
+            refreshRunning();
           },
           function (error) {
             setStatus({ phase: "error", text: "启动失败：" + messageOf(error) });
@@ -1042,21 +1734,15 @@ window.__ModuleLoader__.load({
         });
       }
 
-      function handleStopClick() {
-        if (busy !== null) return;
-        var ctx = runtimeCtx;
-        if (ctx === null) return;
-        if (sessionId === undefined) return;
+      function handleStopAll() {
+        if (busy !== null || active.sessionId === undefined) return;
         setMenuOpen(false);
         setBusy("__stop__");
         setStatus({ phase: "starting", text: "正在停止 Limob 终端…" });
-
-        stopAllTerminals(ctx, sessionId).then(
+        stopAllTerminals(runtimeCtx, active.sessionId).then(
           function (count) {
-            setStatus({
-              phase: count > 0 ? "idle" : "idle",
-              text: count > 0 ? "已停止 Limob 终端（" + count + " 个）" : "当前没有正在运行的 Limob 终端"
-            });
+            setStatus({ phase: "idle", text: count > 0 ? ("已停止 Limob 终端（" + count + " 个）") : "当前没有正在运行的 Limob 终端" });
+            setRunning({});
           },
           function (error) {
             setStatus({ phase: "error", text: "停止失败：" + messageOf(error) });
@@ -1066,325 +1752,177 @@ window.__ModuleLoader__.load({
         });
       }
 
-      // 「检查更新」：忽略 6 小时缓存，手动查一次。
-      function handleManualUpdateCheck() {
-        setUpdateStatus({ phase: "checking" });
+      function handleCheckUpdate() {
+        setStatus({ phase: "starting", text: "正在检查 GitHub 更新…" });
         checkForUpdateShared(true).then(function (result) {
-          setUpdateStatus(result);
+          if (result.phase === "error") {
+            setStatus({ phase: "error", text: "检查更新失败：" + result.message });
+          } else if (result.available) {
+            setStatus({ phase: "idle", text: "发现新版本 v" + result.latestVersion });
+          } else {
+            setStatus({ phase: "idle", text: "已是最新版本 v" + PLUGIN_VERSION });
+          }
         });
       }
 
-      // 点击更新提示：跳到 DSH 插件页的本插件详情（那里有完整升级说明）。
-      function handleOpenUpdate() {
+      function handleUpdateClick() {
         setMenuOpen(false);
         openPluginUpdatePage(runtimeCtx, updateStatus && updateStatus.releaseUrl, function (text) {
           setStatus({ phase: "idle", text: text });
         });
       }
 
-      var trigger = h(
-        "button",
-        {
-          type: "button",
-          className: "dshLimob-trigger",
-          "data-busy": busy !== null ? "true" : "false",
-          title: "在 DSH 自带终端里运行 Limob 项目命令（不打开系统终端）",
-          onClick: function () {
-            if (busy !== null) return;
-            setMenuOpen(!menuOpen);
-          }
-        },
-        h("span", { "aria-hidden": "true" }, "▶"),
-        h("span", null, "运行 Limob"),
-        h("span", { className: "dshLimob-caret", "aria-hidden": "true" })
+      if (config.ui.visible === false) return null;
+
+      var menuWidth = Math.min(360, viewport.width - 16);
+      var menuLeft = clampNumber(
+        fabPos.x > viewport.width / 2 ? fabPos.x + 44 - menuWidth : fabPos.x,
+        8,
+        Math.max(8, viewport.width - menuWidth - 8)
       );
-
-      var menuChildren = [];
-
-      // 有更新时，菜单最上方先放一条醒目的更新提示。
-      if (updateStatus !== null && updateStatus.available) {
-        menuChildren.push(
-          h(
-            "button",
-            {
-              key: "menu-update",
-              type: "button",
-              className: "dshLimob-item",
-              onClick: handleOpenUpdate
-            },
-            h("span", { className: "dshLimob-title" }, "发现新版本 v" + updateStatus.latestVersion),
-            h("span", { className: "dshLimob-cmd" }, "点击查看升级方式（当前 v" + PLUGIN_VERSION + "）")
-          )
-        );
+      var menuStyle = { width: menuWidth + "px", left: menuLeft + "px" };
+      if (fabPos.y > viewport.height / 2) {
+        // 按钮在屏幕下半部：菜单向上展开。
+        menuStyle.bottom = clampNumber(viewport.height - fabPos.y + 8, 8, viewport.height - 40) + "px";
+      } else {
+        menuStyle.top = clampNumber(fabPos.y + 52, 8, Math.max(8, viewport.height - 120)) + "px";
       }
-
-      menuChildren.push(
-        h("div", { key: "menu-title", className: "dshLimob-menuTitle" }, "在 DSH 内置终端中运行")
-      );
-
-      TASKS.forEach(function (task) {
-        menuChildren.push(
-          h(
-            "button",
-            {
-              key: task.id,
-              type: "button",
-              className: "dshLimob-item",
-              disabled: busy !== null,
-              onClick: function () {
-                handleTaskClick(task);
-              }
-            },
-            h("span", { className: "dshLimob-title" }, task.title),
-            h("span", { className: "dshLimob-cmd" }, task.command)
-          )
-        );
-      });
-
-      menuChildren.push(
-        h("div", { key: "menu-sep", className: "dshLimob-sep" }),
-        h(
-          "button",
-          {
-            key: "menu-stop",
-            type: "button",
-            className: "dshLimob-item dshLimob-stop",
-            disabled: busy !== null,
-            onClick: handleStopClick
-          },
-          h("span", { className: "dshLimob-title" }, "停止 Limob 终端"),
-          h("span", { className: "dshLimob-cmd" }, "关闭本会话里由本插件创建的终端进程")
-        )
-      );
-
-      // 菜单底部固定一个「检查更新」入口。
-      menuChildren.push(
-        h("div", { key: "menu-sep-update", className: "dshLimob-sep" }),
-        h(
-          "button",
-          {
-            key: "menu-check-update",
-            type: "button",
-            className: "dshLimob-item",
-            disabled: updateStatus !== null && updateStatus.phase === "checking",
-            onClick: handleManualUpdateCheck
-          },
-          h(
-            "span",
-            { className: "dshLimob-title" },
-            updateStatus !== null && updateStatus.phase === "checking" ? "正在检查更新…" : "检查更新"
-          ),
-          h(
-            "span",
-            { className: "dshLimob-cmd" },
-            updateStatus !== null && updateStatus.latestVersion
-              ? "GitHub 最新 release：v" + updateStatus.latestVersion
-              : "从 GitHub Releases 检查新版本（当前 v" + PLUGIN_VERSION + "）"
-          )
-        )
-      );
-
-      var menu = menuOpen
-        ? h("div", { className: "dshLimob-menu", role: "menu" }, menuChildren)
+      var menu = menuOpen ? h("div", { className: "dshLimobFabMenu", style: menuStyle, role: "menu" },
+        updateStatus !== null && updateStatus.available
+          ? h("button", { type: "button", className: "dshLimobFabItem", onClick: handleUpdateClick },
+              h("span", { className: "dshLimobFabItemMain" },
+                h("span", { className: "dshLimobFabItemTitle" }, "发现新版本 v" + updateStatus.latestVersion),
+                h("span", { className: "dshLimobFabItemCmd" }, "点击查看升级方式（当前 v" + PLUGIN_VERSION + "）")))
+          : null,
+        h("div", { className: "dshLimobFabMenuTitle" },
+          h("span", null, "运行 Limob 命令"),
+          h("span", null, active.projectPath !== undefined ? String(active.projectPath) : (active.sessionId !== undefined ? "当前会话" : "未进入会话"))),
+        active.sessionId === undefined
+          ? h("div", { className: "dshLimobFabMenuTitle" }, "先进入一个会话才能运行命令（全局命令也需要会话）")
+          : null,
+        commands.length === 0
+          ? h("div", { className: "dshLimobFabMenuTitle" }, "当前项目没有可用命令：去「管理命令」里添加，或把命令作用域设为全局。")
+          : commands.map(function (command) {
+              return h("button", {
+                key: command.id,
+                type: "button",
+                className: "dshLimobFabItem",
+                disabled: busy !== null || active.sessionId === undefined,
+                onClick: function () { handleRun(command); }
+              },
+                running[command.id] ? h("span", { className: "dshLimobFabRunDot", title: "运行中" }) : null,
+                h("span", { className: "dshLimobFabItemMain" },
+                  h("span", { className: "dshLimobFabItemTitle" }, command.title),
+                  h("span", { className: "dshLimobFabItemCmd" }, command.command)),
+                h("span", { className: "dshLimobFabTag" }, command.scope === "project" ? "项目" : "全局"));
+            }),
+        h("div", { className: "dshLimobFabSep" }),
+        h("button", {
+          type: "button",
+          className: "dshLimobFabItem",
+          disabled: busy !== null || active.sessionId === undefined,
+          onClick: handleStopAll
+        },
+          h("span", { className: "dshLimobFabItemMain" },
+            h("span", { className: "dshLimobFabItemTitle" }, "停止本会话 Limob 终端"),
+            h("span", { className: "dshLimobFabItemCmd" }, "关闭由本插件创建的终端进程"))),
+        h("button", {
+          type: "button",
+          className: "dshLimobFabItem",
+          onClick: function () { setMenuOpen(false); setConfigOpen(true); }
+        },
+          h("span", { className: "dshLimobFabItemMain" },
+            h("span", { className: "dshLimobFabItemTitle" }, "管理命令…"),
+            h("span", { className: "dshLimobFabItemCmd" }, "新增/编辑/删除/排序，设置全局或项目作用域"))),
+        h("button", {
+          type: "button",
+          className: "dshLimobFabItem",
+          disabled: updateStatus !== null && updateStatus.phase === "checking",
+          onClick: handleCheckUpdate
+        },
+          h("span", { className: "dshLimobFabItemMain" },
+            h("span", { className: "dshLimobFabItemTitle" }, updateStatus !== null && updateStatus.phase === "checking" ? "正在检查更新…" : "检查更新"),
+            h("span", { className: "dshLimobFabItemCmd" },
+              updateStatus !== null && updateStatus.latestVersion
+                ? "GitHub 最新 release：v" + updateStatus.latestVersion
+                : "从 GitHub Releases 检查新版本（当前 v" + PLUGIN_VERSION + "）"))))
         : null;
 
-      var statusNode = null;
+      var toast = null;
       if (status !== null) {
-        var phase = status.phase || "idle";
-        statusNode = h(
-          "span",
-          { className: "dshLimob-status", title: status.text },
-          h("span", { className: "dshLimob-dot", "data-phase": phase, "aria-hidden": "true" }),
-          h("span", { className: "dshLimob-statusText" }, status.text)
-        );
+        // toast 与菜单互不遮挡：菜单向上弹时 toast 放按钮下方；贴近底部时改放按钮左侧。
+        var toastStyle = {};
+        if (fabPos.y > viewport.height * 0.72) {
+          toastStyle.right = clampNumber(viewport.width - fabPos.x + 8, 8, Math.max(8, viewport.width - 80)) + "px";
+          toastStyle.top = clampNumber(fabPos.y, 8, Math.max(8, viewport.height - 60)) + "px";
+        } else if (fabPos.y > viewport.height / 2) {
+          toastStyle.left = clampNumber(fabPos.x, 8, Math.max(8, viewport.width - 300)) + "px";
+          toastStyle.top = clampNumber(fabPos.y + 54, 8, Math.max(8, viewport.height - 60)) + "px";
+        } else {
+          toastStyle.left = clampNumber(fabPos.x, 8, Math.max(8, viewport.width - 300)) + "px";
+          toastStyle.top = clampNumber(fabPos.y - 44, 8, Math.max(8, viewport.height - 60)) + "px";
+        }
+        toast = h("div", {
+          className: "dshLimobFabToast",
+          "data-phase": status.phase || "idle",
+          style: toastStyle
+        }, status.text);
       }
 
-      // 发现新版本时，在按钮/状态旁给一个可点击的小提示（不打断操作）。
-      var updateChip = null;
-      if (updateStatus !== null && updateStatus.available) {
-        updateChip = h(
-          "button",
-          {
-            type: "button",
-            className: "dshLimob-updateChip",
-            title: "发现新版本 v" + updateStatus.latestVersion + "，点击查看升级方式",
-            onClick: handleOpenUpdate
+      var configModal = configOpen
+        ? h("div", {
+            className: "dshLimobCfgModalBackdrop",
+            onMouseDown: function (event) {
+              if (event.target === event.currentTarget) setConfigOpen(false);
+            }
           },
-          "可更新 v" + updateStatus.latestVersion
-        );
-      }
+            h("div", { className: "dshLimobCfgModal" },
+              h("div", { className: "dshLimobCfgH", style: { marginBottom: "10px" } },
+                h("span", null, "Limob 运行器 · 命令配置"),
+                h("button", {
+                  type: "button",
+                  className: "dshLimobCfgBtn",
+                  onClick: function () { setConfigOpen(false); }
+                }, "关闭")),
+              h(LimobConfigEditor, { currentProjectPath: active.projectPath })))
+        : null;
 
-      return h(
-        "div",
-        { className: "dshLimob-root", ref: rootRef },
-        trigger,
-        statusNode,
-        updateChip,
-        menu
-      );
-    }
-
-    // =====================================================================
-    // 七之二、插件详情页里的更新提示（DSH 插件管理页面 slots）
-    // =====================================================================
-    // 这两个组件注册到 DSH「插件」页面声明的插件详情 slots：
-    //   plugins.detail.badge   标题旁的小标签
-    //   plugins.detail.section 详情页底部的一段说明
-    // 它们都会收到 subject；只用 subject.kind === "bundle" 且包名是本插件时才渲染。
-
-    function isOwnBundleSubject(subject) {
-      return subject !== undefined && subject !== null
-        && subject.kind === "bundle"
-        && subject.pkg !== undefined && subject.pkg !== null
-        && subject.pkg.name === PLUGIN_NAME;
-    }
-
-    /** 多个组件共用的「检查更新」hook：挂载后延迟检查，返回 [state, setState]。 */
-    function useUpdateStatus() {
-      var pair = react.useState({ phase: "checking" });
-      var state = pair[0];
-      var setState = pair[1];
-      react.useEffect(function () {
-        var alive = true;
-        var timer = setTimeout(function () {
-          checkForUpdateShared(false).then(function (result) {
-            if (alive) setState(result);
-          });
-        }, 800);
-        return function () {
-          alive = false;
-          clearTimeout(timer);
-        };
-      }, []);
-      return [state, setState];
-    }
-
-    /** 插件详情页标题旁：只有发现新版本时才显示。 */
-    function LimobUpdateBadge(props) {
-      if (!isOwnBundleSubject(props && props.subject)) return null;
-      var pair = useUpdateStatus();
-      var update = pair[0];
-      if (update === undefined || update === null || !update.available) return null;
-      return h(
-        "span",
-        {
-          className: "dshLimob-updateBadge",
-          title: "发现新版本 v" + update.latestVersion + "，打开本插件详情查看升级方式"
+      return h("div", { ref: rootRef, className: "dshLimobFabRoot", style: { left: "0", top: "0", width: "0", height: "0" } },
+        h("div", {
+          className: "dshLimobFabBtn",
+          role: "button",
+          tabIndex: 0,
+          "data-dragging": dragover !== null ? "true" : "false",
+          title: "点击打开 Limob 命令菜单；按住拖动可移动，位置会自动记住",
+          "aria-label": "运行 Limob 命令",
+          style: { position: "fixed", left: fabPos.x + "px", top: fabPos.y + "px" },
+          onPointerDown: onPointerDown,
+          onPointerMove: onPointerMove,
+          onPointerUp: onPointerUp,
+          onPointerCancel: onPointerUp,
+          onKeyDown: function (event) {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              toggleMenu();
+            }
+          }
         },
-        "可更新 v" + update.latestVersion
-      );
-    }
-
-    /** 插件详情页底部：显示当前/最新版本、检查按钮、升级命令与发布页。 */
-    function LimobUpdateSection(props) {
-      var subject = props && props.subject;
-      if (!isOwnBundleSubject(subject)) return null;
-
-      var updatePair = useUpdateStatus();
-      var update = updatePair[0];
-      var setUpdate = updatePair[1];
-
-      var copiedPair = react.useState(false);
-      var copied = copiedPair[0];
-      var setCopied = copiedPair[1];
-
-      var installed = subject.pkg !== undefined && subject.pkg !== null && typeof subject.pkg.version === "string"
-        ? subject.pkg.version
-        : PLUGIN_VERSION;
-      var checking = update !== undefined && update !== null && update.phase === "checking";
-      var latest = update !== undefined && update !== null && typeof update.latestVersion === "string"
-        ? ("v" + update.latestVersion)
-        : (checking ? "检查中…" : "未知");
-
-      var hint;
-      if (update !== undefined && update !== null && update.phase === "error") {
-        hint = "检查失败：" + update.message + "（不影响终端功能）";
-      } else if (update !== undefined && update !== null && update.available) {
-        hint = "发现新版本 v" + update.latestVersion + "，建议升级。";
-      } else if (update !== undefined && update !== null && update.phase === "ready") {
-        hint = "已是最新版本。";
-      } else {
-        hint = "正在检查 GitHub 更新…";
-      }
-
-      function handleCheckNow() {
-        setUpdate({ phase: "checking" });
-        checkForUpdateShared(true).then(function (result) {
-          setUpdate(result);
-        });
-      }
-
-      function handleCopyCommand() {
-        setCopied(copyTextToClipboard(UPGRADE_COMMAND));
-      }
-
-      return h(
-        "section",
-        { className: "dshLimob-detailSection" },
-        h("div", { className: "dshLimob-detailTitle" }, "Limob 运行器更新"),
-        h("div", { className: "dshLimob-detailMuted" }, "当前版本 v" + installed + " · GitHub 最新 " + latest),
-        h("div", null, hint),
-        h(
-          "div",
-          { className: "dshLimob-detailMuted" },
-          "升级方式：退出 DeepSeek Harness 后在 profile 目录执行下面的命令；或在「插件 → 添加插件」里粘贴 "
-            + INSTALL_SPEC + " 重新安装（先卸载旧版）。"
-        ),
-        h("code", { className: "dshLimob-detailCode" }, UPGRADE_COMMAND),
-        h(
-          "div",
-          { className: "dshLimob-detailActions" },
-          h(
-            "button",
-            { type: "button", className: "dshLimob-detailBtn", disabled: checking, onClick: handleCheckNow },
-            checking ? "检查中…" : "检查更新"
-          ),
-          h(
-            "button",
-            { type: "button", className: "dshLimob-detailBtn", onClick: handleCopyCommand },
-            copied ? "已复制" : "复制升级命令"
-          ),
-          h(
-            "a",
-            { className: "dshLimob-detailBtn", href: GITHUB_RELEASES_PAGE, target: "_blank", rel: "noreferrer" },
-            "打开发布页"
-          )
-        )
-      );
+          h("span", { "aria-hidden": "true" }, busy !== null ? "…" : "▶"),
+          updateStatus !== null && updateStatus.available ? h("span", { className: "dshLimobFabDot" }) : null),
+        menu,
+        toast,
+        configModal);
     }
 
     // =====================================================================
-    // 八、Cordis 插件入口
+    // 十二、注册
     // =====================================================================
-    /**
-     * 注册到对话输入框 dock 槽位。
-     * `conversation.input.dock` 是 list 类型、session 作用域的槽位：
-     * 只有进入会话后才会渲染；组件会收到 sessionId 等标准属性。
-     */
-    /** 插件内部错误只写日志：任何 UI 注册失败都不能影响 DSH 正常聊天。 */
-    function logPluginError(ctx, message, error) {
-      if (ctx !== null && ctx.logger !== undefined && ctx.logger !== null && typeof ctx.logger.error === "function") {
-        ctx.logger.error("dsh-limob-runner: " + message, error);
-      } else if (typeof console !== "undefined") {
-        console.error("dsh-limob-runner: " + message, error);
-      }
-    }
-
-    /**
-     * 注册一个 slot 条目；slot 还没声明时会等待（ctx.slots.inject 的语义）。
-     * 所有注册都包在 try/catch 里，保证插件部分失败不影响 DSH。
-     */
-    function registerSlot(ctx, slotName, entryId, component, order) {
+    function registerSlot(ctx, slotName, entryId, component, order, label) {
       try {
+        var options = { name: slotName, id: entryId, order: order };
+        if (typeof label === "string" && label !== "") options.label = label;
         ctx.slots.inject(slotName, function () {
-          return ctx.slots.register(
-            {
-              name: slotName,
-              id: entryId,
-              order: order
-            },
-            component
-          );
+          return ctx.slots.register(options, component);
         });
       } catch (error) {
         logPluginError(ctx, "注册槽位失败（" + slotName + "）", error);
@@ -1393,12 +1931,11 @@ window.__ModuleLoader__.load({
 
     function apply(ctx) {
       runtimeCtx = ctx;
-
-      // 1) 对话输入框上方的运行菜单（核心功能）。
-      registerSlot(ctx, "conversation.input.dock", "limob-runner", RunLimobDock, 40);
-
-      // 2) DSH 插件页的详情扩展：有更新时显示徽标 + 升级说明。
-      //    这些 slot 由 ui-plugin-manager 声明；未打开插件页时注册会等待，不影响 dock。
+      // 浮动按钮：整个应用范围内可见、可拖动。
+      registerSlot(ctx, "shell.overlay", "limob-runner-fab", LimobFab, 200);
+      // 设置弹窗左侧新增「Limob 运行器」页（settings.section 的每个条目就是一页）。
+      registerSlot(ctx, "settings.section", "limob-runner", LimobSettingsSection, 60, "Limob 运行器");
+      // DSH 插件页的更新提示（沿用 0.2 的能力）。
       registerSlot(ctx, "plugins.detail.badge", "limob-runner-update", LimobUpdateBadge, 100);
       registerSlot(ctx, "plugins.detail.section", "limob-runner-update", LimobUpdateSection, 100);
     }
@@ -1407,7 +1944,7 @@ window.__ModuleLoader__.load({
     exports.inject = ["slots"];
     exports.apply = apply;
 
-    // 只给离线测试/CI 用的内部入口；DSH loader 只读 name/inject/apply，不会碰它。
+    // 仅给离线测试/CI 用的内部入口；DSH loader 只读 name/inject/apply。
     exports.__limob = {
       pluginName: PLUGIN_NAME,
       pluginVersion: PLUGIN_VERSION,
@@ -1416,7 +1953,15 @@ window.__ModuleLoader__.load({
       upgradeCommand: UPGRADE_COMMAND,
       parseVersion: parseVersion,
       compareVersions: compareVersions,
-      checkForUpdate: checkForUpdate
+      checkForUpdate: checkForUpdate,
+      config: {
+        defaults: defaultConfig,
+        normalize: normalizeConfig,
+        normalizeCommand: normalizeCommand,
+        visibleCommands: visibleCommands,
+        commandMatchesProject: commandMatchesProject,
+        normalizePath: normalizePath
+      }
     };
 
     return module.exports;
