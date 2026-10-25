@@ -1,6 +1,5 @@
 # dsh-limob-runner
 
-[![ci](https://github.com/lcx19970714/dsh-limob-runner/actions/workflows/ci.yml/badge.svg)](https://github.com/lcx19970714/dsh-limob-runner/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/release/lcx19970714/dsh-limob-runner)](https://github.com/lcx19970714/dsh-limob-runner/releases)
 
 给 **DeepSeek Harness（DSH）** 的 Web 界面加一个「运行 Limob」按钮：点击后**不打开系统终端**，而是在 **DSH 自带的右侧栏终端**里创建 PTY 并送入固定命令，输出实时滚动；同时支持从 GitHub Releases 检查新版本并在界面里提示升级。
@@ -63,15 +62,18 @@ dsh plugin --profile desktop add file:<仓库绝对路径>
 **发布新版本（维护者）：**
 
 ```powershell
-# 1) 同时修改 package.json 与 client.js 的 PLUGIN_VERSION（CI 会校验两者一致）
+# 1) 同时修改 package.json 与 client.js 的 PLUGIN_VERSION（scripts/smoke.mjs 会校验两者一致）
 # 2) 提交并打 tag
 git add .
 git commit -m "release v0.2.1"
 git tag v0.2.1
 git push origin main --tags
+
+# 3) 创建 GitHub Release（更新检查读取的正是 latest release）
+gh release create v0.2.1 --title "v0.2.1" --generate-notes
 ```
 
-推送 tag 后 `.github/workflows/release.yml` 会自动创建 GitHub Release；已安装的插件在下一次检查时就会提示新版本。
+也可以启用仓库里的 `contrib/github-workflows/release.yml`（复制到 `.github/workflows/`）让打 tag 自动发 Release；这需要 token 带 `workflow` 权限（`gh auth refresh -s workflow`）。已安装的插件在下一次检查时就会提示新版本。
 
 ---
 
@@ -141,7 +143,7 @@ node --check client.js
 node scripts/smoke.mjs
 ```
 
-`scripts/smoke.mjs` 在 Node 里用假的 `window.__ModuleLoader__` / react / ctx 执行 `client.js`，并 mock `fetch`、`localStorage` 覆盖 GitHub 更新检查逻辑（新版本、老版本、无 release、断网、缓存、版本一致性）。CI 在每次 push/PR 时运行同一套检查。
+`scripts/smoke.mjs` 在 Node 里用假的 `window.__ModuleLoader__` / react / ctx 执行 `client.js`，并 mock `fetch`、`localStorage` 覆盖 GitHub 更新检查逻辑（新版本、老版本、无 release、断网、缓存、版本一致性）。可以在本地运行，也可以接入任意 CI。
 
 目录：
 
@@ -150,8 +152,8 @@ node scripts/smoke.mjs
 | `client.js` | 浏览器半体：dock 菜单、终端创建/写入/复用/停止、更新检查、插件页更新说明 |
 | `index.js` | Host 半体：故意的空插件（不注册工具/不抢服务） |
 | `cordis.patch.yml` | 作为 bundle 被选中时插入 loader 行 `id: limob-runner` |
-| `scripts/smoke.mjs` | 离线逻辑测试（CI 用） |
-| `.github/workflows/` | `ci.yml` 校验；`release.yml` 在 tag 推送时自动发 Release |
+| `scripts/smoke.mjs` | 离线逻辑测试 |
+| `contrib/github-workflows/` | 可选的 GitHub Actions 模板（启用方法见「发布新版本」） |
 
 ---
 
