@@ -187,10 +187,13 @@ C:\Users\main\.dsh\limob-runner\commands.json
 ```powershell
 node --check index.js
 node --check client.js
+node --check host-config.js
+node scripts/host-smoke.mjs
 node scripts/smoke.mjs
 ```
 
 `scripts/smoke.mjs` 在 Node 里用假的 `window.__ModuleLoader__` / react / ctx 执行 `client.js`，并测试：4 个 slot 注册、配置默认值与作用域匹配、GitHub 更新检查（mock fetch/localStorage）、最小 props 下的组件首次渲染。
+`scripts/host-smoke.mjs` 用临时目录测试 Host 侧 `commands.json` 的读写和 AI Tool 的 create/update/delete 核心逻辑。
 
 ## License
 
