@@ -1,6 +1,6 @@
 {
   "name": "dsh-limob-runner",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "private": false,
   "description": "DSH 客户端插件：输入框下方「运行」小按钮 + 设置页紧凑命令配置；配置存 Host 侧并提供 limob_run_config 工具，让 AI 可在任意项目直接创建启动命令。",
   "type": "module",

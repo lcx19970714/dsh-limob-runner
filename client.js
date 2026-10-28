@@ -34,7 +34,7 @@ window.__ModuleLoader__.load({
     // 一、常量与内置命令
     // =====================================================================
     var PLUGIN_NAME = "dsh-limob-runner";
-    var PLUGIN_VERSION = "0.6.0";
+    var PLUGIN_VERSION = "0.6.1";
 
     // 更新检查（GitHub Releases）
     var REPO_SLUG = "lcx19970714/dsh-limob-runner";
@@ -45,7 +45,7 @@ window.__ModuleLoader__.load({
     var GITHUB_API_LATEST = "https://api.github.com/repos/" + REPO_SLUG + "/releases/latest";
     var GITHUB_RAW_PACKAGE = "https://raw.githubusercontent.com/" + REPO_SLUG + "/main/package.json";
     var UPDATE_CACHE_KEY = "dsh.limob-runner.update.v1";
-    var UPDATE_TTL_MS = 6 * 60 * 60 * 1000; // 6 小时
+    var UPDATE_TTL_MS = 10 * 60 * 1000; // 10 分钟：菜单打开时能较快看到 GitHub 新版本
 
     // 配置与旧终端映射
     var CONFIG_KEY = "dsh.limob-runner.config.v1";
@@ -127,6 +127,16 @@ window.__ModuleLoader__.load({
       ".dshLimobRunStatus[data-phase=error]{color:#f87171}",
       ".dshLimobRunMenu{position:fixed;z-index:60;box-sizing:border-box;min-width:260px;max-width:min(400px,92vw);max-height:min(60vh,520px);overflow:auto;padding:6px;border-radius:11px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));background:var(--dsw-alias-bg-layer-2,#26282c);box-shadow:0 12px 32px rgba(0,0,0,.38);font-family:inherit;font-size:12px;line-height:18px;color:inherit}",
       ".dshLimobRunMenuTitle{padding:5px 9px 3px;font-size:11px;opacity:.6;user-select:none;display:flex;justify-content:space-between;gap:8px}",
+      ".dshLimobRunFoot{display:flex;align-items:center;justify-content:space-between;gap:8px;border-top:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.28));margin-top:4px;padding:4px 4px 1px 7px;font-size:10px;line-height:16px;opacity:.75}",
+      ".dshLimobRunFootBtn{display:inline-flex;align-items:center;gap:4px;min-width:0;padding:2px 4px;border:0;border-radius:5px;background:transparent;color:inherit;font:inherit;font-size:10px;line-height:16px;cursor:pointer;white-space:nowrap;opacity:.8}",
+      ".dshLimobRunFootBtn:hover:not(:disabled){background:rgba(128,128,128,.14);opacity:1}",
+      ".dshLimobRunFootBtn:disabled{cursor:default;opacity:.55}",
+      ".dshLimobRunFootDot{width:6px;height:6px;border-radius:50%;background:var(--dsw-alias-label-tertiary,rgba(128,128,128,.65));flex:none}",
+      ".dshLimobRunFootDot[data-state=update]{background:#f59e0b}",
+      ".dshLimobRunFootDot[data-state=checking]{background:#679efe}",
+      ".dshLimobRunFootDot[data-state=error]{background:#f87171}",
+      ".dshLimobRunFootGitHub{display:inline-flex;align-items:center;gap:3px;flex:none;padding:2px 4px;border-radius:5px;color:inherit;text-decoration:none;font-size:10px;line-height:16px;opacity:.8;white-space:nowrap}",
+      ".dshLimobRunFootGitHub:hover{opacity:1;background:rgba(128,128,128,.14);text-decoration:none}",
       ".dshLimobRunItem{display:flex;align-items:flex-start;gap:7px;width:100%;padding:7px 9px;border:0;border-radius:7px;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}",
       ".dshLimobRunItem:hover{background:rgba(103,158,254,.14)}",
       ".dshLimobRunItem[disabled]{opacity:.55;cursor:default}",
@@ -1854,6 +1864,7 @@ window.__ModuleLoader__.load({
       var workspaces = workspaceOptionsFrom(props !== undefined ? props.useWorkspaces : undefined);
       var updatePair = useUpdateStatus();
       var updateStatus = updatePair[0];
+      var setUpdateStatus = updatePair[1];
 
       var menuPair = react.useState(false);
       var menuOpen = menuPair[0];
@@ -1945,6 +1956,10 @@ window.__ModuleLoader__.load({
         if (!menuOpen) {
           // AI 可能刚通过 limob_run_config 改过配置；每次打开菜单先同步一次。
           syncConfigFromHost();
+          // 更新检查也用 10 分钟缓存，频繁打开菜单不会刷爆 GitHub API。
+          checkForUpdateShared(false).then(function (result) {
+            if (result !== undefined && result !== null) setUpdateStatus(result);
+          });
           refreshRunning();
           try {
             var rect = buttonRef.current !== null ? buttonRef.current.getBoundingClientRect() : null;
@@ -2050,14 +2065,24 @@ window.__ModuleLoader__.load({
           }
         : { left: "0" };
 
+      // 菜单底部的小更新标志：只占很小一行，不单独占一个菜单项。
+      var updateDotState = "latest";
+      var updateLabel = "v" + PLUGIN_VERSION;
+      if (updateStatus !== null && updateStatus !== undefined) {
+        if (updateStatus.phase === "checking") {
+          updateDotState = "checking";
+          updateLabel = "检查中…";
+        } else if (updateStatus.available) {
+          updateDotState = "update";
+          updateLabel = "v" + updateStatus.latestVersion;
+        } else if (updateStatus.phase === "error") {
+          updateDotState = "error";
+          updateLabel = "检查更新";
+        }
+      }
+
       var menu = menuOpen
         ? h("div", { className: "dshLimobRunMenu", style: menuStyle, role: "menu" },
-            updateStatus !== null && updateStatus.available
-              ? h("button", { type: "button", className: "dshLimobRunItem", onClick: handleUpdateClick },
-                  h("span", { className: "dshLimobRunItemMain" },
-                    h("span", { className: "dshLimobRunItemTitle" }, "发现新版本 v" + updateStatus.latestVersion),
-                    h("span", { className: "dshLimobRunItemCmd" }, "点击查看升级方式（当前 v" + PLUGIN_VERSION + "）")))
-              : null,
             h("div", { className: "dshLimobRunMenuTitle" },
               h("span", null, "运行 Limob 命令"),
               h("span", null, projectPath !== undefined ? String(projectPath) : "当前会话")),
@@ -2102,18 +2127,35 @@ window.__ModuleLoader__.load({
               h("span", { className: "dshLimobRunItemMain" },
                 h("span", { className: "dshLimobRunItemTitle" }, "管理命令…"),
                 h("span", { className: "dshLimobRunItemCmd" }, "新增/编辑/删除/排序，设置全局或项目作用域"))),
-            h("button", {
-              type: "button",
-              className: "dshLimobRunItem",
-              disabled: updateStatus !== null && updateStatus.phase === "checking",
-              onClick: handleCheckUpdate
-            },
-              h("span", { className: "dshLimobRunItemMain" },
-                h("span", { className: "dshLimobRunItemTitle" }, updateStatus !== null && updateStatus.phase === "checking" ? "正在检查更新…" : "检查更新"),
-                h("span", { className: "dshLimobRunItemCmd" },
-                  updateStatus !== null && updateStatus.latestVersion
-                    ? "GitHub 最新 release：v" + updateStatus.latestVersion
-                    : "从 GitHub Releases 检查新版本（当前 v" + PLUGIN_VERSION + "）"))))
+            h("div", { className: "dshLimobRunFoot" },
+              h("button", {
+                type: "button",
+                className: "dshLimobRunFootBtn",
+                disabled: updateStatus !== null && updateStatus.phase === "checking",
+                title: updateDotState === "update"
+                  ? ("发现新版本 v" + updateStatus.latestVersion + "，点击查看")
+                  : "检查 GitHub 更新（每 10 分钟最多请求一次）",
+                onClick: function () {
+                  if (updateStatus !== null && updateStatus !== undefined && updateStatus.available) handleUpdateClick();
+                  else handleCheckUpdate();
+                }
+              },
+                h("span", { className: "dshLimobRunFootDot", "data-state": updateDotState }),
+                h("span", null, updateLabel)),
+              h("a", {
+                className: "dshLimobRunFootGitHub",
+                href: GITHUB_REPO_PAGE,
+                target: "_blank",
+                rel: "noopener noreferrer",
+                title: "打开 GitHub 仓库",
+                onClick: function () { setMenuOpen(false); }
+              },
+                h("svg", { width: 12, height: 12, viewBox: "0 0 16 16", "aria-hidden": "true", focusable: "false" },
+                  h("path", {
+                    d: "M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z",
+                    fill: "currentColor"
+                  })),
+                h("span", null, "GitHub"))))
         : null;
 
       var configModal = configOpen
