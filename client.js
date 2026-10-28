@@ -34,7 +34,7 @@ window.__ModuleLoader__.load({
     // 一、常量与内置命令
     // =====================================================================
     var PLUGIN_NAME = "dsh-limob-runner";
-    var PLUGIN_VERSION = "0.4.0";
+    var PLUGIN_VERSION = "0.4.1";
 
     // 更新检查（GitHub Releases）
     var REPO_SLUG = "lcx19970714/dsh-limob-runner";
@@ -115,8 +115,8 @@ window.__ModuleLoader__.load({
     var CSS = [
       // ---- 输入框下方的运行按钮 ----
       ".dshLimobRunDock{position:relative;display:flex;align-items:center;gap:8px;min-width:0;max-width:100%}",
-      ".dshLimobRunBtn{display:inline-flex;align-items:center;gap:5px;height:24px;padding:0 10px;border-radius:999px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));background:var(--dsw-alias-bg-layer-1,rgba(128,128,128,.08));color:inherit;font:inherit;font-size:11px;line-height:22px;cursor:pointer;white-space:nowrap;user-select:none}",
-      ".dshLimobRunBtn:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.16))}",
+      ".dshLimobRunBtn{display:inline-flex;align-items:center;gap:4px;height:24px;padding:0 6px;border-radius:6px;border:0;background:transparent;color:var(--dsw-alias-label-secondary,inherit);font:inherit;font-size:11px;line-height:22px;cursor:pointer;white-space:nowrap;user-select:none}",
+      ".dshLimobRunBtn:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.16));color:inherit}",
       ".dshLimobRunBtn[data-busy=true]{cursor:progress;opacity:.7}",
       ".dshLimobRunDot{width:6px;height:6px;border-radius:50%;background:#f59e0b;margin-left:1px}",
       ".dshLimobRunStatus{display:inline-flex;align-items:center;min-width:0;font-size:11px;line-height:16px;opacity:.8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
@@ -1289,7 +1289,7 @@ window.__ModuleLoader__.load({
           h("div", { className: "dshLimobCfgRow" },
             h("label", { className: "dshLimobCfgCheck" },
               h("input", { type: "checkbox", checked: config.ui.visible, onChange: toggleVisible }),
-              "在输入框下方显示「运行 Limob」按钮"),
+              "在输入框下方显示「运行」按钮"),
             h("span", { className: "dshLimobCfgMuted" }, "按钮会出现在对话输入框卡片的正下方，点击向上展开命令菜单。"))),
 
         // 命令列表
@@ -1805,7 +1805,7 @@ window.__ModuleLoader__.load({
           }
         },
           h("span", { "aria-hidden": "true" }, busy !== null ? "…" : "▶"),
-          h("span", null, "运行 Limob"),
+          h("span", null, "运行"),
           updateStatus !== null && updateStatus.available ? h("span", { className: "dshLimobRunDot", title: "有新版本" }) : null),
         status !== null
           ? h("span", { className: "dshLimobRunStatus", "data-phase": status.phase || "idle", title: status.text }, status.text)
