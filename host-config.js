@@ -1,4 +1,4 @@
-// dsh-limob-runner 的宿主侧配置存储（不依赖 DSH 运行时，方便离线测试）。
+// dsh-runner 的宿主侧配置存储（不依赖 DSH 运行时，方便离线测试）。
 //
 // 为什么需要它：
 //   浏览器端插件的配置原本只存在 localStorage 里，AI（Host 侧的 Agent）看不到；

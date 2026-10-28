@@ -1,7 +1,7 @@
 # 本插件作为 DSH profile 的 bundle 被选中时，由这一层把插件行插入 loader 树。
 # 行的 `name` 必须是包名原样：Host 半按 package.json 的 main 加载 index.js，
 # Client 半按 exports["./client"] 加载 client.js（由 dsh-client-modules 扫描）。
-# `id` 是稳定身份，后续 profile 用户层可以用 - id: limob-runner 定向覆盖 config。
+# `id` 是稳定身份，后续 profile 用户层可以用 - id: dsh-runner 定向覆盖 config。
 - insert:
-    - id: limob-runner
-      name: dsh-limob-runner
+    - id: dsh-runner
+      name: dsh-runner

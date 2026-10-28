@@ -1,8 +1,8 @@
-// dsh-limob-runner 的宿主侧（Host）实现。
+// dsh-runner 的宿主侧（Host）实现。
 //
 // 浏览器端的「运行」按钮只负责调用 DSH 自带终端执行命令；命令配置真正存到
 // 宿主侧的 commands.json，并同时提供两种入口：
-//   1) 给 AI 用的 Tool：limob_run_config（list/create/update/delete）；
+//   1) 给 AI 用的 Tool：dsh_runner_config（list/create/update/delete）；
 //   2) 给浏览器设置页用的 RPC：config/get、config/save。
 // 这样 AI 在任意项目里都能直接给插件加启动命令，设置页刷新/打开菜单时自动同步。
 import os from "node:os";
@@ -17,17 +17,32 @@ import {
   updateCommand
 } from "./host-config.js";
 
-export const name = "dsh-limob-runner";
+export const name = "dsh-runner";
 // tools：注册 AI Tool；connection 在 apply 里按需注入（浏览器 RPC 需要）。
 export const inject = ["tools"];
 
+const DEFAULT_CONFIG_PATH = path.join(os.homedir(), ".dsh", "dsh-runner", "commands.json");
+// 旧版插件名改过来之前的配置文件位置；首次读取时自动迁移到新路径。
+const LEGACY_CONFIG_PATH = path.join(os.homedir(), ".dsh", "limob-runner", "commands.json");
+
 // 配置文件的默认位置；测试时可用环境变量指向临时文件，避免污染真实配置。
-export const CONFIG_PATH = process.env.DSH_LIMOB_RUNNER_CONFIG
-  || path.join(os.homedir(), ".dsh", "limob-runner", "commands.json");
+export const CONFIG_PATH = process.env.DSH_RUNNER_CONFIG
+  || process.env.DSH_LIMOB_RUNNER_CONFIG
+  || DEFAULT_CONFIG_PATH;
 
 const RPC_CHANNEL = "/api";
-const RPC_NAMESPACE = "limob-runner";
+const RPC_NAMESPACE = "dsh-runner";
 const RPC_ENDPOINTS = ["config/get", "config/save"];
+
+/** 读取配置；如果新路径还不存在而旧版文件存在，就自动迁移一次。 */
+async function ensureConfigFile() {
+  const current = await loadConfig(CONFIG_PATH);
+  if (current.exists || CONFIG_PATH !== DEFAULT_CONFIG_PATH) return current;
+  const legacy = await loadConfig(LEGACY_CONFIG_PATH);
+  if (!legacy.exists) return current;
+  await saveConfigFile(CONFIG_PATH, legacy.config);
+  return { exists: true, config: legacy.config };
+}
 
 /** 当前 AI 调用所在会话的工作区目录（用于项目作用域的默认值）。 */
 function sessionWorkspacePath(exec) {
@@ -50,9 +65,9 @@ function pickPatch(args) {
 /** 注册给 AI 的配置 Tool。 */
 function registerConfigTool(ctx) {
   return ctx.tools.register(defineTool({
-    name: "limob_run_config",
+    name: "dsh_runner_config",
     description:
-      "Manage the DSH Limob runner's launch commands (the commands shown under the composer's Run button). "
+      "Manage the dsh-runner launch commands (the commands shown under the composer's Run button). "
       + "Use action=list to inspect existing commands; action=create to add one; action=update to edit; action=delete to remove. "
       + "When the user asks to add a startup/launch/run command for the current project, call create with command (and optional title); "
       + "the Tool defaults to project scope and uses the current session workspace as projectRoot, so it only appears in that project. "
@@ -80,7 +95,7 @@ function registerConfigTool(ctx) {
       render: (_args, value) => [{ type: "text", text: JSON.stringify(value, null, 2) }]
     },
     async execute(args, exec) {
-      const loaded = await loadConfig(CONFIG_PATH);
+      const loaded = await ensureConfigFile();
       if (args.action === "list") {
         return {
           ok: true,
@@ -149,7 +164,7 @@ function fail(code, message) {
 
 async function dispatch(endpoint, payload) {
   if (endpoint === "config/get") {
-    const loaded = await loadConfig(CONFIG_PATH);
+    const loaded = await ensureConfigFile();
     return {
       config: loaded.exists ? loaded.config : null,
       filePath: CONFIG_PATH,
@@ -166,7 +181,7 @@ async function dispatch(endpoint, payload) {
   throw new Error("未知 endpoint：" + endpoint);
 }
 
-/** 注册浏览器 RPC 路由（POST /api/limob-runner/config/get 等）。 */
+/** 注册浏览器 RPC 路由（POST /api/dsh-runner/config/get 等）。 */
 function registerRpc(ctx) {
   for (const endpoint of RPC_ENDPOINTS) {
     const routePath = RPC_CHANNEL + "/" + RPC_NAMESPACE + "/" + endpoint;
@@ -203,7 +218,7 @@ function registerRpc(ctx) {
       };
     };
     if (typeof ctx.effect === "function") {
-      ctx.effect(register, "limob-runner: rpc " + endpoint);
+      ctx.effect(register, "dsh-runner: rpc " + endpoint);
     } else {
       register();
     }

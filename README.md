@@ -1,8 +1,8 @@
-# dsh-limob-runner
+# dsh-runner
 
-[![release](https://img.shields.io/github/v/release/lcx19970714/dsh-limob-runner)](https://github.com/lcx19970714/dsh-limob-runner/releases)
+[![release](https://img.shields.io/github/v/release/lcx19970714/dsh-runner)](https://github.com/lcx19970714/dsh-runner/releases)
 
-给 **DeepSeek Harness（DSH）** 的对话输入框**正下方**加一个低调的「▶ 运行」小按钮：点击选择命令，在 **DSH 自带的右侧栏终端**里执行，输出实时滚动。命令可以在 **设置弹窗的「Limob 运行器」页**里增删改查、排序、启停，并选择「全局」或「仅某个项目」显示。
+给 **DeepSeek Harness（DSH）** 的对话输入框**正下方**加一个低调的「▶ 运行」小按钮：点击选择命令，在 **DSH 自带的右侧栏终端**里执行，输出实时滚动。命令可以在 **设置弹窗的「dsh-runner」页**里增删改查、排序、启停，并选择「全局」或「仅某个项目」显示。
 
 > 适用于 DSH **0.2.1 线**（`0.2.1-rc.2` 实测）。插件依赖 DSH 的内部客户端服务，升级 DSH 后可能需要适配，见文末「版本风险」。
 
@@ -17,7 +17,7 @@
 3. 粘贴：
 
    ```
-   github:lcx19970714/dsh-limob-runner
+   github:lcx19970714/dsh-runner
    ```
 
 4. 安装后，进入任意会话，输入框卡片正下方出现「▶ 运行」。
@@ -25,7 +25,7 @@
 ### 方式 B：命令行（桌面版需先完全退出 DSH）
 
 ```powershell
-dsh plugin --profile desktop add github:lcx19970714/dsh-limob-runner
+dsh plugin --profile desktop add github:lcx19970714/dsh-runner
 ```
 
 其它 profile 把 `desktop` 换成对应名字。
@@ -33,7 +33,7 @@ dsh plugin --profile desktop add github:lcx19970714/dsh-limob-runner
 ### 方式 C：本地开发
 
 ```powershell
-git clone https://github.com/lcx19970714/dsh-limob-runner
+git clone https://github.com/lcx19970714/dsh-runner
 dsh plugin --profile desktop add file:<仓库绝对路径>
 ```
 
@@ -53,7 +53,7 @@ dsh plugin --profile desktop add file:<仓库绝对路径>
 
 ## 配置页面在哪？
 
-DSH 左下角 **设置**（Settings）弹窗 → 左侧导航新增一页 **「Limob 运行器」**。
+DSH 左下角 **设置**（Settings）弹窗 → 左侧导航新增一页 **「dsh-runner」**。
 （技术实现：注册到 DSH 设置页的 `settings.section` 槽位，每个条目就是一页，不需要改 DSH 源码。）
 
 也可以从「运行」菜单的 **「管理命令…」** 直接打开同一套配置（弹窗形式）。
@@ -84,7 +84,7 @@ DSH 左下角 **设置**（Settings）弹窗 → 左侧导航新增一页 **「L
 
 ## 让 AI 直接帮你加启动命令（0.6.0+）
 
-装好后，AI 侧多了一个工具 **`limob_run_config`**。在任何项目的会话里直接说：
+装好后，AI 侧多了一个工具 **`dsh_runner_config`**。在任何项目的会话里直接说：
 
 - 「给当前项目加一个启动命令：`pnpm dev`，名字叫启动开发服务器」
 - 「给这个项目加一个 `cargo check` 命令」
@@ -99,15 +99,15 @@ AI 调用工具时的默认行为：
 - 命令里含中文时自动勾选 chcp 65001；
 - 只有你明确说「全局」时才会创建全局命令。
 
-保存后**不需要重启 DSH**：打开输入框下方的「运行」菜单，或进入设置页「Limob 运行器」，插件会自动从 Host 同步；设置页底部也有「同步宿主」按钮可手动刷新。
+保存后**不需要重启 DSH**：打开输入框下方的「运行」菜单，或进入设置页「dsh-runner」，插件会自动从 Host 同步；设置页底部也有「同步宿主」按钮可手动刷新。
 
 配置由 Host 统一保存到：
 
 ```
-C:\Users\main\.dsh\limob-runner\commands.json
+C:\Users\main\.dsh\dsh-runner\commands.json
 ```
 
-（可用环境变量 `DSH_LIMOB_RUNNER_CONFIG` 指向别的路径；AI 也可以用普通文件工具直接读写这个 JSON。）
+（可用环境变量 `DSH_RUNNER_CONFIG` 指向别的路径；AI 也可以用普通文件工具直接读写这个 JSON。）
 如果没有 Host（例如离线/旧版），浏览器会自动退回 localStorage。
 
 > 工具只负责**保存配置**，不会直接执行命令；真正运行仍需你在菜单里点一下，避免 AI 直接跑危险命令。
@@ -156,7 +156,7 @@ C:\Users\main\.dsh\limob-runner\commands.json
 - 升级方式：DSH 插件页卸载后用 `github:` 规格重装，或退出 DSH 后执行：
 
   ```powershell
-  dsh plugin --profile desktop add github:lcx19970714/dsh-limob-runner
+  dsh plugin --profile desktop add github:lcx19970714/dsh-runner
   ```
 
 - 为什么不做静默自动升级：安装要写 profile、跑 pnpm、重新组合，属于 DSH Host/插件管理器的权限；自动升级也会绕过用户确认。
@@ -167,7 +167,7 @@ C:\Users\main\.dsh\limob-runner\commands.json
 
 ## 数据与回退
 
-- 配置：Host 侧 `C:\Users\main\.dsh\limob-runner\commands.json`（主数据）；浏览器 `localStorage["dsh.limob-runner.config.v1"]` 作为缓存/离线兜底
+- 配置：Host 侧 `C:\Users\main\.dsh\dsh-runner\commands.json`（主数据）；浏览器 `localStorage["dsh.limob-runner.config.v1"]` 作为缓存/离线兜底
 - 终端复用记录：`localStorage["dsh.limob-runner.v1"]`
 - 更新缓存：`localStorage["dsh.limob-runner.update.v1"]`
 

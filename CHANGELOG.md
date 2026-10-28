@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.0
+
+### Changed
+
+- **插件更名为 dsh-runner**：包名、Loader id、GitHub 仓库、安装规格、设置页标签统一为 `dsh-runner`；
+- AI 工具改名为 `dsh_runner_config`，命令配置迁移到新路径 `C:\Users\main\.dsh\dsh-runner\commands.json`（旧路径会自动迁移一次）；
+- 设置页标题、运行菜单标题、配置弹窗等用户可见名称同步更新；内部终端前缀/旧 localStorage 键保留以兼容已有配置与终端复用；
+- GitHub 仓库已重命名为 https://github.com/lcx19970714/dsh-runner （旧地址由 GitHub 自动跳转）。
+
 ## 0.6.1
 
 ### Changed

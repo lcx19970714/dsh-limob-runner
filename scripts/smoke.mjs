@@ -1,4 +1,4 @@
-// dsh-limob-runner 的离线冒烟测试（CI 与本地都用它）。
+// dsh-runner 的离线冒烟测试（CI 与本地都用它）。
 //
 // 覆盖：
 // 1. 用假的 window.__ModuleLoader__ / react / ctx 执行 client.js，确认插件能注册 4 个 slot；
@@ -25,7 +25,7 @@ globalThis.window = {
   }
 };
 new Function("window", source)(globalThis.window);
-assert.equal(registration.id, "dsh-limob-runner", "client.js 的模块 id 必须等于包名");
+assert.equal(registration.id, "dsh-runner", "client.js 的模块 id 必须等于包名");
 
 // ---- 2. 假 react ----
 const reactStub = {
@@ -47,7 +47,7 @@ const moduleExports = registration.factory((name) => {
   if (name === "react") return reactStub;
   throw new Error("client.js 出现了未预期的 require: " + name);
 });
-assert.equal(moduleExports.name, "dsh-limob-runner");
+assert.equal(moduleExports.name, "dsh-runner");
 assert.deepEqual(moduleExports.inject, ["slots", "connection"]);
 
 const internals = moduleExports.__limob;
@@ -214,7 +214,7 @@ assert.deepEqual(
   ["conversation.composer.dock", "plugins.detail.badge", "plugins.detail.section", "settings.section"].sort(),
   "应注册输入框下方按钮、设置页、插件页更新提示"
 );
-assert.equal(registered.find((entry) => entry.options.name === "settings.section").options.label, "Limob 运行器");
+assert.equal(registered.find((entry) => entry.options.name === "settings.section").options.label, "dsh-runner");
 
 // ---- 8. 首次渲染（最小 props） ----
 const runButton = registered.find((entry) => entry.options.name === "conversation.composer.dock").component;

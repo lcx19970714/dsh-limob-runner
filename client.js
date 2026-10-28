@@ -1,9 +1,9 @@
-/* dsh-limob-runner —— 客户端半体（浏览器侧）v0.4
+/* dsh-runner —— 客户端半体（浏览器侧）v0.7
  *
  * 功能总览：
- *   1) 在对话输入框「正下方」放一个低调的「▶ 运行 Limob」小按钮
+ *   1) 在对话输入框「正下方」放一个低调的「▶ 运行」小按钮
  *      （conversation.composer.dock 槽位）：点击向上展开命令菜单；
- *   2) 命令配置页（settings.section）：在 DSH 设置弹窗里新增「Limob 运行器」页，
+ *   2) 命令配置页（settings.section）：在 DSH 设置弹窗里新增「dsh-runner」页，
  *      支持命令的增删改查、排序、启停、全局/项目作用域；
  *   3) 运行命令仍通过 DSH 自带终端（remote.terminal + 右侧栏 terminal 页签），
  *      输出实时滚动；重复点击复用已有终端，支持一键停止；
@@ -18,7 +18,7 @@
  * 任何失败只影响对应提示，不影响 DSH 正常聊天。
  */
 window.__ModuleLoader__.load({
-  id: "dsh-limob-runner",
+  id: "dsh-runner",
   factory: (require) => {
     "use strict";
 
@@ -33,11 +33,11 @@ window.__ModuleLoader__.load({
     // =====================================================================
     // 一、常量与内置命令
     // =====================================================================
-    var PLUGIN_NAME = "dsh-limob-runner";
-    var PLUGIN_VERSION = "0.6.1";
+    var PLUGIN_NAME = "dsh-runner";
+    var PLUGIN_VERSION = "0.7.0";
 
     // 更新检查（GitHub Releases）
-    var REPO_SLUG = "lcx19970714/dsh-limob-runner";
+    var REPO_SLUG = "lcx19970714/dsh-runner";
     var INSTALL_SPEC = "github:" + REPO_SLUG;
     var UPGRADE_COMMAND = "dsh plugin --profile desktop add " + INSTALL_SPEC;
     var GITHUB_REPO_PAGE = "https://github.com/" + REPO_SLUG;
@@ -299,9 +299,9 @@ window.__ModuleLoader__.load({
 
     function logPluginError(ctx, message, error) {
       if (ctx !== null && ctx.logger !== undefined && ctx.logger !== null && typeof ctx.logger.error === "function") {
-        ctx.logger.error("dsh-limob-runner: " + message, error);
+        ctx.logger.error("dsh-runner: " + message, error);
       } else if (typeof console !== "undefined") {
-        console.error("dsh-limob-runner: " + message, error);
+        console.error("dsh-runner: " + message, error);
       }
     }
 
@@ -617,7 +617,7 @@ window.__ModuleLoader__.load({
     async function hostRpc(endpoint, payload) {
       if (hostConnection === null || hostConnection === undefined || hostConnection.rpc === undefined) return undefined;
       try {
-        var result = await hostConnection.rpc.call("/api", "limob-runner/" + endpoint, payload === undefined ? {} : payload);
+        var result = await hostConnection.rpc.call("/api", "dsh-runner/" + endpoint, payload === undefined ? {} : payload);
         if (result === null || result === undefined) return undefined;
         if (result.ok !== true) throw new Error(result.error && result.error.message ? result.error.message : "RPC 失败");
         return result.value;
@@ -1219,7 +1219,7 @@ window.__ModuleLoader__.load({
         });
       }
       return h("section", { className: "dshLimobDetailSection" },
-        h("div", { className: "dshLimobDetailTitle" }, "Limob 运行器更新"),
+        h("div", { className: "dshLimobDetailTitle" }, "dsh-runner 更新"),
         h("div", { className: "dshLimobDetailMuted" }, "当前版本 v" + installed + " · GitHub 最新 " + latest),
         h("div", null, hint),
         h("div", { className: "dshLimobDetailMuted" },
@@ -1824,7 +1824,7 @@ window.__ModuleLoader__.load({
       return h("div", { className: "dshLimobCfgPage" },
         h("div", { className: "dshLimobPageHead" },
           h("div", null,
-            h("div", { className: "dshLimobPageTitle" }, "Limob 运行器"),
+            h("div", { className: "dshLimobPageTitle" }, "dsh-runner"),
             h("div", { className: "dshLimobPageSub" }, "输入框下方「运行」按钮的命令配置")),
           h("span", { className: "dshLimobPageVersion" }, "v" + PLUGIN_VERSION)),
         h(LimobConfigEditor, {
@@ -1833,7 +1833,7 @@ window.__ModuleLoader__.load({
         }));
     }
     // =====================================================================
-    // 十一、输入框下方的「运行 Limob」按钮（conversation.composer.dock）
+    // 十一、输入框下方的「运行」按钮（conversation.composer.dock）
     // =====================================================================
     // conversation.composer.dock 是 DSH 对话输入框卡片「正下方」的环境条目槽位，
     // 官方用它放 ActivityPill / UsagePill。这里只放一个低调的小按钮 + 向上展开的菜单，
@@ -1954,7 +1954,7 @@ window.__ModuleLoader__.load({
 
       function toggleMenu() {
         if (!menuOpen) {
-          // AI 可能刚通过 limob_run_config 改过配置；每次打开菜单先同步一次。
+          // AI 可能刚通过 dsh_runner_config 改过配置；每次打开菜单先同步一次。
           syncConfigFromHost();
           // 更新检查也用 10 分钟缓存，频繁打开菜单不会刷爆 GitHub API。
           checkForUpdateShared(false).then(function (result) {
@@ -2084,7 +2084,7 @@ window.__ModuleLoader__.load({
       var menu = menuOpen
         ? h("div", { className: "dshLimobRunMenu", style: menuStyle, role: "menu" },
             h("div", { className: "dshLimobRunMenuTitle" },
-              h("span", null, "运行 Limob 命令"),
+              h("span", null, "运行命令"),
               h("span", null, projectPath !== undefined ? String(projectPath) : "当前会话")),
             commands.length === 0
               ? h("div", { className: "dshLimobRunMenuTitle" }, "当前项目没有可用命令：去「管理命令」里添加，或把命令作用域设为全局。")
@@ -2167,7 +2167,7 @@ window.__ModuleLoader__.load({
           },
             h("div", { className: "dshLimobCfgModal" },
               h("div", { className: "dshLimobCfgH", style: { marginBottom: "10px" } },
-                h("span", null, "Limob 运行器 · 命令配置"),
+                h("span", null, "dsh-runner · 命令配置"),
                 h("button", {
                   type: "button",
                   className: "dshLimobCfgBtn",
@@ -2182,8 +2182,8 @@ window.__ModuleLoader__.load({
           type: "button",
           className: "dshLimobRunBtn",
           "data-busy": busy !== null ? "true" : "false",
-          title: "在 DSH 自带终端里运行 Limob 命令（点击选择命令）",
-          "aria-label": "运行 Limob 命令",
+          title: "在 DSH 自带终端里运行命令（点击选择命令）",
+          "aria-label": "运行命令",
           onClick: function () {
             if (busy !== null) return;
             toggleMenu();
@@ -2224,15 +2224,15 @@ window.__ModuleLoader__.load({
       }
       syncConfigFromHost();
       // 输入框卡片正下方的小按钮（conversation.composer.dock）。
-      registerSlot(ctx, "conversation.composer.dock", "limob-runner-run", LimobComposerButton, 40);
-      // 设置弹窗左侧新增「Limob 运行器」页（settings.section 的每个条目就是一页）。
-      registerSlot(ctx, "settings.section", "limob-runner", LimobSettingsSection, 60, "Limob 运行器");
+      registerSlot(ctx, "conversation.composer.dock", "dsh-runner-run", LimobComposerButton, 40);
+      // 设置弹窗左侧新增「dsh-runner」页（settings.section 的每个条目就是一页）。
+      registerSlot(ctx, "settings.section", "dsh-runner", LimobSettingsSection, 60, "dsh-runner");
       // DSH 插件页的更新提示（沿用 0.2 的能力）。
-      registerSlot(ctx, "plugins.detail.badge", "limob-runner-update", LimobUpdateBadge, 100);
-      registerSlot(ctx, "plugins.detail.section", "limob-runner-update", LimobUpdateSection, 100);
+      registerSlot(ctx, "plugins.detail.badge", "dsh-runner-update", LimobUpdateBadge, 100);
+      registerSlot(ctx, "plugins.detail.section", "dsh-runner-update", LimobUpdateSection, 100);
     }
 
-    exports.name = "dsh-limob-runner";
+    exports.name = "dsh-runner";
     exports.inject = ["slots", "connection"];
     exports.apply = apply;
 
