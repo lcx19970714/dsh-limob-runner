@@ -34,7 +34,7 @@ window.__ModuleLoader__.load({
     // 一、常量与内置命令
     // =====================================================================
     var PLUGIN_NAME = "dsh-limob-runner";
-    var PLUGIN_VERSION = "0.4.1";
+    var PLUGIN_VERSION = "0.5.0";
 
     // 更新检查（GitHub Releases）
     var REPO_SLUG = "lcx19970714/dsh-limob-runner";
@@ -132,34 +132,77 @@ window.__ModuleLoader__.load({
       ".dshLimobRunTag{flex:none;padding:0 6px;border-radius:999px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));font-size:10px;line-height:16px;opacity:.75}",
       ".dshLimobRunRunningDot{flex:none;width:6px;height:6px;margin-top:6px;border-radius:50%;background:#22c55e}",
       ".dshLimobRunSep{height:1px;margin:5px 4px;background:var(--dsw-alias-border-l3,rgba(128,128,128,.3))}",
-      // ---- 配置编辑器 ----
-      ".dshLimobCfg{display:flex;flex-direction:column;gap:12px;font-size:12px;line-height:18px;color:inherit}",
-      ".dshLimobCfgCard{display:flex;flex-direction:column;gap:8px;padding:12px 14px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));border-radius:10px;background:var(--dsw-alias-bg-layer-1,rgba(128,128,128,.06))}",
-      ".dshLimobCfgH{font-size:13px;font-weight:600;display:flex;align-items:center;justify-content:space-between;gap:8px}",
-      ".dshLimobCfgMuted{opacity:.65}",
-      ".dshLimobCfgRow{display:flex;flex-wrap:wrap;align-items:center;gap:8px}",
-      ".dshLimobCfgField{display:flex;flex-direction:column;gap:3px;flex:1 1 220px;min-width:0}",
-      ".dshLimobCfgField > span{font-size:11px;opacity:.7}",
-      ".dshLimobCfgInput,.dshLimobCfgTextarea,.dshLimobCfgSelect{width:100%;box-sizing:border-box;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.4));border-radius:7px;background:var(--dsw-alias-bg-base,transparent);color:inherit;font:inherit;padding:5px 8px}",
-      ".dshLimobCfgTextarea{min-height:52px;resize:vertical;font-family:ui-monospace,Consolas,'Courier New',monospace;font-size:11px}",
-      ".dshLimobCfgBtn{display:inline-flex;align-items:center;justify-content:center;height:26px;padding:0 10px;border-radius:7px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));background:transparent;color:inherit;font:inherit;font-size:12px;cursor:pointer;white-space:nowrap}",
-      ".dshLimobCfgBtn:hover{background:rgba(103,158,254,.14)}",
-      ".dshLimobCfgBtn[disabled]{opacity:.5;cursor:default}",
-      ".dshLimobCfgBtnPrimary{border-color:rgba(103,158,254,.55);background:rgba(103,158,254,.16)}",
-      ".dshLimobCfgBtnDanger{border-color:rgba(239,68,68,.5);color:#f87171}",
-      ".dshLimobCfgList{display:flex;flex-direction:column;gap:6px}",
-      ".dshLimobCfgItem{display:flex;flex-wrap:wrap;align-items:center;gap:7px;padding:8px 10px;border-radius:8px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.25));background:var(--dsw-alias-bg-layer-1,rgba(128,128,128,.04))}",
-      ".dshLimobCfgItem[data-disabled=true]{opacity:.55}",
-      ".dshLimobCfgItemMain{display:flex;flex-direction:column;gap:1px;min-width:0;flex:1 1 180px}",
-      ".dshLimobCfgItemTitle{font-size:12px;line-height:17px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
-      ".dshLimobCfgItemCmd{font-size:10px;line-height:14px;opacity:.55;font-family:ui-monospace,Consolas,'Courier New',monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
-      ".dshLimobCfgTag{flex:none;padding:0 6px;border-radius:999px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));font-size:10px;line-height:16px;opacity:.75;white-space:nowrap}",
-      ".dshLimobCfgError{color:#f87171;font-size:11px}",
-      ".dshLimobCfgNotice{color:#22c55e;font-size:11px}",
-      ".dshLimobCfgCheck{display:inline-flex;align-items:center;gap:5px;font-size:11px;opacity:.85;user-select:none}",
-      ".dshLimobCfgModalBackdrop{pointer-events:auto;position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,.42);display:flex;align-items:center;justify-content:center;padding:24px}",
-      ".dshLimobCfgModal{box-sizing:border-box;width:min(760px,92vw);max-height:min(84vh,760px);overflow:auto;border-radius:12px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));background:var(--dsw-alias-bg-layer-2,#26282c);box-shadow:0 18px 48px rgba(0,0,0,.45);padding:16px}",
-      ".dshLimobCfgPage{max-width:720px;padding:2px 2px 24px}",
+      // ---- 设置页：命令配置（紧凑布局） ----
+      ".dshLimobCfgPage{display:flex;flex-direction:column;gap:10px;width:100%;max-width:100%;padding:0 0 18px;font-size:12px;line-height:18px;color:inherit;box-sizing:border-box}",
+      ".dshLimobPageHead{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:2px 2px 9px;border-bottom:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35))}",
+      ".dshLimobPageTitle{font-size:15px;font-weight:600;line-height:22px}",
+      ".dshLimobPageSub{font-size:11px;line-height:16px;opacity:.6;margin-top:2px}",
+      ".dshLimobPageVersion{font-size:10px;line-height:16px;opacity:.4;flex:none;padding-top:3px}",
+      ".dshLimobCfg{display:flex;flex-direction:column;gap:10px;min-width:0}",
+      ".dshLimobCfgToolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}",
+      ".dshLimobCfgStat{flex:1 1 160px;min-width:0;font-size:11px;line-height:16px;opacity:.62;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+      ".dshLimobSwitch{display:inline-flex;align-items:center;gap:6px;font-size:11px;line-height:16px;opacity:.85;user-select:none;cursor:pointer;position:relative;white-space:nowrap}",
+      ".dshLimobSwitch input{position:absolute;opacity:0;width:1px;height:1px;pointer-events:none}",
+      ".dshLimobSwitchTrack{width:26px;height:15px;border-radius:999px;background:rgba(128,128,128,.35);position:relative;flex:none;transition:background .15s}",
+      ".dshLimobSwitchTrack::after{content:\"\";position:absolute;top:2px;left:2px;width:11px;height:11px;border-radius:50%;background:#fff;transition:left .15s}",
+      ".dshLimobSwitch input:checked + .dshLimobSwitchTrack{background:#679efe}",
+      ".dshLimobSwitch input:checked + .dshLimobSwitchTrack::after{left:13px}",
+      ".dshLimobCfgBtn{display:inline-flex;align-items:center;justify-content:center;gap:4px;height:24px;padding:0 9px;border-radius:6px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));background:transparent;color:inherit;font:inherit;font-size:11px;line-height:22px;cursor:pointer;white-space:nowrap}",
+      ".dshLimobCfgBtn:hover{background:rgba(103,158,254,.12)}",
+      ".dshLimobCfgBtn[disabled]{opacity:.45;cursor:default}",
+      ".dshLimobCfgBtnPrimary{border-color:rgba(103,158,254,.55);background:rgba(103,158,254,.16);color:#679efe}",
+      ".dshLimobCfgBtnPrimary:hover{background:rgba(103,158,254,.24)}",
+      ".dshLimobCfgBtnDanger{border-color:rgba(239,68,68,.45);color:#f87171}",
+      ".dshLimobCfgBtnDanger:hover{background:rgba(239,68,68,.12)}",
+      ".dshLimobCfgBtnGhost{border:0;padding:0 6px;height:22px;opacity:.72}",
+      ".dshLimobCfgBtnGhost:hover{opacity:1;background:rgba(128,128,128,.12)}",
+      ".dshLimobCmdList{display:flex;flex-direction:column;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));border-radius:10px;overflow:hidden;background:var(--dsw-alias-bg-layer-1,rgba(128,128,128,.05))}",
+      ".dshLimobCmdRow{display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.22));min-width:0}",
+      ".dshLimobCmdRow:last-child{border-bottom:0}",
+      ".dshLimobCmdRow:hover{background:rgba(103,158,254,.06)}",
+      ".dshLimobCmdRow[data-disabled=true]{opacity:.55}",
+      ".dshLimobCmdMain{display:flex;flex-direction:column;gap:1px;min-width:0;flex:1;cursor:pointer}",
+      ".dshLimobCmdTitleLine{display:flex;align-items:center;gap:6px;min-width:0}",
+      ".dshLimobCmdTitle{font-size:12px;font-weight:500;line-height:17px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+      ".dshLimobTag{flex:none;padding:0 5px;border-radius:999px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));font-size:9px;line-height:14px;opacity:.8;white-space:nowrap;max-width:46%;overflow:hidden;text-overflow:ellipsis}",
+      ".dshLimobTag[data-scope=project]{border-color:rgba(103,158,254,.45);color:#679efe;background:rgba(103,158,254,.08)}",
+      ".dshLimobCmdPreview{font-size:10px;line-height:14px;opacity:.5;font-family:ui-monospace,Consolas,'Courier New',monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+      ".dshLimobCmdActions{display:flex;align-items:center;gap:2px;flex:none}",
+      ".dshLimobIconBtn{width:26px;height:26px;display:inline-flex;align-items:center;justify-content:center;border:0;border-radius:6px;background:transparent;color:inherit;font:inherit;font-size:13px;line-height:1;cursor:pointer;opacity:.6}",
+      ".dshLimobIconBtn:hover{background:rgba(128,128,128,.16);opacity:1}",
+      ".dshLimobIconBtn[disabled]{opacity:.25;cursor:default}",
+      ".dshLimobIconBtn[data-danger=true]:hover{background:rgba(239,68,68,.14);color:#f87171}",
+      ".dshLimobCfgEmpty{padding:18px 12px;text-align:center;font-size:11px;opacity:.55}",
+      ".dshLimobCfgForm{border:.5px solid rgba(103,158,254,.35);border-radius:10px;background:rgba(103,158,254,.05);padding:11px 12px;display:flex;flex-direction:column;gap:9px}",
+      ".dshLimobCfgFormTop{display:flex;align-items:center;justify-content:space-between;gap:8px}",
+      ".dshLimobCfgFormTitle{font-size:12px;font-weight:600;line-height:17px}",
+      ".dshLimobFormGrid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:8px}",
+      ".dshLimobFormField{display:flex;flex-direction:column;gap:3px;min-width:0}",
+      ".dshLimobFormField[data-wide=true]{grid-column:1 / -1}",
+      ".dshLimobFormField > span{font-size:10px;line-height:14px;opacity:.6}",
+      ".dshLimobInput,.dshLimobTextarea,.dshLimobSelect{width:100%;box-sizing:border-box;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.4));border-radius:6px;background:var(--dsw-alias-bg-base,transparent);color:inherit;font:inherit;font-size:12px;padding:5px 8px;min-width:0}",
+      ".dshLimobTextarea{min-height:46px;resize:vertical;font-family:ui-monospace,Consolas,'Courier New',monospace;font-size:11px;line-height:16px}",
+      ".dshLimobSegment{display:inline-flex;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.4));border-radius:6px;overflow:hidden;flex:none}",
+      ".dshLimobSegment button{border:0;background:transparent;color:inherit;font:inherit;font-size:11px;line-height:20px;padding:2px 10px;cursor:pointer;opacity:.7}",
+      ".dshLimobSegment button[data-active=true]{background:rgba(103,158,254,.16);color:#679efe;opacity:1}",
+      ".dshLimobFormRow{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}",
+      ".dshLimobFormRow .dshLimobSelect{flex:1 1 180px}",
+      ".dshLimobLinkBtn{border:0;background:transparent;color:#679efe;font:inherit;font-size:10px;line-height:16px;padding:0;cursor:pointer;opacity:.85}",
+      ".dshLimobLinkBtn:hover{opacity:1;text-decoration:underline}",
+      ".dshLimobFormFoot{display:flex;align-items:center;gap:8px;justify-content:flex-end;min-height:24px}",
+      ".dshLimobFormError{color:#f87171;font-size:11px;line-height:16px;margin-right:auto}",
+      ".dshLimobCfgFooter{display:flex;align-items:center;gap:2px;border-top:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.28));padding-top:7px;margin-top:1px;flex-wrap:wrap}",
+      ".dshLimobCfgFooterVersion{margin-left:auto;font-size:10px;line-height:16px;opacity:.35;flex:none}",
+      ".dshLimobImportBox{display:flex;flex-direction:column;gap:6px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.3));border-radius:8px;padding:8px}",
+      ".dshLimobImportBox .dshLimobTextarea{min-height:76px}",
+      ".dshLimobCfgNotice{color:#22c55e;font-size:11px;line-height:16px}",
+      ".dshLimobCfgError{color:#f87171;font-size:11px;line-height:16px}",
+      ".dshLimobFieldHint{font-size:10px;line-height:14px;opacity:.5;margin-top:2px}",
+      ".dshLimobCfgTips{display:flex;flex-direction:column;gap:3px;border-top:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.28));padding:9px 2px 0;margin-top:2px;font-size:11px;line-height:17px;opacity:.55}",
+      ".dshLimobCfgTipsTitle{font-size:11px;font-weight:600;opacity:.9}",
+      ".dshLimobCfgModalBackdrop{pointer-events:auto;position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,.42);display:flex;align-items:center;justify-content:center;padding:20px}",
+      ".dshLimobCfgModal{box-sizing:border-box;width:min(720px,94vw);max-height:min(86vh,780px);overflow:auto;border-radius:12px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));background:var(--dsw-alias-bg-layer-2,#26282c);box-shadow:0 18px 48px rgba(0,0,0,.45);padding:14px}",
+      ".dshLimobCfgH{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:13px;font-weight:600}",
       // ---- 插件详情页更新区 ----
       ".dshLimobUpdateBadge{display:inline-flex;align-items:center;height:20px;padding:0 8px;border-radius:999px;border:.5px solid rgba(245,158,11,.5);background:rgba(245,158,11,.12);color:#f59e0b;font-size:11px;line-height:18px;white-space:nowrap}",
       ".dshLimobDetailSection{display:flex;flex-direction:column;gap:8px;padding:14px 16px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));border-radius:10px;background:var(--dsw-alias-bg-layer-1,rgba(128,128,128,.06));font-size:12px;line-height:18px}",
@@ -1113,9 +1156,57 @@ window.__ModuleLoader__.load({
     // =====================================================================
     // 九、配置编辑器（设置页与运行按钮的「管理命令…」弹窗共用）
     // =====================================================================
+    // 交互原则：列表尽量紧凑、少留白；编辑表单内联展开，作用域用分段按钮选择，
+    // 项目级命令直接从 DSH 已注册的工作区下拉选择，不需要手输路径（也允许自定义）。
+
+    /** 从 useWorkspaces 快照里取出「项目选择器」选项（去重、保留标题）。 */
+    function workspaceOptionsFrom(useWorkspaces) {
+      var workspaces = typeof useWorkspaces === "function" ? useWorkspaces(function (state) { return state; }) : undefined;
+      var items = workspaces !== undefined && workspaces !== null && Array.isArray(workspaces.items) ? workspaces.items : [];
+      var seen = {};
+      var options = [];
+      for (var i = 0; i < items.length; i += 1) {
+        var workspace = items[i];
+        if (workspace === null || workspace === undefined || typeof workspace.path !== "string" || workspace.path === "") continue;
+        var key = normalizePath(workspace.path);
+        if (seen[key] === true) continue;
+        seen[key] = true;
+        var title = typeof workspace.title === "string" && workspace.title !== ""
+          ? workspace.title
+          : (workspace.path.split(/[\\/]/).filter(Boolean).pop() || workspace.path);
+        options.push({ path: workspace.path, title: title });
+      }
+      return options;
+    }
+
+    /** 在项目选项里找路径对应的标题；找不到返回路径最后一段。 */
+    function projectTitleOf(path, options) {
+      if (path === undefined || path === null || path === "") return "未指定项目";
+      var key = normalizePath(path);
+      for (var i = 0; i < options.length; i += 1) {
+        if (normalizePath(options[i].path) === key) return options[i].title;
+      }
+      var parts = String(path).split(/[\\/]/).filter(Boolean);
+      return parts.length > 0 ? parts[parts.length - 1] : String(path);
+    }
+
+    /** 16x16 线性小图标（统一 viewBox/颜色，避免用文字符号或 emoji 当图标）。 */
+    function limobIcon(name) {
+      var base = { width: 15, height: 15, viewBox: "0 0 16 16", "aria-hidden": "true", focusable: "false" };
+      if (name === "up") return h("svg", base, h("path", { d: "M8 4l4 4H9v4H7V8H4l4-4z", fill: "currentColor" }));
+      if (name === "down") return h("svg", base, h("path", { d: "M8 12l-4-4h3V4h2v4h3l-4 4z", fill: "currentColor" }));
+      if (name === "edit") return h("svg", base, h("path", { d: "M3 11.5V13h1.5L12 5.5 10.5 4 3 11.5zM13.7 3.3a1 1 0 0 0 0-1.4l-.6-.6a1 1 0 0 0-1.4 0L11 2l1.9 1.9.8-.6z", fill: "currentColor" }));
+      if (name === "trash") return h("svg", base, h("path", { d: "M6.5 2h3l.5 1H13v1H3V3h3l.5-1zM4.2 5h7.6l-.6 8H4.8L4.2 5z", fill: "currentColor" }));
+      if (name === "close") return h("svg", base, h("path", { d: "M4.3 3.3L8 7l3.7-3.7 1.4 1.4L9.4 8.4l3.7 3.7-1.4 1.4L8 9.8l-3.7 3.7-1.4-1.4 3.7-3.7-3.7-3.7z", fill: "currentColor" }));
+      if (name === "plus") return h("svg", base, h("path", { d: "M7 3h2v4h4v2H9v4H7V9H3V7h4V3z", fill: "currentColor" }));
+      return null;
+    }
+
     function LimobConfigEditor(props) {
       var config = useConfig();
-      var currentProjectPath = props.currentProjectPath;
+      var currentProjectPath = props !== undefined ? props.currentProjectPath : undefined;
+      var workspaces = props !== undefined && Array.isArray(props.workspaces) ? props.workspaces : [];
+
       var editingPair = react.useState(null);
       var editing = editingPair[0];
       var setEditing = editingPair[1];
@@ -1137,6 +1228,48 @@ window.__ModuleLoader__.load({
       var resetPair = react.useState(false);
       var resetArmed = resetPair[0];
       var setResetArmed = resetPair[1];
+      var customProjectPair = react.useState(false);
+      var projectCustom = customProjectPair[0];
+      var setProjectCustom = customProjectPair[1];
+
+      // 提示 3.5 秒后自动消失。
+      react.useEffect(function () {
+        if (notice === "") return undefined;
+        var timer = setTimeout(function () {
+          setNotice("");
+        }, 3500);
+        return function () {
+          clearTimeout(timer);
+        };
+      }, [notice]);
+
+      /** 项目选择器的选项：已注册工作区 + 当前工作区（若尚未注册，当前工作区排在最前）。 */
+      function projectOptions() {
+        var list = workspaces.slice();
+        if (currentProjectPath !== undefined && currentProjectPath !== "") {
+          var exists = false;
+          for (var i = 0; i < list.length; i += 1) {
+            if (normalizePath(list[i].path) === normalizePath(currentProjectPath)) {
+              exists = true;
+              if (i > 0) {
+                var moved = list.splice(i, 1)[0];
+                list.unshift(moved);
+              }
+              break;
+            }
+          }
+          if (!exists) list.unshift({ path: currentProjectPath, title: "当前工作区" });
+        }
+        return list;
+      }
+
+      function workspaceFor(path) {
+        var list = projectOptions();
+        for (var i = 0; i < list.length; i += 1) {
+          if (normalizePath(list[i].path) === normalizePath(path)) return list[i];
+        }
+        return undefined;
+      }
 
       function flash(text) {
         setNotice(text);
@@ -1156,11 +1289,13 @@ window.__ModuleLoader__.load({
           utf8CodePage: false,
           longRunning: false
         });
+        setProjectCustom(false);
         setError("");
       }
 
       function startEdit(command) {
         setEditing(Object.assign({}, command, { terminalTitle: command.terminalTitle || "" }));
+        setProjectCustom(command.scope === "project" && workspaceFor(command.projectRoot) === undefined);
         setError("");
       }
 
@@ -1168,21 +1303,53 @@ window.__ModuleLoader__.load({
         if (editing === null) return;
         var next = Object.assign({}, editing);
         next[field] = value;
-        if (field === "command") {
-          // 含中文时自动建议 UTF-8（用户可手动关闭）。
-          if (/[^\x00-\x7f]/.test(String(value))) next.utf8CodePage = true;
-        }
+        if (field === "command" && /[^\x00-\x7f]/.test(String(value))) next.utf8CodePage = true;
         setEditing(next);
+      }
+
+      function chooseScope(scope) {
+        if (editing === null) return;
+        if (scope === "project") {
+          var fallback = currentProjectPath !== undefined && currentProjectPath !== "" ? currentProjectPath : "";
+          var known = fallback !== "" && workspaceFor(fallback) !== undefined;
+          setEditing(Object.assign({}, editing, {
+            scope: "project",
+            projectRoot: editing.projectRoot !== "" ? editing.projectRoot : fallback,
+            cwd: editing.cwd !== "" ? editing.cwd : fallback
+          }));
+          setProjectCustom(editing.projectRoot === "" && !known);
+        } else {
+          setEditing(Object.assign({}, editing, { scope: "global" }));
+          setProjectCustom(false);
+        }
+      }
+
+      function chooseProject(value) {
+        if (editing === null) return;
+        if (value === "__custom__") {
+          setProjectCustom(true);
+          setEditing(Object.assign({}, editing, { projectRoot: "" }));
+          return;
+        }
+        setProjectCustom(false);
+        setEditing(Object.assign({}, editing, {
+          projectRoot: value,
+          cwd: editing.cwd !== "" ? editing.cwd : value
+        }));
+      }
+
+      function useProjectAsCwd() {
+        if (editing === null || editing.projectRoot === "") return;
+        setEditing(Object.assign({}, editing, { cwd: editing.projectRoot }));
       }
 
       function saveDraft() {
         if (editing === null) return;
         var normalized = normalizeCommand(editing);
         if (normalized === null) {
-          setError("请填写名称、工作目录、命令；作用域为「仅项目」时还要填写项目根目录。");
+          setError("请填写名称、工作目录、命令；作用域为「指定项目」时还要选择或填写项目。");
           return;
         }
-        if (normalized.id === "") normalized.id = makeId();
         var next = Object.assign({}, config, { commands: config.commands.slice() });
         var index = -1;
         for (var i = 0; i < next.commands.length; i += 1) {
@@ -1196,16 +1363,16 @@ window.__ModuleLoader__.load({
         saveConfig(next);
         setEditing(null);
         setError("");
-        flash("已保存命令：" + normalized.title);
+        flash("已保存：" + normalized.title);
       }
 
       function removeCommand(id) {
-        var next = Object.assign({}, config, {
+        saveConfig(Object.assign({}, config, {
           commands: config.commands.filter(function (command) {
             return command.id !== id;
           })
-        });
-        saveConfig(next);
+        }));
+        if (editing !== null && editing.id === id) setEditing(null);
         setPendingDelete(null);
         flash("已删除命令");
       }
@@ -1221,17 +1388,25 @@ window.__ModuleLoader__.load({
       }
 
       function toggleEnabled(command) {
-        var commands = config.commands.map(function (item) {
-          if (item.id !== command.id) return item;
-          return Object.assign({}, item, { enabled: !item.enabled });
-        });
-        saveConfig(Object.assign({}, config, { commands: commands }));
+        saveConfig(Object.assign({}, config, {
+          commands: config.commands.map(function (item) {
+            if (item.id !== command.id) return item;
+            return Object.assign({}, item, { enabled: !item.enabled });
+          })
+        }));
+      }
+
+      function toggleVisible() {
+        saveConfig(Object.assign({}, config, {
+          ui: Object.assign({}, config.ui, { visible: !config.ui.visible })
+        }));
+        flash(config.ui.visible ? "已隐藏输入框下方的运行按钮" : "已显示输入框下方的运行按钮");
       }
 
       function resetDefaults() {
         if (!resetArmed) {
           setResetArmed(true);
-          flash("再点一次「确认恢复内置命令」：会清空自定义命令（运行按钮显示设置保留）。");
+          flash("再点一次「确认恢复」：会清空自定义命令（运行按钮开关保留）。");
           return;
         }
         var defaults = defaultConfig();
@@ -1242,14 +1417,6 @@ window.__ModuleLoader__.load({
         flash("已恢复内置的 4 条命令");
       }
 
-      function toggleVisible() {
-        var next = Object.assign({}, config, {
-          ui: Object.assign({}, config.ui, { visible: !config.ui.visible })
-        });
-        saveConfig(next);
-        flash(config.ui.visible ? "已隐藏运行按钮（在设置里可重新显示）" : "已显示运行按钮");
-      }
-
       function exportConfig() {
         var copied = copyTextToClipboard(JSON.stringify(config, null, 2));
         flash(copied ? "配置 JSON 已复制到剪贴板" : "复制失败，请重试");
@@ -1257,8 +1424,7 @@ window.__ModuleLoader__.load({
 
       function applyImport() {
         try {
-          var parsed = JSON.parse(importText);
-          var normalized = normalizeConfig(parsed);
+          var normalized = normalizeConfig(JSON.parse(importText));
           saveConfig(normalized);
           setImportOpen(false);
           setImportText("");
@@ -1270,217 +1436,275 @@ window.__ModuleLoader__.load({
         }
       }
 
-      function scopeTag(command) {
-        if (command.scope === "project") {
-          return "项目 · " + (command.projectRoot || "未设置");
-        }
-        return "全局";
-      }
+      var projectCount = config.commands.filter(function (command) {
+        return command.scope === "project";
+      }).length;
+      var currentWorkspace = currentProjectPath !== undefined && currentProjectPath !== ""
+        ? workspaceFor(currentProjectPath)
+        : undefined;
+      var statText = config.commands.length + " 条命令"
+        + (projectCount > 0 ? " · " + projectCount + " 条项目级" : "")
+        + (currentWorkspace !== undefined ? " · 当前 " + currentWorkspace.title : "");
 
-      return h("div", { className: "dshLimobCfg" },
-        h("div", { className: "dshLimobCfgMuted" },
-          currentProjectPath !== undefined && currentProjectPath !== ""
-            ? "当前工作区：" + currentProjectPath + "（项目命令只在这个项目里显示）"
-            : "当前不在会话里；项目命令需要进入对应工作区的会话后才显示。"),
+      var options = projectOptions();
+      var selectedProject = editing !== null && editing.projectRoot !== "" ? workspaceFor(editing.projectRoot) : undefined;
+      var projectSelectValue = projectCustom
+        ? "__custom__"
+        : (selectedProject !== undefined ? selectedProject.path : (editing !== null && editing.projectRoot !== "" ? "__custom__" : (options.length > 0 ? options[0].path : "__custom__")));
 
-        // 运行按钮显示设置
-        h("div", { className: "dshLimobCfgCard" },
-          h("div", { className: "dshLimobCfgH" }, h("span", null, "运行按钮"), h("span", { className: "dshLimobCfgMuted" }, "v" + PLUGIN_VERSION)),
-          h("div", { className: "dshLimobCfgRow" },
-            h("label", { className: "dshLimobCfgCheck" },
-              h("input", { type: "checkbox", checked: config.ui.visible, onChange: toggleVisible }),
-              "在输入框下方显示「运行」按钮"),
-            h("span", { className: "dshLimobCfgMuted" }, "按钮会出现在对话输入框卡片的正下方，点击向上展开命令菜单。"))),
-
-        // 命令列表
-        h("div", { className: "dshLimobCfgCard" },
-          h("div", { className: "dshLimobCfgH" },
-            h("span", null, "命令（" + config.commands.length + "）"),
-            h("button", { type: "button", className: "dshLimobCfgBtn dshLimobCfgBtnPrimary", onClick: startCreate }, "新增命令")),
-          config.commands.length === 0
-            ? h("div", { className: "dshLimobCfgMuted" }, "还没有命令，点「新增命令」添加一条。")
-            : h("div", { className: "dshLimobCfgList" },
-              config.commands.map(function (command, index) {
-                return h("div", {
-                  key: command.id,
-                  className: "dshLimobCfgItem",
-                  "data-disabled": command.enabled ? "false" : "true"
-                },
-                  h("div", { className: "dshLimobCfgItemMain" },
-                    h("div", { className: "dshLimobCfgItemTitle" }, command.title),
-                    h("div", { className: "dshLimobCfgItemCmd" }, command.command)),
-                  h("span", { className: "dshLimobCfgTag" }, scopeTag(command)),
-                  h("label", { className: "dshLimobCfgCheck" },
-                    h("input", {
-                      type: "checkbox",
-                      checked: command.enabled,
-                      onChange: function () { toggleEnabled(command); }
-                    }),
-                    "启用"),
-                  h("button", {
-                    type: "button",
-                    className: "dshLimobCfgBtn",
-                    disabled: index === 0,
-                    title: "上移",
-                    onClick: function () { moveCommand(index, -1); }
-                  }, "↑"),
-                  h("button", {
-                    type: "button",
-                    className: "dshLimobCfgBtn",
-                    disabled: index === config.commands.length - 1,
-                    title: "下移",
-                    onClick: function () { moveCommand(index, 1); }
-                  }, "↓"),
-                  h("button", {
-                    type: "button",
-                    className: "dshLimobCfgBtn",
-                    onClick: function () { startEdit(command); }
-                  }, "编辑"),
-                  pendingDelete === command.id
-                    ? h("span", { className: "dshLimobCfgRow" },
-                        h("button", {
-                          type: "button",
-                          className: "dshLimobCfgBtn dshLimobCfgBtnDanger",
-                          onClick: function () { removeCommand(command.id); }
-                        }, "确认删除"),
-                        h("button", {
-                          type: "button",
-                          className: "dshLimobCfgBtn",
-                          onClick: function () { setPendingDelete(null); }
-                        }, "取消"))
-                    : h("button", {
-                        type: "button",
-                        className: "dshLimobCfgBtn dshLimobCfgBtnDanger",
-                        onClick: function () { setPendingDelete(command.id); }
-                      }, "删除"));
-              }))),
-
-        // 编辑表单
-        editing !== null
-          ? h("div", { className: "dshLimobCfgCard" },
-            h("div", { className: "dshLimobCfgH" },
-              h("span", null, editing.id === "" ? "新增命令" : "编辑命令"),
-              h("button", {
-                type: "button",
-                className: "dshLimobCfgBtn",
-                onClick: function () { setEditing(null); setError(""); }
-              }, "取消")),
-            h("div", { className: "dshLimobCfgRow" },
-              h("label", { className: "dshLimobCfgField" },
-                h("span", null, "名称 *"),
-                h("input", {
-                  className: "dshLimobCfgInput",
-                  value: editing.title,
-                  placeholder: "例如：开发调试",
-                  onChange: function (event) { updateDraft("title", event.target.value); }
-                })),
-              h("label", { className: "dshLimobCfgField" },
-                h("span", null, "终端标题（可选）"),
-                h("input", {
-                  className: "dshLimobCfgInput",
-                  value: editing.terminalTitle,
-                  placeholder: "默认 Limob-<id>",
-                  onChange: function (event) { updateDraft("terminalTitle", event.target.value); }
-                }))),
-            h("label", { className: "dshLimobCfgField" },
-              h("span", null, "工作目录 *"),
+      var form = editing === null ? null : h("div", { className: "dshLimobCfgForm" },
+        h("div", { className: "dshLimobCfgFormTop" },
+          h("span", { className: "dshLimobCfgFormTitle" }, editing.id === "" ? "新增命令" : "编辑命令"),
+          h("button", {
+            type: "button",
+            className: "dshLimobIconBtn",
+            title: "关闭",
+            "aria-label": "关闭",
+            onClick: function () { setEditing(null); setError(""); }
+          }, limobIcon("close"))),
+        h("div", { className: "dshLimobFormGrid" },
+          h("label", { className: "dshLimobFormField" },
+            h("span", null, "名称 *"),
+            h("input", {
+              className: "dshLimobInput",
+              value: editing.title,
+              placeholder: "例如：开发调试",
+              onChange: function (event) { updateDraft("title", event.target.value); }
+            })),
+          h("label", { className: "dshLimobFormField" },
+            h("span", null, "终端标题（可选）"),
+            h("input", {
+              className: "dshLimobInput",
+              value: editing.terminalTitle,
+              placeholder: "默认 Limob-<id>",
+              onChange: function (event) { updateDraft("terminalTitle", event.target.value); }
+            })),
+          h("label", { className: "dshLimobFormField", "data-wide": "true" },
+            h("span", null, "工作目录 *"),
+            h("div", { className: "dshLimobFormRow" },
               h("input", {
-                className: "dshLimobCfgInput",
+                className: "dshLimobInput",
+                style: { flex: "1 1 220px" },
                 value: editing.cwd,
                 placeholder: "H:\\Limob-windows",
                 onChange: function (event) { updateDraft("cwd", event.target.value); }
-              })),
-            h("label", { className: "dshLimobCfgField" },
-              h("span", null, "命令（PowerShell，固定文本）*"),
-              h("textarea", {
-                className: "dshLimobCfgTextarea",
-                value: editing.command,
-                placeholder: "pnpm 客户端-调试",
-                onChange: function (event) { updateDraft("command", event.target.value); }
-              })),
-            h("div", { className: "dshLimobCfgRow" },
-              h("label", { className: "dshLimobCfgField" },
-                h("span", null, "作用域"),
-                h("select", {
-                  className: "dshLimobCfgSelect",
-                  value: editing.scope,
-                  onChange: function (event) { updateDraft("scope", event.target.value); }
-                },
-                  h("option", { value: "global" }, "全局（所有项目都显示）"),
-                  h("option", { value: "project" }, "仅项目（只在指定项目显示）"))),
-              editing.scope === "project"
-                ? h("label", { className: "dshLimobCfgField" },
-                    h("span", null, "项目根目录 *"),
-                    h("input", {
-                      className: "dshLimobCfgInput",
-                      value: editing.projectRoot,
-                      placeholder: "H:\\Limob-windows",
-                      onChange: function (event) { updateDraft("projectRoot", event.target.value); }
-                    }))
-                : null),
-            editing.scope === "project"
-              ? h("div", { className: "dshLimobCfgRow" },
-                  h("button", {
-                    type: "button",
-                    className: "dshLimobCfgBtn",
-                    disabled: currentProjectPath === undefined || currentProjectPath === "",
-                    onClick: function () { updateDraft("projectRoot", currentProjectPath || ""); }
-                  }, "填入当前工作区"))
-              : null,
-            h("div", { className: "dshLimobCfgRow" },
-              h("label", { className: "dshLimobCfgCheck" },
-                h("input", {
-                  type: "checkbox",
-                  checked: editing.utf8CodePage,
-                  onChange: function (event) { updateDraft("utf8CodePage", event.target.checked); }
-                }),
-                "命令含中文时先执行 chcp 65001（推荐）"),
-              h("label", { className: "dshLimobCfgCheck" },
-                h("input", {
-                  type: "checkbox",
-                  checked: editing.enabled,
-                  onChange: function (event) { updateDraft("enabled", event.target.checked); }
-                }),
-                "启用")),
-            h("div", { className: "dshLimobCfgRow" },
-              h("button", { type: "button", className: "dshLimobCfgBtn dshLimobCfgBtnPrimary", onClick: saveDraft }, "保存"),
-              h("button", {
-                type: "button",
-                className: "dshLimobCfgBtn",
-                onClick: function () { setEditing(null); setError(""); }
-              }, "取消")))
-          : null,
-
-        // 导入/导出/重置
-        h("div", { className: "dshLimobCfgCard" },
-          h("div", { className: "dshLimobCfgH" }, h("span", null, "备份与维护")),
-          h("div", { className: "dshLimobCfgRow" },
-            h("button", { type: "button", className: "dshLimobCfgBtn", onClick: exportConfig }, "导出配置 JSON"),
-            h("button", {
-              type: "button",
-              className: "dshLimobCfgBtn",
-              onClick: function () { setImportOpen(!importOpen); setError(""); }
-            }, importOpen ? "收起导入" : "导入配置"),
-            h("button", {
-              type: "button",
-              className: "dshLimobCfgBtn dshLimobCfgBtnDanger",
-              onClick: resetDefaults
-            }, resetArmed ? "确认恢复内置命令" : "恢复内置命令")),
-          importOpen
-            ? h("div", { className: "dshLimobCfgRow" },
-                h("textarea", {
-                  className: "dshLimobCfgTextarea",
-                  style: { flex: "1 1 100%", minHeight: "90px" },
-                  value: importText,
-                  placeholder: "粘贴导出的配置 JSON"
-                , onChange: function (event) { setImportText(event.target.value); } }),
-                h("button", { type: "button", className: "dshLimobCfgBtn dshLimobCfgBtnPrimary", onClick: applyImport }, "导入"),
+              }),
+              editing.scope === "project" && editing.projectRoot !== ""
+                ? h("button", { type: "button", className: "dshLimobLinkBtn", onClick: useProjectAsCwd }, "使用项目目录")
+                : null)),
+          h("label", { className: "dshLimobFormField", "data-wide": "true" },
+            h("span", null, "命令（PowerShell，固定文本）*"),
+            h("textarea", {
+              className: "dshLimobTextarea",
+              value: editing.command,
+              placeholder: "pnpm 客户端-调试",
+              onChange: function (event) { updateDraft("command", event.target.value); }
+            })),
+          h("div", { className: "dshLimobFormField", "data-wide": "true" },
+            h("span", null, "作用域"),
+            h("div", { className: "dshLimobFormRow" },
+              h("div", { className: "dshLimobSegment" },
                 h("button", {
                   type: "button",
-                  className: "dshLimobCfgBtn",
+                  "data-active": editing.scope === "global" ? "true" : "false",
+                  onClick: function () { chooseScope("global"); }
+                }, "所有项目"),
+                h("button", {
+                  type: "button",
+                  "data-active": editing.scope === "project" ? "true" : "false",
+                  onClick: function () { chooseScope("project"); }
+                }, "指定项目")),
+              editing.scope === "project"
+                ? h("select", {
+                    className: "dshLimobSelect",
+                    value: projectSelectValue,
+                    onChange: function (event) { chooseProject(event.target.value); }
+                  },
+                    options.map(function (option) {
+                      return h("option", { key: option.path, value: option.path }, option.title + " · " + option.path);
+                    }),
+                    h("option", { value: "__custom__" }, "自定义路径…"))
+                : h("span", { className: "dshLimobPageSub" }, "所有项目都会显示这条命令")),
+            editing.scope === "project" && projectCustom
+              ? h("input", {
+                  className: "dshLimobInput",
+                  style: { marginTop: "5px" },
+                  value: editing.projectRoot,
+                  placeholder: "项目根目录，例如 H:\\Limob-windows",
+                  onChange: function (event) { updateDraft("projectRoot", event.target.value); }
+                })
+              : null,
+            editing.scope === "project"
+              ? h("span", { className: "dshLimobFieldHint" }, "只在该工作区的会话里出现；下拉列表来自 DSH 已注册的工作区。")
+              : null),
+          h("div", { className: "dshLimobFormRow", "data-wide": "true" },
+            h("label", { className: "dshLimobSwitch" },
+              h("input", {
+                type: "checkbox",
+                checked: editing.utf8CodePage,
+                onChange: function (event) { updateDraft("utf8CodePage", event.target.checked); }
+              }),
+              h("span", { className: "dshLimobSwitchTrack" }),
+              h("span", null, "中文命令先执行 chcp 65001")),
+            h("label", { className: "dshLimobSwitch" },
+              h("input", {
+                type: "checkbox",
+                checked: editing.enabled,
+                onChange: function (event) { updateDraft("enabled", event.target.checked); }
+              }),
+              h("span", { className: "dshLimobSwitchTrack" }),
+              h("span", null, "启用")))),
+        h("div", { className: "dshLimobFormFoot" },
+          error !== "" ? h("span", { className: "dshLimobFormError" }, error) : null,
+          h("button", {
+            type: "button",
+            className: "dshLimobCfgBtn",
+            onClick: function () { setEditing(null); setError(""); }
+          }, "取消"),
+          h("button", { type: "button", className: "dshLimobCfgBtn dshLimobCfgBtnPrimary", onClick: saveDraft }, "保存")));
+
+      var list = config.commands.length === 0
+        ? h("div", { className: "dshLimobCmdList" }, h("div", { className: "dshLimobCfgEmpty" }, "还没有命令，点右上角「+ 新增」添加一条。"))
+        : h("div", { className: "dshLimobCmdList" },
+            config.commands.map(function (command, index) {
+              var projectLabel = command.scope === "project"
+                ? "项目 · " + projectTitleOf(command.projectRoot, options)
+                : "全局";
+              var actions = pendingDelete === command.id
+                ? [
+                    h("button", {
+                      key: "confirm",
+                      type: "button",
+                      className: "dshLimobCfgBtn dshLimobCfgBtnDanger",
+                      onClick: function () { removeCommand(command.id); }
+                    }, "确认删除"),
+                    h("button", {
+                      key: "cancel",
+                      type: "button",
+                      className: "dshLimobCfgBtn dshLimobCfgBtnGhost",
+                      onClick: function () { setPendingDelete(null); }
+                    }, "取消")
+                  ]
+                : [
+                    h("label", { key: "enabled", className: "dshLimobSwitch", title: command.enabled ? "停用" : "启用" },
+                      h("input", {
+                        type: "checkbox",
+                        checked: command.enabled,
+                        onChange: function () { toggleEnabled(command); }
+                      }),
+                      h("span", { className: "dshLimobSwitchTrack" })),
+                    h("button", {
+                      key: "up",
+                      type: "button",
+                      className: "dshLimobIconBtn",
+                      title: "上移",
+                      "aria-label": "上移",
+                      disabled: index === 0,
+                      onClick: function () { moveCommand(index, -1); }
+                    }, limobIcon("up")),
+                    h("button", {
+                      key: "down",
+                      type: "button",
+                      className: "dshLimobIconBtn",
+                      title: "下移",
+                      "aria-label": "下移",
+                      disabled: index === config.commands.length - 1,
+                      onClick: function () { moveCommand(index, 1); }
+                    }, limobIcon("down")),
+                    h("button", {
+                      key: "edit",
+                      type: "button",
+                      className: "dshLimobIconBtn",
+                      title: "编辑",
+                      "aria-label": "编辑",
+                      onClick: function () { startEdit(command); }
+                    }, limobIcon("edit")),
+                    h("button", {
+                      key: "delete",
+                      type: "button",
+                      className: "dshLimobIconBtn",
+                      "data-danger": "true",
+                      title: "删除",
+                      "aria-label": "删除",
+                      onClick: function () { setPendingDelete(command.id); }
+                    }, limobIcon("trash"))
+                  ];
+              return h("div", {
+                key: command.id,
+                className: "dshLimobCmdRow",
+                "data-disabled": command.enabled ? "false" : "true"
+              },
+                h("div", {
+                  className: "dshLimobCmdMain",
+                  onClick: function () { startEdit(command); }
+                },
+                  h("div", { className: "dshLimobCmdTitleLine" },
+                    h("span", { className: "dshLimobCmdTitle" }, command.title),
+                    h("span", {
+                      className: "dshLimobTag",
+                      "data-scope": command.scope,
+                      title: command.scope === "project" ? command.projectRoot : "所有项目"
+                    }, projectLabel),
+                    command.enabled ? null : h("span", { className: "dshLimobTag" }, "已停用")),
+                  h("div", { className: "dshLimobCmdPreview" }, command.command)),
+                h("div", { className: "dshLimobCmdActions" }, actions));
+            }));
+
+      return h("div", { className: "dshLimobCfg" },
+        h("div", { className: "dshLimobCfgToolbar" },
+          h("span", { className: "dshLimobCfgStat", title: statText }, statText),
+          h("label", { className: "dshLimobSwitch", title: "在输入框下方显示「运行」按钮" },
+            h("input", { type: "checkbox", checked: config.ui.visible, onChange: toggleVisible }),
+            h("span", { className: "dshLimobSwitchTrack" }),
+            h("span", null, "运行按钮")),
+          h("button", {
+            type: "button",
+            className: "dshLimobCfgBtn dshLimobCfgBtnPrimary",
+            onClick: startCreate
+          }, limobIcon("plus"), h("span", null, "新增"))),
+
+        form,
+        list,
+
+        h("div", { className: "dshLimobCfgFooter" },
+          h("button", { type: "button", className: "dshLimobCfgBtn dshLimobCfgBtnGhost", onClick: exportConfig }, "导出配置"),
+          h("button", {
+            type: "button",
+            className: "dshLimobCfgBtn dshLimobCfgBtnGhost",
+            onClick: function () { setImportOpen(!importOpen); setError(""); }
+          }, importOpen ? "收起导入" : "导入配置"),
+          h("button", {
+            type: "button",
+            className: "dshLimobCfgBtn dshLimobCfgBtnGhost",
+            style: resetArmed ? { color: "#f87171" } : undefined,
+            onClick: resetDefaults
+          }, resetArmed ? "确认恢复" : "恢复内置"),
+          h("span", { className: "dshLimobCfgFooterVersion" }, "v" + PLUGIN_VERSION)),
+
+        importOpen
+          ? h("div", { className: "dshLimobImportBox" },
+              h("textarea", {
+                className: "dshLimobTextarea",
+                value: importText,
+                placeholder: "粘贴导出的配置 JSON",
+                onChange: function (event) { setImportText(event.target.value); }
+              }),
+              h("div", { className: "dshLimobFormFoot" },
+                h("button", {
+                  type: "button",
+                  className: "dshLimobCfgBtn dshLimobCfgBtnGhost",
                   onClick: function () { setImportOpen(false); setImportText(""); }
-                }, "取消"))
-            : null),
+                }, "取消"),
+                h("button", { type: "button", className: "dshLimobCfgBtn dshLimobCfgBtnPrimary", onClick: applyImport }, "导入")))
+          : null,
+
+        editing === null
+          ? h("div", { className: "dshLimobCfgTips" },
+              h("div", { className: "dshLimobCfgTipsTitle" }, "小提示"),
+              h("div", null, "全局命令在所有项目可见；项目命令只出现在绑定工作区的会话里。"),
+              h("div", null, "命令在 DSH 右侧栏终端运行，重复点击会复用同一个终端。"),
+              h("div", null, "修改立即生效；关闭「运行按钮」只是隐藏输入框下方的入口。"))
+          : null,
 
         error !== "" ? h("div", { className: "dshLimobCfgError" }, error) : null,
         notice !== "" ? h("div", { className: "dshLimobCfgNotice" }, notice) : null
@@ -1492,16 +1716,18 @@ window.__ModuleLoader__.load({
     // =====================================================================
     function LimobSettingsSection(props) {
       var active = useActiveSession(props);
+      var workspaces = workspaceOptionsFrom(props !== undefined ? props.useWorkspaces : undefined);
       return h("div", { className: "dshLimobCfgPage" },
-        h("div", { className: "dshLimobCfgCard" },
-          h("div", { className: "dshLimobCfgH" },
-            h("span", null, "Limob 运行器"),
-            h("span", { className: "dshLimobCfgMuted" }, "v" + PLUGIN_VERSION)),
-          h("div", { className: "dshLimobCfgMuted" },
-            "配置输入框下方「运行 Limob」按钮里出现的命令：新增/编辑/删除/排序/启停，以及全局或仅当前项目显示。")),
-        h(LimobConfigEditor, { currentProjectPath: active.projectPath }));
+        h("div", { className: "dshLimobPageHead" },
+          h("div", null,
+            h("div", { className: "dshLimobPageTitle" }, "Limob 运行器"),
+            h("div", { className: "dshLimobPageSub" }, "输入框下方「运行」按钮的命令配置")),
+          h("span", { className: "dshLimobPageVersion" }, "v" + PLUGIN_VERSION)),
+        h(LimobConfigEditor, {
+          currentProjectPath: active.projectPath,
+          workspaces: workspaces
+        }));
     }
-
     // =====================================================================
     // 十一、输入框下方的「运行 Limob」按钮（conversation.composer.dock）
     // =====================================================================
@@ -1531,6 +1757,7 @@ window.__ModuleLoader__.load({
         ? props.sessionId
         : (props !== undefined && props.session !== undefined && props.session !== null ? props.session.sessionId : undefined);
       var projectPath = useProjectPath(props !== undefined ? props.useWorkspaces : undefined, sessionId);
+      var workspaces = workspaceOptionsFrom(props !== undefined ? props.useWorkspaces : undefined);
       var updatePair = useUpdateStatus();
       var updateStatus = updatePair[0];
 
@@ -1788,7 +2015,7 @@ window.__ModuleLoader__.load({
                   className: "dshLimobCfgBtn",
                   onClick: function () { setConfigOpen(false); }
                 }, "关闭")),
-              h(LimobConfigEditor, { currentProjectPath: projectPath })))
+              h(LimobConfigEditor, { currentProjectPath: projectPath, workspaces: workspaces })))
         : null;
 
       return h("div", { ref: rootRef, className: "dshLimobRunDock" },
