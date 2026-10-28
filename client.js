@@ -34,7 +34,7 @@ window.__ModuleLoader__.load({
     // 一、常量与内置命令
     // =====================================================================
     var PLUGIN_NAME = "dsh-limob-runner";
-    var PLUGIN_VERSION = "0.5.0";
+    var PLUGIN_VERSION = "0.5.1";
 
     // 更新检查（GitHub Releases）
     var REPO_SLUG = "lcx19970714/dsh-limob-runner";
@@ -126,6 +126,7 @@ window.__ModuleLoader__.load({
       ".dshLimobRunItem{display:flex;align-items:flex-start;gap:7px;width:100%;padding:7px 9px;border:0;border-radius:7px;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}",
       ".dshLimobRunItem:hover{background:rgba(103,158,254,.14)}",
       ".dshLimobRunItem[disabled]{opacity:.55;cursor:default}",
+      ".dshLimobRunItem[data-danger=true]:hover:not([disabled]){background:rgba(239,68,68,.12)}",
       ".dshLimobRunItemMain{display:flex;flex-direction:column;gap:1px;min-width:0;flex:1}",
       ".dshLimobRunItemTitle{font-size:12px;line-height:17px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
       ".dshLimobRunItemCmd{font-size:10px;line-height:14px;opacity:.6;font-family:ui-monospace,Consolas,'Courier New',monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
@@ -1778,6 +1779,9 @@ window.__ModuleLoader__.load({
       var runningPair = react.useState({});
       var running = runningPair[0];
       var setRunning = runningPair[1];
+      var terminalCountPair = react.useState(0);
+      var terminalCount = terminalCountPair[0];
+      var setTerminalCount = terminalCountPair[1];
       var configOpenPair = react.useState(false);
       var configOpen = configOpenPair[0];
       var setConfigOpen = configOpenPair[1];
@@ -1816,6 +1820,7 @@ window.__ModuleLoader__.load({
       async function refreshRunning() {
         if (sessionId === undefined) {
           setRunning({});
+          setTerminalCount(0);
           return;
         }
         var remote = getTerminalRemote(runtimeCtx);
@@ -1825,15 +1830,19 @@ window.__ModuleLoader__.load({
           var registry = loadRegistry();
           var saved = registry.sessions[sessionId] || {};
           var next = {};
+          var liveCount = 0;
           Object.keys(saved).forEach(function (commandId) {
             var entry = saved[commandId];
             if (entry === undefined || entry === null) return;
             var live = list.find(function (info) {
               return info !== null && info !== undefined && info.id === entry.terminalId;
             });
-            if (live !== undefined && live.state === "running") next[commandId] = true;
+            if (live === undefined) return;
+            liveCount += 1;
+            if (live.state === "running") next[commandId] = true;
           });
           setRunning(next);
+          setTerminalCount(liveCount);
         } catch (_error) {
           /* ignore */
         }
@@ -1890,17 +1899,22 @@ window.__ModuleLoader__.load({
       }
 
       function handleStopAll() {
-        if (busy !== null || sessionId === undefined) return;
+        if (busy !== null || sessionId === undefined || terminalCount === 0) return;
         setMenuOpen(false);
         setBusy("__stop__");
-        setStatus({ phase: "starting", text: "正在停止 Limob 终端…" });
+        setStatus({ phase: "starting", text: "正在关闭本会话终端…" });
         stopAllTerminals(runtimeCtx, sessionId).then(
           function (count) {
-            setStatus({ phase: "idle", text: count > 0 ? ("已停止 Limob 终端（" + count + " 个）") : "当前没有正在运行的 Limob 终端" });
+            setStatus({
+              phase: "idle",
+              text: count > 0 ? ("已关闭 " + count + " 个终端（运行中的命令已结束）") : "当前没有可关闭的终端"
+            });
             setRunning({});
+            setTerminalCount(0);
           },
           function (error) {
-            setStatus({ phase: "error", text: "停止失败：" + messageOf(error) });
+            setStatus({ phase: "error", text: "关闭终端失败：" + messageOf(error) });
+            refreshRunning();
           }
         ).then(function () {
           setBusy(null);
@@ -1972,12 +1986,19 @@ window.__ModuleLoader__.load({
             h("button", {
               type: "button",
               className: "dshLimobRunItem",
-              disabled: busy !== null || sessionId === undefined,
+              "data-danger": "true",
+              disabled: busy !== null || sessionId === undefined || terminalCount === 0,
+              title: terminalCount > 0 ? "关闭由「运行」打开的终端" : "当前没有可关闭的终端",
               onClick: handleStopAll
             },
               h("span", { className: "dshLimobRunItemMain" },
-                h("span", { className: "dshLimobRunItemTitle" }, "停止本会话 Limob 终端"),
-                h("span", { className: "dshLimobRunItemCmd" }, "关闭由本插件创建的终端进程"))),
+                h("span", { className: "dshLimobRunItemTitle" }, "关闭本会话的运行终端"),
+                h("span", { className: "dshLimobRunItemCmd" },
+                  sessionId === undefined
+                    ? "请先进入会话"
+                    : terminalCount > 0
+                      ? "关闭由「运行」打开的 " + terminalCount + " 个终端；正在运行的命令会一并结束"
+                      : "当前没有由「运行」打开的终端"))),
             h("button", {
               type: "button",
               className: "dshLimobRunItem",
