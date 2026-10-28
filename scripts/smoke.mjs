@@ -48,7 +48,7 @@ const moduleExports = registration.factory((name) => {
   throw new Error("client.js 出现了未预期的 require: " + name);
 });
 assert.equal(moduleExports.name, "dsh-limob-runner");
-assert.deepEqual(moduleExports.inject, ["slots"]);
+assert.deepEqual(moduleExports.inject, ["slots", "connection"]);
 
 const internals = moduleExports.__limob;
 assert.notEqual(internals, undefined, "client.js 必须导出 __limob 测试入口");

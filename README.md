@@ -80,6 +80,40 @@ DSH 左下角 **设置**（Settings）弹窗 → 左侧导航新增一页 **「L
 - 项目直接从下拉列表选择（来自 DSH 侧栏已经添加的工作区，例如 `Limob-windows · H:\Limob-windows`），不需要手输路径；如果项目尚未注册到 DSH，可选「自定义路径…」手动填写。
 - 不在会话里时菜单只显示提示（运行命令需要会话）。
 
+---
+
+## 让 AI 直接帮你加启动命令（0.6.0+）
+
+装好后，AI 侧多了一个工具 **`limob_run_config`**。在任何项目的会话里直接说：
+
+- 「给当前项目加一个启动命令：`pnpm dev`，名字叫启动开发服务器」
+- 「给这个项目加一个 `cargo check` 命令」
+- 「把启动开发服务器改成 `pnpm dev:web`」
+- 「删除启动开发服务器」
+- 「加一个全局命令：打开记事本」
+
+AI 调用工具时的默认行为：
+
+- 作用域 = **当前项目**（project），项目路径 = 当前会话的工作区，不需要你手写 `H:\...`；
+- 工作目录 = 项目路径（除非显式指定 `cwd`）；
+- 命令里含中文时自动勾选 chcp 65001；
+- 只有你明确说「全局」时才会创建全局命令。
+
+保存后**不需要重启 DSH**：打开输入框下方的「运行」菜单，或进入设置页「Limob 运行器」，插件会自动从 Host 同步；设置页底部也有「同步宿主」按钮可手动刷新。
+
+配置由 Host 统一保存到：
+
+```
+C:\Users\main\.dsh\limob-runner\commands.json
+```
+
+（可用环境变量 `DSH_LIMOB_RUNNER_CONFIG` 指向别的路径；AI 也可以用普通文件工具直接读写这个 JSON。）
+如果没有 Host（例如离线/旧版），浏览器会自动退回 localStorage。
+
+> 工具只负责**保存配置**，不会直接执行命令；真正运行仍需你在菜单里点一下，避免 AI 直接跑危险命令。
+
+---
+
 默认自带 4 条 **全局** 命令：
 
 | 名称 | 工作目录 | 命令 |
@@ -131,11 +165,11 @@ DSH 左下角 **设置**（Settings）弹窗 → 左侧导航新增一页 **「L
 
 ## 数据与回退
 
-- 配置：`localStorage["dsh.limob-runner.config.v1"]`（命令、按钮显示开关）
+- 配置：Host 侧 `C:\Users\main\.dsh\limob-runner\commands.json`（主数据）；浏览器 `localStorage["dsh.limob-runner.config.v1"]` 作为缓存/离线兜底
 - 终端复用记录：`localStorage["dsh.limob-runner.v1"]`
 - 更新缓存：`localStorage["dsh.limob-runner.update.v1"]`
 
-以上都是浏览器本地数据，删掉只会丢失自定义命令/按钮开关，不会影响 DSH 其它功能。卸载插件后如需彻底清理，可在 DevTools 删除这三个键。
+以上都是本机本地数据，删掉只会丢失自定义命令/按钮开关，不会影响 DSH 其它功能。卸载插件后如需彻底清理，删除 `commands.json` 和这三个 localStorage 键即可。
 
 ---
 

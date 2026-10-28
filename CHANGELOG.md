@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.0
+
+### Added
+
+- **AI 可直接创建命令**：Host 侧注册 `limob_run_config` Tool（list / create / update / delete），AI 在任意项目里都能直接说「给当前项目加一个启动命令」并保存；
+- 命令配置改为 Host 侧 `commands.json`（默认 `C:\Users\main\.dsh\limob-runner\commands.json`），浏览器设置页通过 RPC 读写同一份文件；打开菜单/设置页会自动同步，也可点「同步宿主」手动刷新；
+- 项目级命令默认使用**当前会话工作区**作为项目路径，不需要手写 `H:\...`；也支持显式传 `scope=global` 创建全局命令；
+- 旧 localStorage 配置会在首次连接时自动写入 Host 文件，兼容原有 4 条内置命令。
+
 ## 0.5.1
 
 ### Changed

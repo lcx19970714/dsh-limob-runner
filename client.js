@@ -34,7 +34,7 @@ window.__ModuleLoader__.load({
     // 一、常量与内置命令
     // =====================================================================
     var PLUGIN_NAME = "dsh-limob-runner";
-    var PLUGIN_VERSION = "0.5.1";
+    var PLUGIN_VERSION = "0.6.0";
 
     // 更新检查（GitHub Releases）
     var REPO_SLUG = "lcx19970714/dsh-limob-runner";
@@ -54,6 +54,10 @@ window.__ModuleLoader__.load({
 
     // apply(ctx) 时保存客户端根 Context，组件里按需取 DSH 服务。
     var runtimeCtx = null;
+    // Host 侧配置存储的 RPC 连接；Host 半体负责写 commands.json，AI Tool 和浏览器共用同一份配置。
+    var hostConnection = null;
+    var hostSaveTimer = null;
+    var hostSavePending = null;
 
     // 内置默认命令：命令文本全部是常量，不接受用户输入拼接。
     // scope 默认 global，保持旧版行为；用户可在设置页改成「仅项目」。
@@ -593,7 +597,81 @@ window.__ModuleLoader__.load({
           /* ignore */
         }
       });
+      // 同步到 Host 的 commands.json：AI Tool 和浏览器设置页共用同一份配置。
+      // 没有 Host（例如离线测试）时自动退化为纯 localStorage。
+      persistConfigToHost(normalized);
       return normalized;
+    }
+
+    /** 调用 Host 半体注册的 RPC；失败返回 undefined，不阻塞界面。 */
+    async function hostRpc(endpoint, payload) {
+      if (hostConnection === null || hostConnection === undefined || hostConnection.rpc === undefined) return undefined;
+      try {
+        var result = await hostConnection.rpc.call("/api", "limob-runner/" + endpoint, payload === undefined ? {} : payload);
+        if (result === null || result === undefined) return undefined;
+        if (result.ok !== true) throw new Error(result.error && result.error.message ? result.error.message : "RPC 失败");
+        return result.value;
+      } catch (_error) {
+        return undefined;
+      }
+    }
+
+    /** 把 Host 的配置应用到浏览器 store（不反向写 Host，避免循环）。 */
+    function applyConfigFromHost(raw) {
+      var normalized = normalizeConfig(raw);
+      configCache = normalized;
+      try {
+        if (typeof localStorage !== "undefined") localStorage.setItem(CONFIG_KEY, JSON.stringify(normalized));
+      } catch (_error) {
+        /* ignore */
+      }
+      configListeners.forEach(function (listener) {
+        try {
+          listener();
+        } catch (_error) {
+          /* ignore */
+        }
+      });
+    }
+
+    /** 防抖写入 Host，避免开关/排序连续点击时发很多次 RPC。 */
+    function persistConfigToHost(config) {
+      if (hostConnection === null || hostConnection === undefined) return;
+      hostSavePending = config;
+      if (hostSaveTimer !== null) clearTimeout(hostSaveTimer);
+      hostSaveTimer = setTimeout(function () {
+        hostSaveTimer = null;
+        var pending = hostSavePending;
+        hostSavePending = null;
+        if (pending !== null) hostRpc("config/save", { config: pending });
+      }, 300);
+    }
+
+    /**
+     * 从 Host 拉取最新配置（AI 可能刚通过 Tool 改过）。
+     * Host 文件还不存在时，把浏览器当前配置作为初始值写过去。
+     */
+    async function syncConfigFromHost() {
+      // 先把还没落盘的本地修改写掉，避免同步又把刚保存的命令覆盖回旧版本。
+      if (hostSavePending !== null) {
+        var pending = hostSavePending;
+        hostSavePending = null;
+        if (hostSaveTimer !== null) {
+          clearTimeout(hostSaveTimer);
+          hostSaveTimer = null;
+        }
+        await hostRpc("config/save", { config: pending });
+      }
+      var value = await hostRpc("config/get", {});
+      if (value === undefined) return false;
+      if (value.config === null || value.config === undefined) {
+        await hostRpc("config/save", { config: getConfigSnapshot() });
+        return true;
+      }
+      var incoming = normalizeConfig(value.config);
+      var current = getConfigSnapshot();
+      if (JSON.stringify(incoming) !== JSON.stringify(current)) applyConfigFromHost(incoming);
+      return true;
     }
 
     function subscribeConfig(listener) {
@@ -1244,6 +1322,11 @@ window.__ModuleLoader__.load({
         };
       }, [notice]);
 
+      // 打开设置页时从 Host 拉一次最新配置，避免 AI 刚改过而页面还是旧的。
+      react.useEffect(function () {
+        syncConfigFromHost();
+      }, []);
+
       /** 项目选择器的选项：已注册工作区 + 当前工作区（若尚未注册，当前工作区排在最前）。 */
       function projectOptions() {
         var list = workspaces.slice();
@@ -1668,6 +1751,16 @@ window.__ModuleLoader__.load({
         list,
 
         h("div", { className: "dshLimobCfgFooter" },
+          h("button", {
+            type: "button",
+            className: "dshLimobCfgBtn dshLimobCfgBtnGhost",
+            title: "从宿主 commands.json 重新读取（AI 刚改过配置时用）",
+            onClick: function () {
+              syncConfigFromHost().then(function (ok) {
+                flash(ok ? "已从宿主同步最新配置" : "宿主配置暂不可用，已保留本地配置");
+              });
+            }
+          }, "同步宿主"),
           h("button", { type: "button", className: "dshLimobCfgBtn dshLimobCfgBtnGhost", onClick: exportConfig }, "导出配置"),
           h("button", {
             type: "button",
@@ -1850,6 +1943,8 @@ window.__ModuleLoader__.load({
 
       function toggleMenu() {
         if (!menuOpen) {
+          // AI 可能刚通过 limob_run_config 改过配置；每次打开菜单先同步一次。
+          syncConfigFromHost();
           refreshRunning();
           try {
             var rect = buttonRef.current !== null ? buttonRef.current.getBoundingClientRect() : null;
@@ -2079,6 +2174,13 @@ window.__ModuleLoader__.load({
 
     function apply(ctx) {
       runtimeCtx = ctx;
+      // 连接 Host 的 RPC（配置由 commands.json 统一保存，AI Tool 与设置页共用）。
+      try {
+        hostConnection = typeof ctx.get === "function" ? ctx.get("connection") : undefined;
+      } catch (_error) {
+        hostConnection = undefined;
+      }
+      syncConfigFromHost();
       // 输入框卡片正下方的小按钮（conversation.composer.dock）。
       registerSlot(ctx, "conversation.composer.dock", "limob-runner-run", LimobComposerButton, 40);
       // 设置弹窗左侧新增「Limob 运行器」页（settings.section 的每个条目就是一页）。
@@ -2089,7 +2191,7 @@ window.__ModuleLoader__.load({
     }
 
     exports.name = "dsh-limob-runner";
-    exports.inject = ["slots"];
+    exports.inject = ["slots", "connection"];
     exports.apply = apply;
 
     // 仅给离线测试/CI 用的内部入口；DSH loader 只读 name/inject/apply。

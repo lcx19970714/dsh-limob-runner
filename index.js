@@ -1,25 +1,218 @@
-/**
- * dsh-limob-runner 的 Host 半体（Node 侧）。
- *
- * 本插件的全部功能都在浏览器半体 client.js 里完成：它调用 DSH 客户端已挂载的
- * remote.terminal 命名空间（Host 端由 @deepseek-ai/dsh-api-terminal-controller 提供）
- * 创建 PTY、通过 terminal/attach 流写入命令，再让右侧栏内置的 terminal 页签渲染输出。
- *
- * Host 侧故意保持为空插件：
- * 1. 不注册工具、不改系统提示词、不抢任何服务，避免影响 DSH 正常聊天；
- * 2. DSH loader 需要每个 entry 有一个可导入的插件对象，因此这里只导出 name/apply。
- *
- * 如果将来需要「由模型调用」的能力（例如让 Agent 也能一键跑 Limob 命令），
- * 应另建一个独立工具包，而不是把副作用塞进这个纯 UI 插件里。
- */
+// dsh-limob-runner 的宿主侧（Host）实现。
+//
+// 浏览器端的「运行」按钮只负责调用 DSH 自带终端执行命令；命令配置真正存到
+// 宿主侧的 commands.json，并同时提供两种入口：
+//   1) 给 AI 用的 Tool：limob_run_config（list/create/update/delete）；
+//   2) 给浏览器设置页用的 RPC：config/get、config/save。
+// 这样 AI 在任意项目里都能直接给插件加启动命令，设置页刷新/打开菜单时自动同步。
+import os from "node:os";
+import path from "node:path";
+import { RpcId, clientRequestSchema } from "@deepseek-ai/dsh-client-connection";
+import { defineTool } from "@deepseek-ai/dsh-tools";
+import {
+  createCommand,
+  deleteCommand,
+  loadConfig,
+  saveConfigFile,
+  updateCommand
+} from "./host-config.js";
 
-/** loader 行身份（与 package.json 的 name、cordis.patch.yml 的 name 保持一致）。 */
 export const name = "dsh-limob-runner";
+// tools：注册 AI Tool；connection 在 apply 里按需注入（浏览器 RPC 需要）。
+export const inject = ["tools"];
 
-/** 不依赖任何 Host 服务。 */
-export const inject = [];
+// 配置文件的默认位置；测试时可用环境变量指向临时文件，避免污染真实配置。
+export const CONFIG_PATH = process.env.DSH_LIMOB_RUNNER_CONFIG
+  || path.join(os.homedir(), ".dsh", "limob-runner", "commands.json");
 
-/** 空实现：插件加载成功即代表 Host 半体就绪。 */
-export function apply() {
-  // 有意为空：真正的逻辑在 client.js（浏览器侧）。
+const RPC_CHANNEL = "/api";
+const RPC_NAMESPACE = "limob-runner";
+const RPC_ENDPOINTS = ["config/get", "config/save"];
+
+/** 当前 AI 调用所在会话的工作区目录（用于项目作用域的默认值）。 */
+function sessionWorkspacePath(exec) {
+  const cwd = exec && exec.agent && exec.agent.session && exec.agent.session.header
+    ? exec.agent.session.header.cwd
+    : undefined;
+  return typeof cwd === "string" && cwd.trim() !== "" ? cwd.trim() : undefined;
+}
+
+/** 把 Tool 参数里出现的字段收集成 patch，避免 undefined 覆盖已有值。 */
+function pickPatch(args) {
+  const patch = {};
+  const fields = ["title", "command", "cwd", "scope", "projectRoot", "terminalTitle", "enabled", "utf8CodePage"];
+  for (const field of fields) {
+    if (args[field] !== undefined) patch[field] = args[field];
+  }
+  return patch;
+}
+
+/** 注册给 AI 的配置 Tool。 */
+function registerConfigTool(ctx) {
+  return ctx.tools.register(defineTool({
+    name: "limob_run_config",
+    description:
+      "Manage the DSH Limob runner's launch commands (the commands shown under the composer's Run button). "
+      + "Use action=list to inspect existing commands; action=create to add one; action=update to edit; action=delete to remove. "
+      + "When the user asks to add a startup/launch/run command for the current project, call create with command (and optional title); "
+      + "the Tool defaults to project scope and uses the current session workspace as projectRoot, so it only appears in that project. "
+      + "Use scope=global only when the user explicitly wants the command in every project. "
+      + "The command runs in DSH's built-in terminal; this Tool only saves configuration, it does not execute the command.",
+    parameters: {
+      action: {
+        type: "string",
+        required: true,
+        enum: ["list", "create", "update", "delete"],
+        description: "list | create | update | delete"
+      },
+      id: { type: "string", description: "Command id (or exact title) for update/delete; get it from action=list." },
+      title: { type: "string", description: "Display name of the command." },
+      command: { type: "string", description: "The PowerShell command to run, e.g. pnpm dev." },
+      cwd: { type: "string", description: "Working directory; defaults to projectRoot/current workspace." },
+      scope: { type: "string", enum: ["global", "project"], description: "project (default when in a workspace) or global." },
+      projectRoot: { type: "string", description: "Project workspace path for scope=project; defaults to the current session workspace." },
+      terminalTitle: { type: "string", description: "Optional DSH terminal tab title." },
+      enabled: { type: "boolean", description: "Whether the command appears in the menu; default true." },
+      utf8CodePage: { type: "boolean", description: "Run chcp 65001 before the command; auto-enabled for non-ASCII commands." }
+    },
+    output: {
+      schema: { type: "json" },
+      render: (_args, value) => [{ type: "text", text: JSON.stringify(value, null, 2) }]
+    },
+    async execute(args, exec) {
+      const loaded = await loadConfig(CONFIG_PATH);
+      if (args.action === "list") {
+        return {
+          ok: true,
+          filePath: CONFIG_PATH,
+          exists: loaded.exists,
+          commands: loaded.config.commands,
+          ui: loaded.config.ui
+        };
+      }
+      if (args.action === "create") {
+        const created = createCommand(loaded.config, args, sessionWorkspacePath(exec));
+        const saved = await saveConfigFile(CONFIG_PATH, created.config);
+        return {
+          ok: true,
+          filePath: CONFIG_PATH,
+          command: created.command,
+          commands: saved.commands,
+          message: "已创建命令「" + created.command.title + "」"
+        };
+      }
+      if (args.action === "update") {
+        if (args.id === undefined && args.title === undefined) throw new Error("update 需要 id 或 title");
+        const updated = updateCommand(loaded.config, args.id !== undefined ? args.id : args.title, pickPatch(args));
+        const saved = await saveConfigFile(CONFIG_PATH, updated.config);
+        return {
+          ok: true,
+          filePath: CONFIG_PATH,
+          command: updated.command,
+          commands: saved.commands,
+          message: "已修改命令「" + updated.command.title + "」"
+        };
+      }
+      if (args.action === "delete") {
+        if (args.id === undefined && args.title === undefined) throw new Error("delete 需要 id 或 title");
+        const removed = deleteCommand(loaded.config, args.id !== undefined ? args.id : args.title);
+        const saved = await saveConfigFile(CONFIG_PATH, removed.config);
+        return {
+          ok: true,
+          filePath: CONFIG_PATH,
+          command: removed.command,
+          commands: saved.commands,
+          message: "已删除命令「" + removed.command.title + "」"
+        };
+      }
+      throw new Error("未知 action：" + String(args.action));
+    }
+  }));
+}
+
+/** 统一的 RPC 响应信封（与 dsh-client-connection 的 client.rpc.call 对应）。 */
+function respond(rpcId, result) {
+  return Response.json({
+    type: "server-response",
+    rpcId: RpcId(rpcId),
+    result: result
+  });
+}
+
+function ok(value) {
+  return { ok: true, value: value };
+}
+
+function fail(code, message) {
+  return { ok: false, error: { code: code, message: message, details: {} } };
+}
+
+async function dispatch(endpoint, payload) {
+  if (endpoint === "config/get") {
+    const loaded = await loadConfig(CONFIG_PATH);
+    return {
+      config: loaded.exists ? loaded.config : null,
+      filePath: CONFIG_PATH,
+      exists: loaded.exists
+    };
+  }
+  if (endpoint === "config/save") {
+    if (payload === null || payload === undefined || typeof payload !== "object" || payload.config === undefined) {
+      throw new Error("config/save 需要 {config}");
+    }
+    const saved = await saveConfigFile(CONFIG_PATH, payload.config);
+    return { saved: true, filePath: CONFIG_PATH, config: saved };
+  }
+  throw new Error("未知 endpoint：" + endpoint);
+}
+
+/** 注册浏览器 RPC 路由（POST /api/limob-runner/config/get 等）。 */
+function registerRpc(ctx) {
+  for (const endpoint of RPC_ENDPOINTS) {
+    const routePath = RPC_CHANNEL + "/" + RPC_NAMESPACE + "/" + endpoint;
+    const method = RPC_NAMESPACE + "/" + endpoint;
+    const register = () => {
+      const dispose = ctx.connection.fetch.register({
+        path: routePath,
+        methods: ["POST"],
+        requestBody: "buffered",
+        async fetch(request) {
+          let body;
+          try {
+            body = await request.json();
+          } catch (_error) {
+            return new Response("body is not JSON", { status: 400 });
+          }
+          const envelope = clientRequestSchema.safeParse(body);
+          if (!envelope.success) return new Response("invalid client-request envelope", { status: 400 });
+          const message = envelope.data;
+          if (message.method !== method) {
+            return respond(message.rpcId, fail("bad-request", "method mismatch: " + message.method));
+          }
+          let result;
+          try {
+            result = ok(await dispatch(endpoint, message.payload));
+          } catch (error) {
+            result = fail("internal", error instanceof Error ? error.message : String(error));
+          }
+          return respond(message.rpcId, result);
+        }
+      });
+      return () => {
+        dispose();
+      };
+    };
+    if (typeof ctx.effect === "function") {
+      ctx.effect(register, "limob-runner: rpc " + endpoint);
+    } else {
+      register();
+    }
+  }
+}
+
+export function apply(ctx) {
+  registerConfigTool(ctx);
+  ctx.inject(["connection"], (connectionCtx) => {
+    registerRpc(connectionCtx);
+  });
 }

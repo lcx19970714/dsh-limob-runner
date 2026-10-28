@@ -1,8 +1,8 @@
 {
   "name": "dsh-limob-runner",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "private": false,
-  "description": "DSH 客户端插件：输入框下方「运行」小按钮 + 设置页紧凑命令配置（项目下拉选择、增删改查、全局/项目作用域），通过 DSH 自带终端执行命令并检查 GitHub 更新。",
+  "description": "DSH 客户端插件：输入框下方「运行」小按钮 + 设置页紧凑命令配置；配置存 Host 侧并提供 limob_run_config 工具，让 AI 可在任意项目直接创建启动命令。",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -13,13 +13,14 @@
   "files": [
     "index.js",
     "client.js",
+    "host-config.js",
     "cordis.patch.yml",
     "README.md",
     "CHANGELOG.md",
     "LICENSE"
   ],
   "scripts": {
-    "harness:check": "node --check index.js && node --check client.js && node scripts/smoke.mjs"
+    "harness:check": "node --check index.js && node --check client.js && node --check host-config.js && node scripts/host-smoke.mjs && node scripts/smoke.mjs"
   },
   "keywords": [
     "dsh",
