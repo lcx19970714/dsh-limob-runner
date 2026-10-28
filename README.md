@@ -2,7 +2,7 @@
 
 [![release](https://img.shields.io/github/v/release/lcx19970714/dsh-limob-runner)](https://github.com/lcx19970714/dsh-limob-runner/releases)
 
-给 **DeepSeek Harness（DSH）** 的 Web 界面加一个 **可拖动的「运行 Limob」浮动按钮**：点击选择命令，在 **DSH 自带的右侧栏终端**里执行，输出实时滚动；按钮位置会记住。命令可以在 **设置弹窗的「Limob 运行器」页**里增删改查、排序、启停，并选择「全局」或「仅某个项目」显示。
+给 **DeepSeek Harness（DSH）** 的对话输入框**正下方**加一个低调的「▶ 运行 Limob」小按钮：点击选择命令，在 **DSH 自带的右侧栏终端**里执行，输出实时滚动。命令可以在 **设置弹窗的「Limob 运行器」页**里增删改查、排序、启停，并选择「全局」或「仅某个项目」显示。
 
 > 适用于 DSH **0.2.1 线**（`0.2.1-rc.2` 实测）。插件依赖 DSH 的内部客户端服务，升级 DSH 后可能需要适配，见文末「版本风险」。
 
@@ -20,7 +20,7 @@
    github:lcx19970714/dsh-limob-runner
    ```
 
-4. 安装后浮动按钮出现在右下角（可拖动）。
+4. 安装后，进入任意会话，输入框卡片正下方出现「▶ 运行 Limob」。
 
 ### 方式 B：命令行（桌面版需先完全退出 DSH）
 
@@ -39,12 +39,24 @@ dsh plugin --profile desktop add file:<仓库绝对路径>
 
 ---
 
+## 按钮在哪 / 长什么样
+
+- 位置：对话输入框卡片**正下方**（DSH 的 `conversation.composer.dock` 槽位，和输入框下方的状态胶囊同一行）；
+- 样式：小号胶囊按钮 `▶ 运行 Limob`，不占额外高度、不遮挡对话和输入框；
+- 点击：向上展开命令菜单（按当前项目过滤、显示运行中绿点、停止终端、管理命令、检查更新）；
+- 有新版本时按钮上会有一个小橙点；
+- 运行结果（启动中/运行中/失败）以小字显示在按钮右侧，6 秒后自动消失。
+
+不再有浮动按钮、拖动和位置记忆——按你的要求改成了「简单一点，放在输入框下面」。
+
+---
+
 ## 配置页面在哪？
 
 DSH 左下角 **设置**（Settings）弹窗 → 左侧导航新增一页 **「Limob 运行器」**。
 （技术实现：注册到 DSH 设置页的 `settings.section` 槽位，每个条目就是一页，不需要改 DSH 源码。）
 
-也可以从浮动按钮菜单的 **「管理命令…」** 直接打开同一套配置（弹窗形式）。
+也可以从「运行 Limob」菜单的 **「管理命令…」** 直接打开同一套配置（弹窗形式）。
 
 配置页能做：
 
@@ -52,21 +64,21 @@ DSH 左下角 **设置**（Settings）弹窗 → 左侧导航新增一页 **「L
 |---|---|
 | 新增命令 | 名称、工作目录、命令（PowerShell 固定文本）、终端标题（可选） |
 | 编辑 / 删除 | 删除前需二次确认 |
-| 排序 | ↑ / ↓ 调整浮动菜单里的顺序 |
+| 排序 | ↑ / ↓ 调整菜单里的顺序 |
 | 启用 / 停用 | 停用的命令不在菜单里出现，但保留配置 |
 | 作用域 | **全局**：所有项目都显示；**仅项目**：只在「项目根目录」匹配的会话里显示 |
 | 中文命令 | 勾选「先执行 chcp 65001」避免 Windows PowerShell 5.1 中文乱码（输入含中文时自动勾选） |
-| 浮动按钮 | 显示/隐藏、重置位置 |
+| 运行按钮 | 显示 / 隐藏输入框下方的按钮 |
 | 备份 | 导出配置 JSON、导入配置 JSON、恢复内置的 4 条命令 |
 
 ### 全局 vs 项目作用域
 
 - **全局**：任何会话都能看到这条命令。
-- **仅项目**：只有当前会话所属的 **工作区路径** 等于「项目根目录」，或位于它下面（子目录）时，命令才出现在浮动菜单里。
+- **仅项目**：只有当前会话所属的**工作区路径**等于「项目根目录」，或位于它下面（子目录）时，命令才出现在菜单里。
 - 项目根目录就是 DSH 侧栏里那个工作区目录（例如 `H:\Limob-windows`）；配置页里的「填入当前工作区」可以一键填入。
-- 不在会话里时，浮动菜单只显示提示（运行命令需要会话），全局命令也不可点。
+- 不在会话里时菜单只显示提示（运行命令需要会话）。
 
-默认自带 4 条 **全局** 命令（与旧版一致）：
+默认自带 4 条 **全局** 命令：
 
 | 名称 | 工作目录 | 命令 |
 |---|---|---|
@@ -75,16 +87,7 @@ DSH 左下角 **设置**（Settings）弹窗 → 左侧导航新增一页 **「L
 | 快速构建（tauri build --debug） | `H:\Limob-windows` | `pnpm exec tauri build --debug --no-bundle` |
 | 正式构建（pnpm 构建桌面端） | `H:\Limob-windows` | `pnpm 构建桌面端` |
 
-旧版升级上来的用户会自动得到这份默认配置；之前「正在运行的终端」记录（`dsh.limob-runner.v1`）仍然兼容。
-
----
-
-## 浮动按钮
-
-- 默认在右下角；**按住拖动**到任意位置，松手后位置写入 `localStorage`（`dsh.limob-runner.config.v1` 的 `ui.floating`），刷新页面/重启 DSH 后保持。
-- 点击（不拖动）打开命令菜单：按当前项目过滤后的命令、运行中绿点、停止终端、管理命令、检查更新。
-- 位置超出视口会自动夹回可视区域；设置页可「重置按钮位置」或隐藏按钮。
-- 浮动按钮在 DSH 的插件页/设置页等界面也可见；打开模态框时不会挡住弹窗（层级在模态框之下）。
+旧版升级上来的用户会自动得到这份默认配置；之前的终端复用记录（`dsh.limob-runner.v1`）继续兼容。旧配置里的 `ui.floating` 字段会被自动忽略。
 
 ---
 
@@ -111,7 +114,7 @@ DSH 左下角 **设置**（Settings）弹窗 → 左侧导航新增一页 **「L
 
 插件内建 GitHub Releases 检查（6 小时缓存，可手动「检查更新」）：
 
-- 有新版时：浮动按钮出现小橙点、菜单顶部「发现新版本」、DSH 插件页本插件详情出现「可更新」徽标与升级说明；
+- 有新版时：按钮出现小橙点、菜单顶部「发现新版本」、DSH 插件页本插件详情出现「可更新」徽标与升级说明；
 - 升级方式：DSH 插件页卸载后用 `github:` 规格重装，或退出 DSH 后执行：
 
   ```powershell
@@ -120,24 +123,24 @@ DSH 左下角 **设置**（Settings）弹窗 → 左侧导航新增一页 **「L
 
 - 为什么不做静默自动升级：安装要写 profile、跑 pnpm、重新组合，属于 DSH Host/插件管理器的权限；自动升级也会绕过用户确认。
 
-维护者发版：同时改 `package.json` 与 `client.js` 的 `PLUGIN_VERSION`（`scripts/smoke.mjs` 会校验一致）→ commit → `git tag vX.Y.Z` → `git push --tags` → `gh release create vX.Y.Z --generate-notes`。仓库 `contrib/github-workflows/` 里有可选的 Actions 模板（启用方式见下）。
+维护者发版：同时改 `package.json` 与 `client.js` 的 `PLUGIN_VERSION`（`scripts/smoke.mjs` 会校验一致）→ commit → `git tag vX.Y.Z` → `git push --tags` → `gh release create vX.Y.Z --generate-notes`。仓库 `contrib/github-workflows/` 里有可选的 Actions 模板。
 
 ---
 
 ## 数据与回退
 
-- 配置：`localStorage["dsh.limob-runner.config.v1"]`（命令、浮动按钮位置、显示开关）
+- 配置：`localStorage["dsh.limob-runner.config.v1"]`（命令、按钮显示开关）
 - 终端复用记录：`localStorage["dsh.limob-runner.v1"]`
 - 更新缓存：`localStorage["dsh.limob-runner.update.v1"]`
 
-以上都是浏览器本地数据，删掉只会丢失自定义命令/位置记录，不会影响 DSH 其它功能。卸载插件后如需彻底清理，可在 DevTools 删除这三个键。
+以上都是浏览器本地数据，删掉只会丢失自定义命令/按钮开关，不会影响 DSH 其它功能。卸载插件后如需彻底清理，可在 DevTools 删除这三个键。
 
 ---
 
 ## 实现与版本风险
 
 - 客户端插件与 DSH 内置 UI 插件在同一个 Cordis 根 Context 中运行，可访问 `remote.terminal`、`webTerminals`、`sidebarRight` 等客户端服务。
-- 浮动按钮：`shell.overlay`（root 作用域、frame-wide 浮动层）。
+- 运行按钮：`conversation.composer.dock`（输入框卡片下方的环境条目槽位）。
 - 配置页：`settings.section`（设置弹窗的页面列表，每个条目一页）。
 - 更新提示：`plugins.detail.badge` / `plugins.detail.section`（插件页详情扩展点）。
 - 终端：`remote.terminal.create/list/attach/rename/close` + `sidebarRight.openTab("terminal",{params:{terminalId}})`。

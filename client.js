@@ -1,16 +1,16 @@
-/* dsh-limob-runner —— 客户端半体（浏览器侧）v0.3
+/* dsh-limob-runner —— 客户端半体（浏览器侧）v0.4
  *
  * 功能总览：
- *   1) 一个可拖动的浮动按钮（shell.overlay）：点击打开命令菜单，长按/拖动可移动，
- *      位置保存在 localStorage，下次打开保持原位；
+ *   1) 在对话输入框「正下方」放一个低调的「▶ 运行 Limob」小按钮
+ *      （conversation.composer.dock 槽位）：点击向上展开命令菜单；
  *   2) 命令配置页（settings.section）：在 DSH 设置弹窗里新增「Limob 运行器」页，
  *      支持命令的增删改查、排序、启停、全局/项目作用域；
  *   3) 运行命令仍通过 DSH 自带终端（remote.terminal + 右侧栏 terminal 页签），
  *      输出实时滚动；重复点击复用已有终端，支持一键停止；
- *   4) GitHub Releases 更新检查（dock/菜单/插件页提示），只提示不自动升级。
+ *   4) GitHub Releases 更新检查（按钮/菜单/插件页提示），只提示不自动升级。
  *
  * 数据流：
- *   配置：localStorage(dsh.limob-runner.config.v1) <-> 设置页/浮动按钮共用同一个 store
+ *   配置：localStorage(dsh.limob-runner.config.v1) <-> 设置页/按钮菜单共用同一个 store
  *   终端：remote.terminal.create/list/attach/rename/close
  *   页签：webTerminals.recover + sidebarRight.openTab("terminal",{params:{terminalId}})
  *
@@ -34,7 +34,7 @@ window.__ModuleLoader__.load({
     // 一、常量与内置命令
     // =====================================================================
     var PLUGIN_NAME = "dsh-limob-runner";
-    var PLUGIN_VERSION = "0.3.0";
+    var PLUGIN_VERSION = "0.4.0";
 
     // 更新检查（GitHub Releases）
     var REPO_SLUG = "lcx19970714/dsh-limob-runner";
@@ -113,27 +113,25 @@ window.__ModuleLoader__.load({
     // =====================================================================
     var STYLE_ID = "dsh-limob-runner-css";
     var CSS = [
-      // ---- 浮动按钮 ----
-      ".dshLimobFabRoot{position:fixed;z-index:40;pointer-events:none}",
-      ".dshLimobFabBtn{pointer-events:auto;display:inline-flex;align-items:center;justify-content:center;width:44px;height:44px;border-radius:50%;border:.5px solid rgba(103,158,254,.55);background:linear-gradient(135deg,#4561ee,#679efe);color:#fff;font-size:15px;line-height:1;cursor:grab;user-select:none;touch-action:none;box-shadow:0 6px 18px rgba(0,0,0,.32)}",
-      ".dshLimobFabBtn:hover{filter:brightness(1.08)}",
-      ".dshLimobFabBtn[data-dragging=true]{cursor:grabbing;filter:brightness(1.12)}",
-      ".dshLimobFabBtn .dshLimobFabDot{position:absolute;right:5px;top:5px;width:8px;height:8px;border-radius:50%;background:#f59e0b;border:1.5px solid #1b1d22}",
-      ".dshLimobFabBadge{position:absolute;left:0;top:calc(100% + 6px);padding:2px 7px;border-radius:999px;background:rgba(0,0,0,.62);color:#fff;font-size:10px;line-height:16px;white-space:nowrap;pointer-events:none}",
-      // ---- 浮动菜单 ----
-      ".dshLimobFabMenu{pointer-events:auto;box-sizing:border-box;position:fixed;z-index:41;min-width:260px;max-width:min(380px,92vw);max-height:min(70vh,560px);overflow:auto;padding:6px;border-radius:11px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));background:var(--dsw-alias-bg-layer-2,#26282c);box-shadow:0 12px 32px rgba(0,0,0,.38);font-family:inherit;font-size:12px;line-height:18px;color:inherit}",
-      ".dshLimobFabMenuTitle{padding:5px 9px 3px;font-size:11px;opacity:.6;user-select:none;display:flex;justify-content:space-between;gap:8px}",
-      ".dshLimobFabItem{display:flex;align-items:flex-start;gap:7px;width:100%;padding:7px 9px;border:0;border-radius:7px;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}",
-      ".dshLimobFabItem:hover{background:rgba(103,158,254,.14)}",
-      ".dshLimobFabItem[disabled]{opacity:.55;cursor:default}",
-      ".dshLimobFabItemMain{display:flex;flex-direction:column;gap:1px;min-width:0;flex:1}",
-      ".dshLimobFabItemTitle{font-size:13px;line-height:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
-      ".dshLimobFabItemCmd{font-size:11px;line-height:15px;opacity:.6;font-family:ui-monospace,Consolas,'Courier New',monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
-      ".dshLimobFabTag{flex:none;padding:0 6px;border-radius:999px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));font-size:10px;line-height:16px;opacity:.75}",
-      ".dshLimobFabRunDot{flex:none;width:6px;height:6px;margin-top:7px;border-radius:50%;background:#22c55e}",
-      ".dshLimobFabSep{height:1px;margin:5px 4px;background:var(--dsw-alias-border-l3,rgba(128,128,128,.3))}",
-      ".dshLimobFabToast{pointer-events:none;box-sizing:border-box;position:fixed;z-index:41;max-width:min(360px,90vw);padding:6px 10px;border-radius:8px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));background:var(--dsw-alias-bg-layer-2,#26282c);box-shadow:0 8px 22px rgba(0,0,0,.3);font-size:11px;line-height:16px;opacity:.96}",
-      ".dshLimobFabToast[data-phase=error]{border-color:rgba(239,68,68,.5);color:#fca5a5}",
+      // ---- 输入框下方的运行按钮 ----
+      ".dshLimobRunDock{position:relative;display:flex;align-items:center;gap:8px;min-width:0;max-width:100%}",
+      ".dshLimobRunBtn{display:inline-flex;align-items:center;gap:5px;height:24px;padding:0 10px;border-radius:999px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));background:var(--dsw-alias-bg-layer-1,rgba(128,128,128,.08));color:inherit;font:inherit;font-size:11px;line-height:22px;cursor:pointer;white-space:nowrap;user-select:none}",
+      ".dshLimobRunBtn:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.16))}",
+      ".dshLimobRunBtn[data-busy=true]{cursor:progress;opacity:.7}",
+      ".dshLimobRunDot{width:6px;height:6px;border-radius:50%;background:#f59e0b;margin-left:1px}",
+      ".dshLimobRunStatus{display:inline-flex;align-items:center;min-width:0;font-size:11px;line-height:16px;opacity:.8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+      ".dshLimobRunStatus[data-phase=error]{color:#f87171}",
+      ".dshLimobRunMenu{position:fixed;z-index:60;box-sizing:border-box;min-width:260px;max-width:min(400px,92vw);max-height:min(60vh,520px);overflow:auto;padding:6px;border-radius:11px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));background:var(--dsw-alias-bg-layer-2,#26282c);box-shadow:0 12px 32px rgba(0,0,0,.38);font-family:inherit;font-size:12px;line-height:18px;color:inherit}",
+      ".dshLimobRunMenuTitle{padding:5px 9px 3px;font-size:11px;opacity:.6;user-select:none;display:flex;justify-content:space-between;gap:8px}",
+      ".dshLimobRunItem{display:flex;align-items:flex-start;gap:7px;width:100%;padding:7px 9px;border:0;border-radius:7px;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}",
+      ".dshLimobRunItem:hover{background:rgba(103,158,254,.14)}",
+      ".dshLimobRunItem[disabled]{opacity:.55;cursor:default}",
+      ".dshLimobRunItemMain{display:flex;flex-direction:column;gap:1px;min-width:0;flex:1}",
+      ".dshLimobRunItemTitle{font-size:12px;line-height:17px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+      ".dshLimobRunItemCmd{font-size:10px;line-height:14px;opacity:.6;font-family:ui-monospace,Consolas,'Courier New',monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+      ".dshLimobRunTag{flex:none;padding:0 6px;border-radius:999px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));font-size:10px;line-height:16px;opacity:.75}",
+      ".dshLimobRunRunningDot{flex:none;width:6px;height:6px;margin-top:6px;border-radius:50%;background:#22c55e}",
+      ".dshLimobRunSep{height:1px;margin:5px 4px;background:var(--dsw-alias-border-l3,rgba(128,128,128,.3))}",
       // ---- 配置编辑器 ----
       ".dshLimobCfg{display:flex;flex-direction:column;gap:12px;font-size:12px;line-height:18px;color:inherit}",
       ".dshLimobCfgCard{display:flex;flex-direction:column;gap:8px;padding:12px 14px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));border-radius:10px;background:var(--dsw-alias-bg-layer-1,rgba(128,128,128,.06))}",
@@ -495,7 +493,7 @@ window.__ModuleLoader__.load({
             longRunning: item.longRunning
           };
         }),
-        ui: { floating: null, visible: true }
+        ui: { visible: true }
       };
     }
 
@@ -510,19 +508,10 @@ window.__ModuleLoader__.load({
         }
       }
       var ui = raw.ui !== null && typeof raw.ui === "object" ? raw.ui : {};
-      var floating = null;
-      if (ui.floating !== null && ui.floating !== undefined && typeof ui.floating === "object"
-        && typeof ui.floating.x === "number" && typeof ui.floating.y === "number"
-        && isFinite(ui.floating.x) && isFinite(ui.floating.y)) {
-        floating = { x: Math.round(ui.floating.x), y: Math.round(ui.floating.y) };
-      }
       return {
         version: CONFIG_VERSION,
         commands: commands,
-        ui: {
-          floating: floating,
-          visible: ui.visible !== false
-        }
+        ui: { visible: ui.visible !== false }
       };
     }
 
@@ -657,24 +646,6 @@ window.__ModuleLoader__.load({
         projectPath: projectPath,
         sessionTitle: active !== null ? active.title : undefined
       };
-    }
-
-    function useViewport() {
-      var pair = react.useState(function () {
-        if (typeof window === "undefined" || typeof window.innerWidth !== "number") return { width: 1280, height: 800 };
-        return { width: window.innerWidth, height: window.innerHeight };
-      });
-      react.useEffect(function () {
-        function onResize() {
-          if (typeof window === "undefined") return;
-          pair[1]({ width: window.innerWidth, height: window.innerHeight });
-        }
-        window.addEventListener("resize", onResize);
-        return function () {
-          window.removeEventListener("resize", onResize);
-        };
-      }, []);
-      return pair[0];
     }
 
     // =====================================================================
@@ -1140,7 +1111,7 @@ window.__ModuleLoader__.load({
     }
 
     // =====================================================================
-    // 九、配置编辑器（设置页与浮动按钮弹窗共用）
+    // 九、配置编辑器（设置页与运行按钮的「管理命令…」弹窗共用）
     // =====================================================================
     function LimobConfigEditor(props) {
       var config = useConfig();
@@ -1260,7 +1231,7 @@ window.__ModuleLoader__.load({
       function resetDefaults() {
         if (!resetArmed) {
           setResetArmed(true);
-          flash("再点一次「确认恢复内置命令」：会清空自定义命令（浮动按钮设置保留）。");
+          flash("再点一次「确认恢复内置命令」：会清空自定义命令（运行按钮显示设置保留）。");
           return;
         }
         var defaults = defaultConfig();
@@ -1271,18 +1242,12 @@ window.__ModuleLoader__.load({
         flash("已恢复内置的 4 条命令");
       }
 
-      function resetFloating() {
-        var next = Object.assign({}, config, { ui: Object.assign({}, config.ui, { floating: null }) });
-        saveConfig(next);
-        flash("浮动按钮位置已重置");
-      }
-
       function toggleVisible() {
         var next = Object.assign({}, config, {
           ui: Object.assign({}, config.ui, { visible: !config.ui.visible })
         });
         saveConfig(next);
-        flash(config.ui.visible ? "已隐藏浮动按钮（在设置里可重新显示）" : "已显示浮动按钮");
+        flash(config.ui.visible ? "已隐藏运行按钮（在设置里可重新显示）" : "已显示运行按钮");
       }
 
       function exportConfig() {
@@ -1318,15 +1283,14 @@ window.__ModuleLoader__.load({
             ? "当前工作区：" + currentProjectPath + "（项目命令只在这个项目里显示）"
             : "当前不在会话里；项目命令需要进入对应工作区的会话后才显示。"),
 
-        // 浮动按钮设置
+        // 运行按钮显示设置
         h("div", { className: "dshLimobCfgCard" },
-          h("div", { className: "dshLimobCfgH" }, h("span", null, "浮动按钮"), h("span", { className: "dshLimobCfgMuted" }, "v" + PLUGIN_VERSION)),
+          h("div", { className: "dshLimobCfgH" }, h("span", null, "运行按钮"), h("span", { className: "dshLimobCfgMuted" }, "v" + PLUGIN_VERSION)),
           h("div", { className: "dshLimobCfgRow" },
             h("label", { className: "dshLimobCfgCheck" },
               h("input", { type: "checkbox", checked: config.ui.visible, onChange: toggleVisible }),
-              "显示浮动按钮"),
-            h("button", { type: "button", className: "dshLimobCfgBtn", onClick: resetFloating }, "重置按钮位置"),
-            h("span", { className: "dshLimobCfgMuted" }, "按钮可拖动，位置会自动记住。"))),
+              "在输入框下方显示「运行 Limob」按钮"),
+            h("span", { className: "dshLimobCfgMuted" }, "按钮会出现在对话输入框卡片的正下方，点击向上展开命令菜单。"))),
 
         // 命令列表
         h("div", { className: "dshLimobCfgCard" },
@@ -1534,41 +1498,50 @@ window.__ModuleLoader__.load({
             h("span", null, "Limob 运行器"),
             h("span", { className: "dshLimobCfgMuted" }, "v" + PLUGIN_VERSION)),
           h("div", { className: "dshLimobCfgMuted" },
-            "配置「运行 Limob」浮动按钮里出现的命令：新增/编辑/删除/排序/启停，以及全局或仅当前项目显示。")),
+            "配置输入框下方「运行 Limob」按钮里出现的命令：新增/编辑/删除/排序/启停，以及全局或仅当前项目显示。")),
         h(LimobConfigEditor, { currentProjectPath: active.projectPath }));
     }
 
     // =====================================================================
-    // 十一、浮动按钮（shell.overlay，可拖动 + 位置记忆）
+    // 十一、输入框下方的「运行 Limob」按钮（conversation.composer.dock）
     // =====================================================================
-    function clampNumber(value, min, max) {
-      if (value < min) return min;
-      if (value > max) return max;
-      return value;
+    // conversation.composer.dock 是 DSH 对话输入框卡片「正下方」的环境条目槽位，
+    // 官方用它放 ActivityPill / UsagePill。这里只放一个低调的小按钮 + 向上展开的菜单，
+    // 不再有浮动层、拖动和位置记忆。
+
+    /** 由工作区快照反查某个会话所属工作区路径（用于项目作用域过滤）。 */
+    function useProjectPath(useWorkspaces, sessionId) {
+      var workspaces = typeof useWorkspaces === "function" ? useWorkspaces(function (state) { return state; }) : undefined;
+      if (sessionId === undefined || workspaces === undefined || workspaces === null || !Array.isArray(workspaces.items)) {
+        return undefined;
+      }
+      for (var i = 0; i < workspaces.items.length; i += 1) {
+        var workspace = workspaces.items[i];
+        if (workspace !== null && workspace !== undefined && Array.isArray(workspace.sessionIds)
+          && workspace.sessionIds.indexOf(sessionId) !== -1) {
+          return workspace.path;
+        }
+      }
+      return undefined;
     }
 
-    function defaultFabPosition(viewport) {
-      return {
-        x: clampNumber(viewport.width - 72, 8, Math.max(8, viewport.width - 52)),
-        y: clampNumber(viewport.height - 250, 8, Math.max(8, viewport.height - 52))
-      };
-    }
-
-    function LimobFab(props) {
+    function LimobComposerButton(props) {
       var config = useConfig();
-      var active = useActiveSession(props);
-      var viewport = useViewport();
+      var sessionId = props !== undefined && props.sessionId !== undefined
+        ? props.sessionId
+        : (props !== undefined && props.session !== undefined && props.session !== null ? props.session.sessionId : undefined);
+      var projectPath = useProjectPath(props !== undefined ? props.useWorkspaces : undefined, sessionId);
       var updatePair = useUpdateStatus();
       var updateStatus = updatePair[0];
 
       var menuPair = react.useState(false);
       var menuOpen = menuPair[0];
       var setMenuOpen = menuPair[1];
-      var dragPair = react.useState(null);
-      var dragover = dragPair[0];
-      var setDragover = dragPair[1];
-      var dragInfoRef = react.useRef(null);
+      var menuPosPair = react.useState(null);
+      var menuPos = menuPosPair[0];
+      var setMenuPos = menuPosPair[1];
       var rootRef = react.useRef(null);
+      var buttonRef = react.useRef(null);
       var busyPair = react.useState(null);
       var busy = busyPair[0];
       var setBusy = busyPair[1];
@@ -1582,14 +1555,9 @@ window.__ModuleLoader__.load({
       var configOpen = configOpenPair[0];
       var setConfigOpen = configOpenPair[1];
 
-      var commands = visibleCommands(config, active.projectPath, active.sessionId !== undefined);
-      var stored = config.ui.floating;
-      var basePos = stored !== null && stored !== undefined ? stored : defaultFabPosition(viewport);
-      var fabPos = {
-        x: clampNumber(dragover !== null ? dragover.x : basePos.x, 8, Math.max(8, viewport.width - 52)),
-        y: clampNumber(dragover !== null ? dragover.y : basePos.y, 8, Math.max(8, viewport.height - 52))
-      };
+      var commands = visibleCommands(config, projectPath, sessionId !== undefined);
 
+      // 状态提示 6 秒后自动消失。
       react.useEffect(function () {
         if (status === null) return undefined;
         var timer = setTimeout(function () {
@@ -1600,7 +1568,7 @@ window.__ModuleLoader__.load({
         };
       }, [status]);
 
-      // 点菜单外部关闭菜单。
+      // 点菜单外部 / Esc 关闭菜单。
       react.useEffect(function () {
         if (!menuOpen) return undefined;
         function onPointerDown(event) {
@@ -1619,16 +1587,16 @@ window.__ModuleLoader__.load({
       }, [menuOpen]);
 
       async function refreshRunning() {
-        if (active.sessionId === undefined) {
+        if (sessionId === undefined) {
           setRunning({});
           return;
         }
         var remote = getTerminalRemote(runtimeCtx);
         if (remote === undefined || remote === null) return;
         try {
-          var list = await listTerminals(remote, active.sessionId);
+          var list = await listTerminals(remote, sessionId);
           var registry = loadRegistry();
-          var saved = registry.sessions[active.sessionId] || {};
+          var saved = registry.sessions[sessionId] || {};
           var next = {};
           Object.keys(saved).forEach(function (commandId) {
             var entry = saved[commandId];
@@ -1645,80 +1613,40 @@ window.__ModuleLoader__.load({
       }
 
       function toggleMenu() {
-        if (!menuOpen) refreshRunning();
+        if (!menuOpen) {
+          refreshRunning();
+          try {
+            var rect = buttonRef.current !== null ? buttonRef.current.getBoundingClientRect() : null;
+            var width = typeof window !== "undefined" && typeof window.innerWidth === "number" ? window.innerWidth : 1280;
+            var height = typeof window !== "undefined" && typeof window.innerHeight === "number" ? window.innerHeight : 800;
+            if (rect !== null) {
+              var menuWidth = Math.min(400, width - 16);
+              var left = Math.min(Math.max(8, rect.left), Math.max(8, width - menuWidth - 8));
+              setMenuPos({
+                left: left,
+                bottom: height - rect.top + 8,
+                maxHeight: Math.max(160, rect.top - 24)
+              });
+            } else {
+              setMenuPos(null);
+            }
+          } catch (_error) {
+            setMenuPos(null);
+          }
+        }
         setMenuOpen(!menuOpen);
-      }
-
-      function onPointerDown(event) {
-        if (event.button !== undefined && event.button !== 0) return;
-        if (busy !== null) return;
-        dragInfoRef.current = {
-          pointerId: event.pointerId,
-          startX: event.clientX,
-          startY: event.clientY,
-          originX: fabPos.x,
-          originY: fabPos.y,
-          lastX: fabPos.x,
-          lastY: fabPos.y,
-          moved: false
-        };
-        try {
-          event.currentTarget.setPointerCapture(event.pointerId);
-        } catch (_error) {
-          /* ignore */
-        }
-        event.preventDefault();
-      }
-
-      function onPointerMove(event) {
-        var info = dragInfoRef.current;
-        if (info === null || info.pointerId !== event.pointerId) return;
-        var dx = event.clientX - info.startX;
-        var dy = event.clientY - info.startY;
-        if (!info.moved && Math.abs(dx) + Math.abs(dy) > 4) {
-          info.moved = true;
-          setMenuOpen(false);
-        }
-        if (info.moved) {
-          var nextX = clampNumber(info.originX + dx, 8, Math.max(8, viewport.width - 52));
-          var nextY = clampNumber(info.originY + dy, 8, Math.max(8, viewport.height - 52));
-          info.lastX = nextX;
-          info.lastY = nextY;
-          setDragover({ x: nextX, y: nextY });
-        }
-      }
-
-      function onPointerUp(event) {
-        var info = dragInfoRef.current;
-        dragInfoRef.current = null;
-        try {
-          event.currentTarget.releasePointerCapture(event.pointerId);
-        } catch (_error) {
-          /* ignore */
-        }
-        if (info === null) return;
-        if (info.moved) {
-          var next = Object.assign({}, config, {
-            ui: Object.assign({}, config.ui, { floating: { x: info.lastX, y: info.lastY } })
-          });
-          saveConfig(next);
-          setDragover(null);
-          setStatus({ phase: "idle", text: "浮动按钮位置已记住" });
-        } else {
-          toggleMenu();
-        }
       }
 
       function handleRun(command) {
         if (busy !== null) return;
-        if (active.sessionId === undefined) {
+        if (sessionId === undefined) {
           setStatus({ phase: "error", text: "请先进入一个会话，再运行命令" });
           return;
         }
         setMenuOpen(false);
         setBusy(command.id);
         setStatus({ phase: "starting", text: "正在启动：" + command.title });
-        runCommand(runtimeCtx, active.sessionId, command).then(
+        runCommand(runtimeCtx, sessionId, command).then(
           function (result) {
             setStatus({
               phase: "running",
@@ -1735,11 +1663,11 @@ window.__ModuleLoader__.load({
       }
 
       function handleStopAll() {
-        if (busy !== null || active.sessionId === undefined) return;
+        if (busy !== null || sessionId === undefined) return;
         setMenuOpen(false);
         setBusy("__stop__");
         setStatus({ phase: "starting", text: "正在停止 Limob 终端…" });
-        stopAllTerminals(runtimeCtx, active.sessionId).then(
+        stopAllTerminals(runtimeCtx, sessionId).then(
           function (count) {
             setStatus({ phase: "idle", text: count > 0 ? ("已停止 Limob 终端（" + count + " 个）") : "当前没有正在运行的 Limob 终端" });
             setRunning({});
@@ -1774,100 +1702,76 @@ window.__ModuleLoader__.load({
 
       if (config.ui.visible === false) return null;
 
-      var menuWidth = Math.min(360, viewport.width - 16);
-      var menuLeft = clampNumber(
-        fabPos.x > viewport.width / 2 ? fabPos.x + 44 - menuWidth : fabPos.x,
-        8,
-        Math.max(8, viewport.width - menuWidth - 8)
-      );
-      var menuStyle = { width: menuWidth + "px", left: menuLeft + "px" };
-      if (fabPos.y > viewport.height / 2) {
-        // 按钮在屏幕下半部：菜单向上展开。
-        menuStyle.bottom = clampNumber(viewport.height - fabPos.y + 8, 8, viewport.height - 40) + "px";
-      } else {
-        menuStyle.top = clampNumber(fabPos.y + 52, 8, Math.max(8, viewport.height - 120)) + "px";
-      }
-      var menu = menuOpen ? h("div", { className: "dshLimobFabMenu", style: menuStyle, role: "menu" },
-        updateStatus !== null && updateStatus.available
-          ? h("button", { type: "button", className: "dshLimobFabItem", onClick: handleUpdateClick },
-              h("span", { className: "dshLimobFabItemMain" },
-                h("span", { className: "dshLimobFabItemTitle" }, "发现新版本 v" + updateStatus.latestVersion),
-                h("span", { className: "dshLimobFabItemCmd" }, "点击查看升级方式（当前 v" + PLUGIN_VERSION + "）")))
-          : null,
-        h("div", { className: "dshLimobFabMenuTitle" },
-          h("span", null, "运行 Limob 命令"),
-          h("span", null, active.projectPath !== undefined ? String(active.projectPath) : (active.sessionId !== undefined ? "当前会话" : "未进入会话"))),
-        active.sessionId === undefined
-          ? h("div", { className: "dshLimobFabMenuTitle" }, "先进入一个会话才能运行命令（全局命令也需要会话）")
-          : null,
-        commands.length === 0
-          ? h("div", { className: "dshLimobFabMenuTitle" }, "当前项目没有可用命令：去「管理命令」里添加，或把命令作用域设为全局。")
-          : commands.map(function (command) {
-              return h("button", {
-                key: command.id,
-                type: "button",
-                className: "dshLimobFabItem",
-                disabled: busy !== null || active.sessionId === undefined,
-                onClick: function () { handleRun(command); }
-              },
-                running[command.id] ? h("span", { className: "dshLimobFabRunDot", title: "运行中" }) : null,
-                h("span", { className: "dshLimobFabItemMain" },
-                  h("span", { className: "dshLimobFabItemTitle" }, command.title),
-                  h("span", { className: "dshLimobFabItemCmd" }, command.command)),
-                h("span", { className: "dshLimobFabTag" }, command.scope === "project" ? "项目" : "全局"));
-            }),
-        h("div", { className: "dshLimobFabSep" }),
-        h("button", {
-          type: "button",
-          className: "dshLimobFabItem",
-          disabled: busy !== null || active.sessionId === undefined,
-          onClick: handleStopAll
-        },
-          h("span", { className: "dshLimobFabItemMain" },
-            h("span", { className: "dshLimobFabItemTitle" }, "停止本会话 Limob 终端"),
-            h("span", { className: "dshLimobFabItemCmd" }, "关闭由本插件创建的终端进程"))),
-        h("button", {
-          type: "button",
-          className: "dshLimobFabItem",
-          onClick: function () { setMenuOpen(false); setConfigOpen(true); }
-        },
-          h("span", { className: "dshLimobFabItemMain" },
-            h("span", { className: "dshLimobFabItemTitle" }, "管理命令…"),
-            h("span", { className: "dshLimobFabItemCmd" }, "新增/编辑/删除/排序，设置全局或项目作用域"))),
-        h("button", {
-          type: "button",
-          className: "dshLimobFabItem",
-          disabled: updateStatus !== null && updateStatus.phase === "checking",
-          onClick: handleCheckUpdate
-        },
-          h("span", { className: "dshLimobFabItemMain" },
-            h("span", { className: "dshLimobFabItemTitle" }, updateStatus !== null && updateStatus.phase === "checking" ? "正在检查更新…" : "检查更新"),
-            h("span", { className: "dshLimobFabItemCmd" },
-              updateStatus !== null && updateStatus.latestVersion
-                ? "GitHub 最新 release：v" + updateStatus.latestVersion
-                : "从 GitHub Releases 检查新版本（当前 v" + PLUGIN_VERSION + "）"))))
-        : null;
+      // 菜单用 fixed 定位（相对按钮的视口坐标），避免被输入框区域的 overflow 裁切。
+      var menuStyle = menuPos !== null
+        ? {
+            position: "fixed",
+            left: menuPos.left + "px",
+            bottom: menuPos.bottom + "px",
+            top: "auto",
+            right: "auto",
+            maxHeight: menuPos.maxHeight + "px"
+          }
+        : { left: "0" };
 
-      var toast = null;
-      if (status !== null) {
-        // toast 与菜单互不遮挡：菜单向上弹时 toast 放按钮下方；贴近底部时改放按钮左侧。
-        var toastStyle = {};
-        if (fabPos.y > viewport.height * 0.72) {
-          toastStyle.right = clampNumber(viewport.width - fabPos.x + 8, 8, Math.max(8, viewport.width - 80)) + "px";
-          toastStyle.top = clampNumber(fabPos.y, 8, Math.max(8, viewport.height - 60)) + "px";
-        } else if (fabPos.y > viewport.height / 2) {
-          toastStyle.left = clampNumber(fabPos.x, 8, Math.max(8, viewport.width - 300)) + "px";
-          toastStyle.top = clampNumber(fabPos.y + 54, 8, Math.max(8, viewport.height - 60)) + "px";
-        } else {
-          toastStyle.left = clampNumber(fabPos.x, 8, Math.max(8, viewport.width - 300)) + "px";
-          toastStyle.top = clampNumber(fabPos.y - 44, 8, Math.max(8, viewport.height - 60)) + "px";
-        }
-        toast = h("div", {
-          className: "dshLimobFabToast",
-          "data-phase": status.phase || "idle",
-          style: toastStyle
-        }, status.text);
-      }
+      var menu = menuOpen
+        ? h("div", { className: "dshLimobRunMenu", style: menuStyle, role: "menu" },
+            updateStatus !== null && updateStatus.available
+              ? h("button", { type: "button", className: "dshLimobRunItem", onClick: handleUpdateClick },
+                  h("span", { className: "dshLimobRunItemMain" },
+                    h("span", { className: "dshLimobRunItemTitle" }, "发现新版本 v" + updateStatus.latestVersion),
+                    h("span", { className: "dshLimobRunItemCmd" }, "点击查看升级方式（当前 v" + PLUGIN_VERSION + "）")))
+              : null,
+            h("div", { className: "dshLimobRunMenuTitle" },
+              h("span", null, "运行 Limob 命令"),
+              h("span", null, projectPath !== undefined ? String(projectPath) : "当前会话")),
+            commands.length === 0
+              ? h("div", { className: "dshLimobRunMenuTitle" }, "当前项目没有可用命令：去「管理命令」里添加，或把命令作用域设为全局。")
+              : commands.map(function (command) {
+                  return h("button", {
+                    key: command.id,
+                    type: "button",
+                    className: "dshLimobRunItem",
+                    disabled: busy !== null || sessionId === undefined,
+                    onClick: function () { handleRun(command); }
+                  },
+                    running[command.id] ? h("span", { className: "dshLimobRunRunningDot", title: "运行中" }) : null,
+                    h("span", { className: "dshLimobRunItemMain" },
+                      h("span", { className: "dshLimobRunItemTitle" }, command.title),
+                      h("span", { className: "dshLimobRunItemCmd" }, command.command)),
+                    h("span", { className: "dshLimobRunTag" }, command.scope === "project" ? "项目" : "全局"));
+                }),
+            h("div", { className: "dshLimobRunSep" }),
+            h("button", {
+              type: "button",
+              className: "dshLimobRunItem",
+              disabled: busy !== null || sessionId === undefined,
+              onClick: handleStopAll
+            },
+              h("span", { className: "dshLimobRunItemMain" },
+                h("span", { className: "dshLimobRunItemTitle" }, "停止本会话 Limob 终端"),
+                h("span", { className: "dshLimobRunItemCmd" }, "关闭由本插件创建的终端进程"))),
+            h("button", {
+              type: "button",
+              className: "dshLimobRunItem",
+              onClick: function () { setMenuOpen(false); setConfigOpen(true); }
+            },
+              h("span", { className: "dshLimobRunItemMain" },
+                h("span", { className: "dshLimobRunItemTitle" }, "管理命令…"),
+                h("span", { className: "dshLimobRunItemCmd" }, "新增/编辑/删除/排序，设置全局或项目作用域"))),
+            h("button", {
+              type: "button",
+              className: "dshLimobRunItem",
+              disabled: updateStatus !== null && updateStatus.phase === "checking",
+              onClick: handleCheckUpdate
+            },
+              h("span", { className: "dshLimobRunItemMain" },
+                h("span", { className: "dshLimobRunItemTitle" }, updateStatus !== null && updateStatus.phase === "checking" ? "正在检查更新…" : "检查更新"),
+                h("span", { className: "dshLimobRunItemCmd" },
+                  updateStatus !== null && updateStatus.latestVersion
+                    ? "GitHub 最新 release：v" + updateStatus.latestVersion
+                    : "从 GitHub Releases 检查新版本（当前 v" + PLUGIN_VERSION + "）"))))
+        : null;
 
       var configModal = configOpen
         ? h("div", {
@@ -1884,33 +1788,29 @@ window.__ModuleLoader__.load({
                   className: "dshLimobCfgBtn",
                   onClick: function () { setConfigOpen(false); }
                 }, "关闭")),
-              h(LimobConfigEditor, { currentProjectPath: active.projectPath })))
+              h(LimobConfigEditor, { currentProjectPath: projectPath })))
         : null;
 
-      return h("div", { ref: rootRef, className: "dshLimobFabRoot", style: { left: "0", top: "0", width: "0", height: "0" } },
-        h("div", {
-          className: "dshLimobFabBtn",
-          role: "button",
-          tabIndex: 0,
-          "data-dragging": dragover !== null ? "true" : "false",
-          title: "点击打开 Limob 命令菜单；按住拖动可移动，位置会自动记住",
+      return h("div", { ref: rootRef, className: "dshLimobRunDock" },
+        h("button", {
+          ref: buttonRef,
+          type: "button",
+          className: "dshLimobRunBtn",
+          "data-busy": busy !== null ? "true" : "false",
+          title: "在 DSH 自带终端里运行 Limob 命令（点击选择命令）",
           "aria-label": "运行 Limob 命令",
-          style: { position: "fixed", left: fabPos.x + "px", top: fabPos.y + "px" },
-          onPointerDown: onPointerDown,
-          onPointerMove: onPointerMove,
-          onPointerUp: onPointerUp,
-          onPointerCancel: onPointerUp,
-          onKeyDown: function (event) {
-            if (event.key === "Enter" || event.key === " ") {
-              event.preventDefault();
-              toggleMenu();
-            }
+          onClick: function () {
+            if (busy !== null) return;
+            toggleMenu();
           }
         },
           h("span", { "aria-hidden": "true" }, busy !== null ? "…" : "▶"),
-          updateStatus !== null && updateStatus.available ? h("span", { className: "dshLimobFabDot" }) : null),
+          h("span", null, "运行 Limob"),
+          updateStatus !== null && updateStatus.available ? h("span", { className: "dshLimobRunDot", title: "有新版本" }) : null),
+        status !== null
+          ? h("span", { className: "dshLimobRunStatus", "data-phase": status.phase || "idle", title: status.text }, status.text)
+          : null,
         menu,
-        toast,
         configModal);
     }
 
@@ -1931,8 +1831,8 @@ window.__ModuleLoader__.load({
 
     function apply(ctx) {
       runtimeCtx = ctx;
-      // 浮动按钮：整个应用范围内可见、可拖动。
-      registerSlot(ctx, "shell.overlay", "limob-runner-fab", LimobFab, 200);
+      // 输入框卡片正下方的小按钮（conversation.composer.dock）。
+      registerSlot(ctx, "conversation.composer.dock", "limob-runner-run", LimobComposerButton, 40);
       // 设置弹窗左侧新增「Limob 运行器」页（settings.section 的每个条目就是一页）。
       registerSlot(ctx, "settings.section", "limob-runner", LimobSettingsSection, 60, "Limob 运行器");
       // DSH 插件页的更新提示（沿用 0.2 的能力）。

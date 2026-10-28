@@ -176,6 +176,7 @@ const withProject = internals.config.normalize({
   commands: defaults.commands.concat([projectCommand]),
   ui: { floating: { x: 10, y: 20 }, visible: true }
 });
+assert.equal(withProject.ui.floating, undefined, "旧配置里的 ui.floating 应被忽略");
 assert.equal(internals.config.visibleCommands(withProject, "H:\\Other", true).length, 4);
 assert.equal(internals.config.visibleCommands(withProject, "H:\\Limob-windows", true).length, 5);
 assert.equal(internals.config.visibleCommands(withProject, "H:\\Limob-windows", false).length, 4);
@@ -210,15 +211,15 @@ const ctx = {
 moduleExports.apply(ctx);
 assert.deepEqual(
   registered.map((entry) => entry.options.name).sort(),
-  ["plugins.detail.badge", "plugins.detail.section", "settings.section", "shell.overlay"].sort(),
-  "应注册浮动按钮、设置页、插件页更新提示"
+  ["conversation.composer.dock", "plugins.detail.badge", "plugins.detail.section", "settings.section"].sort(),
+  "应注册输入框下方按钮、设置页、插件页更新提示"
 );
 assert.equal(registered.find((entry) => entry.options.name === "settings.section").options.label, "Limob 运行器");
 
 // ---- 8. 首次渲染（最小 props） ----
-const fab = registered.find((entry) => entry.options.name === "shell.overlay").component;
-const fabTree = fab({});
-assert.equal(fabTree.props.className, "dshLimobFabRoot", "浮动按钮根节点应渲染");
+const runButton = registered.find((entry) => entry.options.name === "conversation.composer.dock").component;
+const runTree = runButton({ sessionId: "session-test" });
+assert.equal(runTree.props.className, "dshLimobRunDock", "输入框下方按钮根节点应渲染");
 
 const settings = registered.find((entry) => entry.options.name === "settings.section").component;
 const settingsTree = settings({});
