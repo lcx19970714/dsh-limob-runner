@@ -197,7 +197,10 @@ export function createCommand(config, input, workspacePath) {
     id: makeId(),
     title: typeof input.title === "string" && input.title.trim() !== "" ? input.title : defaultTitle(commandText),
     command: commandText,
-    cwd: typeof input.cwd === "string" && input.cwd.trim() !== "" ? input.cwd : (projectRoot || workspace || ""),
+    // 全局命令默认不锁死 cwd：运行时使用当前项目路径；项目命令才默认项目目录。
+    cwd: typeof input.cwd === "string" && input.cwd.trim() !== ""
+      ? input.cwd
+      : (scope === "project" ? (projectRoot || workspace || "") : ""),
     scope: scope,
     projectRoot: projectRoot,
     terminalTitle: input.terminalTitle,

@@ -191,7 +191,7 @@ async function dispatch(runner, endpoint, payload) {
     if (command === undefined) throw new Error("找不到命令：" + payload.commandId);
     if (command.scope !== "global") throw new Error("只有全局命令可以在全局运行器中启动");
     if (command.enabled === false) throw new Error("命令已停用");
-    return { runner: await runner.start(command), runners: runner.list() };
+    return { runner: await runner.start(command, typeof payload.workspacePath === "string" ? payload.workspacePath : undefined), runners: runner.list() };
   }
   if (endpoint === "global/stop") {
     if (payload === null || payload === undefined || typeof payload !== "object" || typeof payload.commandId !== "string") {

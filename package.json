@@ -1,6 +1,6 @@
 {
   "name": "dsh-runner",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "private": false,
   "description": "DSH 客户端插件 dsh-runner：输入框下方「运行」小按钮（项目级命令）+ 左侧导航「运行」全局命令页；Host 进程独立运行、右侧日志终端跨会话可见，并提供 dsh_runner_config 工具。",
   "type": "module",

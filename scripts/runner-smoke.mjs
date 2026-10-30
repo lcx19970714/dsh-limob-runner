@@ -24,6 +24,21 @@ try {
   const log = await readFile(status.logPath, "utf8");
   assert.match(log, /hello-dsh-runner/);
 
+  // 全局命令 cwd 为空时，使用调用时的工作区路径
+  const cwdCheck = await runner.start({
+    id: "smoke-cwd",
+    title: "cwd 检查",
+    command: "Write-Output (Get-Location).Path",
+    cwd: "",
+    scope: "global",
+    enabled: true
+  }, "H:\\运行插件");
+  assert.equal(cwdCheck.status, "running");
+  await new Promise((resolve) => setTimeout(resolve, 2500));
+  const cwdStatus = runner.list().find((item) => item.commandId === "smoke-cwd");
+  const cwdLog = await readFile(cwdStatus.logPath, "utf8");
+  assert.match(cwdLog, /H:\\运行插件/i);
+
   const long = await runner.start({
     id: "smoke-long",
     title: "长命令",

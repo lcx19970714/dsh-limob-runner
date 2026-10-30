@@ -34,15 +34,15 @@ function escapePowerShell(value) {
   return String(value).replace(/'/g, "''");
 }
 
-function buildCommandText(command) {
+function buildCommandText(command, cwd) {
   const parts = [
     "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)",
     "$OutputEncoding = [Console]::OutputEncoding",
     "chcp 65001 | Out-Null",
     "$env:PATH = (Join-Path $env:USERPROFILE '.cargo\\bin') + ';' + $env:PATH"
   ];
-  if (typeof command.cwd === "string" && command.cwd.trim() !== "") {
-    parts.push("Set-Location -LiteralPath '" + escapePowerShell(command.cwd.trim()) + "'");
+  if (typeof cwd === "string" && cwd.trim() !== "") {
+    parts.push("Set-Location -LiteralPath '" + escapePowerShell(cwd.trim()) + "'");
   }
   parts.push(command.command);
   return parts.join("; ");
@@ -59,7 +59,7 @@ export class GlobalRunnerService {
     this.disposed = false;
   }
 
-  async start(command) {
+  async start(command, workspacePath) {
     if (command === null || command === undefined || typeof command !== "object") {
       throw new Error("start 需要命令对象");
     }
@@ -67,14 +67,19 @@ export class GlobalRunnerService {
     const previous = this.records.get(command.id);
     if (previous !== undefined && previous.status === "running") return this.snapshot(previous);
 
+    // 全局命令没有固定 cwd 时，用调用时的当前项目目录。
+    const effectiveCwd = typeof command.cwd === "string" && command.cwd.trim() !== ""
+      ? command.cwd.trim()
+      : (typeof workspacePath === "string" && workspacePath.trim() !== "" ? workspacePath.trim() : undefined);
+
     await mkdir(this.logDir, { recursive: true });
     const logPath = path.join(this.logDir, safeFilePart(command.id) + ".log");
     const log = createWriteStream(logPath, { flags: "a" });
     log.write("\r\n[dsh-runner] " + new Date().toLocaleString() + " 启动：" + command.title + "\r\n");
 
     const shell = resolvePowerShell();
-    const child = spawn(shell, ["-NoLogo", "-NoProfile", "-Command", buildCommandText(command)], {
-      cwd: typeof command.cwd === "string" && command.cwd.trim() !== "" ? command.cwd : undefined,
+    const child = spawn(shell, ["-NoLogo", "-NoProfile", "-Command", buildCommandText(command, effectiveCwd)], {
+      cwd: effectiveCwd,
       env: process.env,
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"]
@@ -83,6 +88,7 @@ export class GlobalRunnerService {
       commandId: command.id,
       title: command.title,
       command: command.command,
+      cwd: effectiveCwd,
       logPath: logPath,
       logStream: log,
       child: child,

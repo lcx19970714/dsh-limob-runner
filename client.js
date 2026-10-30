@@ -34,7 +34,7 @@ window.__ModuleLoader__.load({
     // 一、常量与内置命令
     // =====================================================================
     var PLUGIN_NAME = "dsh-runner";
-    var PLUGIN_VERSION = "0.8.0";
+    var PLUGIN_VERSION = "0.8.1";
 
     // 更新检查（GitHub Releases）
     var REPO_SLUG = "lcx19970714/dsh-runner";
@@ -2235,6 +2235,7 @@ window.__ModuleLoader__.load({
     // 全局命令不再依赖会话终端：Host 侧启动独立进程并写日志；
     // 每个会话右侧栏打开一个「跟随日志」的原生终端，切换项目仍能看到同一份输出。
     var globalTailOpening = {};
+    var lastActiveProjectPath = undefined;
 
     function loadGlobalTabs() {
       try {
@@ -2347,6 +2348,7 @@ window.__ModuleLoader__.load({
       var active = useActiveSession(props);
       react.useEffect(function () {
         if (active.sessionId === undefined) return undefined;
+        if (active.projectPath !== undefined && active.projectPath !== "") lastActiveProjectPath = active.projectPath;
         var cancelled = false;
         async function syncTails() {
           var value = await hostRpc("global/status", {});
@@ -2394,6 +2396,8 @@ window.__ModuleLoader__.load({
       });
 
       async function refresh() {
+        // AI 可能刚通过 dsh_runner_config 创建/修改了全局命令，刷新状态时顺带同步配置。
+        await syncConfigFromHost();
         var value = await hostRpc("global/status", {});
         if (value !== undefined) setRunners(Array.isArray(value.runners) ? value.runners : []);
       }
@@ -2417,7 +2421,10 @@ window.__ModuleLoader__.load({
         if (busy !== null) return;
         setBusy(command.id);
         setError("");
-        var value = await hostRpc("global/start", { commandId: command.id });
+        var value = await hostRpc("global/start", {
+          commandId: command.id,
+          workspacePath: active.projectPath !== undefined ? active.projectPath : lastActiveProjectPath
+        });
         if (value === undefined || value.runner === undefined) {
           setError("启动失败：Host 运行器不可用");
         } else {
@@ -2481,7 +2488,7 @@ window.__ModuleLoader__.load({
             onClick: refresh
           }, "刷新状态")),
         globalCommands.length === 0
-          ? h("div", { className: "dshLimobGlobalEmpty" }, "还没有全局命令。去 设置 → dsh-runner 新增一条，作用域选「所有项目」。")
+          ? h("div", { className: "dshLimobGlobalEmpty" }, "还没有全局命令。可以直接对 AI 说「给所有项目加一个全局命令：打开记事本」，或去 设置 → dsh-runner 新增一条并把作用域选「所有项目」。")
           : h("div", { className: "dshLimobGlobalList" },
               globalCommands.map(function (command) {
                 var runner = runnerOf(command.id);

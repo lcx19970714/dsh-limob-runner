@@ -43,6 +43,16 @@ try {
   assert.equal(created.command.cwd, "H:\\Limob-windows");
   assert.equal(created.command.utf8CodePage, false);
 
+  // 全局命令默认不锁死 cwd（运行时用当前项目路径）
+  const globalCreated = createCommand(created.config, {
+    title: "全局启动",
+    command: "pnpm dev",
+    scope: "global"
+  }, "H:\\Limob-windows");
+  assert.equal(globalCreated.command.scope, "global");
+  assert.equal(globalCreated.command.projectRoot, "");
+  assert.equal(globalCreated.command.cwd, "");
+
   // 中文命令自动 chcp
   const chinese = createCommand(created.config, {
     command: "pnpm 客户端-调试"
