@@ -13,9 +13,11 @@ import {
   createCommand,
   deleteCommand,
   loadConfig,
+  normalizePath,
   saveConfigFile,
   updateCommand
 } from "./host-config.js";
+import { ProjectRunnerService } from "./host-runner.js";
 
 export const name = "dsh-runner";
 // tools：注册 AI Tool；connection 在 apply 里按需注入（浏览器 RPC 需要）。
@@ -32,7 +34,7 @@ export const CONFIG_PATH = process.env.DSH_RUNNER_CONFIG
 
 const RPC_CHANNEL = "/api";
 const RPC_NAMESPACE = "dsh-runner";
-const RPC_ENDPOINTS = ["config/get", "config/save"];
+const RPC_ENDPOINTS = ["config/get", "config/save", "project/status", "project/start", "project/stop", "project/stopAll"];
 
 /** 读取配置；如果新路径还不存在而旧版文件存在，就自动迁移一次。 */
 async function ensureConfigFile() {
@@ -162,7 +164,7 @@ function fail(code, message) {
   return { ok: false, error: { code: code, message: message, details: {} } };
 }
 
-async function dispatch(endpoint, payload) {
+async function dispatch(runner, endpoint, payload) {
   if (endpoint === "config/get") {
     const loaded = await ensureConfigFile();
     return {
@@ -178,11 +180,49 @@ async function dispatch(endpoint, payload) {
     const saved = await saveConfigFile(CONFIG_PATH, payload.config);
     return { saved: true, filePath: CONFIG_PATH, config: saved };
   }
+  if (endpoint === "project/status") {
+    const projectPath = payload !== null && payload !== undefined && typeof payload === "object" && typeof payload.projectPath === "string"
+      ? payload.projectPath
+      : undefined;
+    return { runners: runner.list(projectPath) };
+  }
+  if (endpoint === "project/start") {
+    if (payload === null || payload === undefined || typeof payload !== "object"
+      || typeof payload.commandId !== "string" || typeof payload.projectPath !== "string" || payload.projectPath.trim() === "") {
+      throw new Error("project/start 需要 {commandId, projectPath}");
+    }
+    const loaded = await ensureConfigFile();
+    const command = loaded.config.commands.find((item) => item.id === payload.commandId);
+    if (command === undefined) throw new Error("找不到命令：" + payload.commandId);
+    if (command.enabled === false) throw new Error("命令已停用");
+    if (command.scope === "project") {
+      const root = normalizePath(command.projectRoot);
+      const current = normalizePath(payload.projectPath);
+      if (root === "" || !(current === root || current.indexOf(root + "\\") === 0)) {
+        throw new Error("当前项目不匹配这条项目级命令");
+      }
+    }
+    return { runner: await runner.start(command, payload.projectPath), runners: runner.list(payload.projectPath) };
+  }
+  if (endpoint === "project/stop") {
+    if (payload === null || payload === undefined || typeof payload !== "object"
+      || typeof payload.commandId !== "string" || typeof payload.projectPath !== "string") {
+      throw new Error("project/stop 需要 {commandId, projectPath}");
+    }
+    return { stopped: await runner.stop(payload.projectPath, payload.commandId), runners: runner.list(payload.projectPath) };
+  }
+  if (endpoint === "project/stopAll") {
+    if (payload === null || payload === undefined || typeof payload !== "object" || typeof payload.projectPath !== "string") {
+      throw new Error("project/stopAll 需要 {projectPath}");
+    }
+    const count = await runner.stopProject(payload.projectPath);
+    return { stopped: count, runners: runner.list(payload.projectPath) };
+  }
   throw new Error("未知 endpoint：" + endpoint);
 }
 
 /** 注册浏览器 RPC 路由（POST /api/dsh-runner/config/get 等）。 */
-function registerRpc(ctx) {
+function registerRpc(ctx, runner) {
   for (const endpoint of RPC_ENDPOINTS) {
     const routePath = RPC_CHANNEL + "/" + RPC_NAMESPACE + "/" + endpoint;
     const method = RPC_NAMESPACE + "/" + endpoint;
@@ -206,7 +246,7 @@ function registerRpc(ctx) {
           }
           let result;
           try {
-            result = ok(await dispatch(endpoint, message.payload));
+            result = ok(await dispatch(runner, endpoint, message.payload));
           } catch (error) {
             result = fail("internal", error instanceof Error ? error.message : String(error));
           }
@@ -226,8 +266,10 @@ function registerRpc(ctx) {
 }
 
 export function apply(ctx) {
+  const runner = new ProjectRunnerService();
+  ctx.effect(() => () => runner.disposeAll(), "dsh-runner: project runner cleanup");
   registerConfigTool(ctx);
   ctx.inject(["connection"], (connectionCtx) => {
-    registerRpc(connectionCtx);
+    registerRpc(connectionCtx, runner);
   });
 }

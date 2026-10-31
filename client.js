@@ -26,15 +26,21 @@ window.__ModuleLoader__.load({
     var exports = module.exports;
     Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
 
-    // 只用基线共享模块 react。
+    // 只用基线共享模块 react；react-dom 用于把菜单 portal 到 body，避免被右侧栏盖住。
     var react = require("react");
+    var reactDom = null;
+    try {
+      reactDom = require("react-dom");
+    } catch (_error) {
+      reactDom = null;
+    }
     var h = react.createElement;
 
     // =====================================================================
     // 一、常量与内置命令
     // =====================================================================
     var PLUGIN_NAME = "dsh-runner";
-    var PLUGIN_VERSION = "0.9.0";
+    var PLUGIN_VERSION = "0.10.0";
 
     // 更新检查（GitHub Releases）
     var REPO_SLUG = "lcx19970714/dsh-runner";
@@ -125,7 +131,7 @@ window.__ModuleLoader__.load({
       ".dshLimobRunDot{width:6px;height:6px;border-radius:50%;background:#f59e0b;margin-left:1px}",
       ".dshLimobRunStatus{display:inline-flex;align-items:center;min-width:0;font-size:11px;line-height:16px;opacity:.8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
       ".dshLimobRunStatus[data-phase=error]{color:#f87171}",
-      ".dshLimobRunMenu{position:fixed;z-index:60;box-sizing:border-box;min-width:260px;max-width:min(400px,92vw);max-height:min(60vh,520px);overflow:auto;padding:6px;border-radius:11px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));background:var(--dsw-alias-bg-layer-2,#26282c);box-shadow:0 12px 32px rgba(0,0,0,.38);font-family:inherit;font-size:12px;line-height:18px;color:inherit}",
+      ".dshLimobRunMenu{position:fixed;z-index:1000;box-sizing:border-box;min-width:260px;max-width:min(400px,92vw);max-height:min(60vh,520px);overflow:auto;padding:6px;border-radius:11px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));background:var(--dsw-alias-bg-layer-2,#26282c);box-shadow:0 12px 32px rgba(0,0,0,.38);font-family:inherit;font-size:12px;line-height:18px;color:inherit}",
       ".dshLimobRunMenuTitle{padding:5px 9px 3px;font-size:11px;opacity:.6;user-select:none;display:flex;justify-content:space-between;gap:8px}",
       ".dshLimobRunFoot{display:flex;align-items:center;justify-content:space-between;gap:8px;border-top:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.28));margin-top:4px;padding:4px 4px 1px 7px;font-size:10px;line-height:16px;opacity:.75}",
       ".dshLimobRunFootBtn{display:inline-flex;align-items:center;gap:4px;min-width:0;padding:2px 4px;border:0;border-radius:5px;background:transparent;color:inherit;font:inherit;font-size:10px;line-height:16px;cursor:pointer;white-space:nowrap;opacity:.8}",
@@ -1855,6 +1861,147 @@ window.__ModuleLoader__.load({
       return undefined;
     }
 
+    // =====================================================================
+    // 十二、项目级日志终端（Host 进程与右侧日志终端）
+    // =====================================================================
+    // 设计：Host 按「项目路径 + 命令」启动独立进程；每个会话右侧栏打开一个
+    // 原生 terminal，执行 Get-Content -Wait 跟随项目日志。切会话时由
+    // ProjectTailKeeper 自动补开，所以右侧终端是项目级的，而不是会话级的。
+    var PROJECT_TABS_KEY = "dsh.runner.projectTabs.v1";
+    var projectTailOpening = {};
+
+    function loadProjectTabs() {
+      try {
+        if (typeof localStorage === "undefined") return { sessions: {} };
+        var raw = localStorage.getItem(PROJECT_TABS_KEY);
+        if (raw === null) return { sessions: {} };
+        var parsed = JSON.parse(raw);
+        if (parsed !== null && typeof parsed === "object" && parsed.sessions !== null && typeof parsed.sessions === "object") return parsed;
+      } catch (_error) {
+        /* ignore */
+      }
+      return { sessions: {} };
+    }
+
+    function saveProjectTabs(registry) {
+      try {
+        if (typeof localStorage !== "undefined") localStorage.setItem(PROJECT_TABS_KEY, JSON.stringify(registry));
+      } catch (_error) {
+        /* ignore */
+      }
+    }
+
+    function projectTabKey(projectPath, commandId) {
+      return String(projectPath).toLowerCase() + "::" + String(commandId);
+    }
+
+    function sameProjectPath(left, right) {
+      var a = String(left === undefined || left === null ? "" : left).trim().replace(/\//g, "\\").replace(/\\+$/g, "").toLowerCase();
+      var b = String(right === undefined || right === null ? "" : right).trim().replace(/\//g, "\\").replace(/\\+$/g, "").toLowerCase();
+      return a !== "" && a === b;
+    }
+
+    function buildProjectTailCommand(runner) {
+      var logPath = String(runner.logPath || "").replace(/'/g, "''");
+      return "chcp 65001 | Out-Null; Get-Content -LiteralPath '" + logPath + "' -Encoding UTF8 -Tail 600 -Wait";
+    }
+
+    /** 在当前会话打开/聚焦某个项目命令的日志终端。 */
+    async function ensureProjectTail(ctx, sessionId, runner, openIt) {
+      if (ctx === null || sessionId === undefined || runner === null || runner === undefined) return;
+      if (typeof runner.projectPath !== "string" || typeof runner.logPath !== "string" || runner.logPath === "") return;
+      var key = projectTabKey(runner.projectPath, runner.commandId);
+      if (projectTailOpening[key] === true) return;
+      projectTailOpening[key] = true;
+      try {
+        var remote = getTerminalRemote(ctx);
+        if (remote === undefined || remote === null) return;
+        var registry = loadProjectTabs();
+        if (registry.sessions[sessionId] === undefined || registry.sessions[sessionId] === null) registry.sessions[sessionId] = {};
+        var entry = registry.sessions[sessionId][key];
+        if (entry !== undefined && entry !== null && typeof entry.terminalId === "string") {
+          var list = await listTerminals(remote, sessionId);
+          var live = list.find(function (info) {
+            return info !== null && info !== undefined && info.id === entry.terminalId;
+          });
+          if (live !== undefined) {
+            if (openIt) await openOrFocusTab(ctx, sessionId, entry.terminalId);
+            return;
+          }
+        }
+        var shellPath = await pickShellPath(remote, sessionId);
+        var baseId = ("dsh-runner-proj-" + String(runner.commandId || "")).replace(/[^\w-]/g, "-").slice(0, 100);
+        var created = await createTerminal(remote, sessionId, baseId, shellPath);
+        var title = typeof runner.terminalTitle === "string" && runner.terminalTitle !== ""
+          ? runner.terminalTitle
+          : ("项目 · " + runner.title);
+        await safeRename(remote, sessionId, created.id, title);
+        await sendCommands(remote, sessionId, created.id, [buildProjectTailCommand(runner)]);
+        registry.sessions[sessionId][key] = {
+          terminalId: created.id,
+          title: title,
+          logPath: runner.logPath,
+          projectPath: runner.projectPath,
+          commandId: runner.commandId,
+          savedAt: Date.now()
+        };
+        saveProjectTabs(registry);
+        if (openIt) await openOrFocusTab(ctx, sessionId, created.id);
+      } catch (_error) {
+        /* 终端失败不影响 Host 进程 */
+      } finally {
+        delete projectTailOpening[key];
+      }
+    }
+
+    /** 停止项目时关闭该项目在所有会话里的日志终端。 */
+    async function closeProjectTails(ctx, projectPath) {
+      var registry = loadProjectTabs();
+      var sessionIds = Object.keys(registry.sessions || {});
+      for (var i = 0; i < sessionIds.length; i += 1) {
+        var sessionId = sessionIds[i];
+        var entries = registry.sessions[sessionId] || {};
+        var keys = Object.keys(entries);
+        for (var j = 0; j < keys.length; j += 1) {
+          var entry = entries[keys[j]];
+          if (entry === undefined || entry === null || !sameProjectPath(entry.projectPath, projectPath)) continue;
+          await closeTerminal(ctx, sessionId, entry.terminalId);
+          delete entries[keys[j]];
+        }
+        if (Object.keys(entries).length === 0) delete registry.sessions[sessionId];
+      }
+      saveProjectTabs(registry);
+    }
+
+    /** 切会话/项目时补开当前项目正在运行的日志终端。 */
+    function ProjectTailKeeper(props) {
+      var active = useActiveSession(props);
+      react.useEffect(function () {
+        if (active.sessionId === undefined || active.projectPath === undefined || active.projectPath === "") return undefined;
+        var cancelled = false;
+        async function syncTails() {
+          var value = await hostRpc("project/status", { projectPath: active.projectPath });
+          if (cancelled || value === undefined) return;
+          var runners = Array.isArray(value.runners) ? value.runners : [];
+          for (var i = 0; i < runners.length; i += 1) {
+            if (cancelled) return;
+            if (runners[i].status !== "running") continue;
+            await ensureProjectTail(runtimeCtx, active.sessionId, runners[i], true);
+          }
+        }
+        function onChanged() {
+          syncTails();
+        }
+        var timer = setTimeout(syncTails, 500);
+        window.addEventListener("dsh-runner:project-changed", onChanged);
+        return function () {
+          cancelled = true;
+          clearTimeout(timer);
+          window.removeEventListener("dsh-runner:project-changed", onChanged);
+        };
+      }, [active.sessionId, active.projectPath]);
+      return null;
+    }
     function LimobComposerButton(props) {
       var config = useConfig();
       var sessionId = props !== undefined && props.sessionId !== undefined
@@ -1908,7 +2055,10 @@ window.__ModuleLoader__.load({
         if (!menuOpen) return undefined;
         function onPointerDown(event) {
           var root = rootRef.current;
-          if (root !== null && !root.contains(event.target)) setMenuOpen(false);
+          var target = event.target;
+          var inMenu = target !== null && target !== undefined && typeof target.closest === "function"
+            && target.closest(".dshLimobRunMenu") !== null;
+          if (!inMenu && root !== null && !root.contains(target)) setMenuOpen(false);
         }
         function onKeyDown(event) {
           if (event.key === "Escape") setMenuOpen(false);
@@ -1922,34 +2072,25 @@ window.__ModuleLoader__.load({
       }, [menuOpen]);
 
       async function refreshRunning() {
-        if (sessionId === undefined) {
+        if (sessionId === undefined || projectPath === undefined || projectPath === "") {
           setRunning({});
           setTerminalCount(0);
           return;
         }
-        var remote = getTerminalRemote(runtimeCtx);
-        if (remote === undefined || remote === null) return;
-        try {
-          var list = await listTerminals(remote, sessionId);
-          var registry = loadRegistry();
-          var saved = registry.sessions[sessionId] || {};
-          var next = {};
-          var liveCount = 0;
-          Object.keys(saved).forEach(function (commandId) {
-            var entry = saved[commandId];
-            if (entry === undefined || entry === null) return;
-            var live = list.find(function (info) {
-              return info !== null && info !== undefined && info.id === entry.terminalId;
-            });
-            if (live === undefined) return;
-            liveCount += 1;
-            if (live.state === "running") next[commandId] = true;
-          });
-          setRunning(next);
-          setTerminalCount(liveCount);
-        } catch (_error) {
-          /* ignore */
+        var value = await hostRpc("project/status", { projectPath: projectPath });
+        if (value === undefined) return;
+        var list = Array.isArray(value.runners) ? value.runners : [];
+        var next = {};
+        var runningCount = 0;
+        for (var i = 0; i < list.length; i += 1) {
+          var runner = list[i];
+          if (runner !== null && runner !== undefined && runner.status === "running") {
+            next[runner.commandId] = true;
+            runningCount += 1;
+          }
         }
+        setRunning(next);
+        setTerminalCount(runningCount);
       }
 
       function toggleMenu() {
@@ -1985,19 +2126,22 @@ window.__ModuleLoader__.load({
 
       function handleRun(command) {
         if (busy !== null) return;
-        if (sessionId === undefined) {
-          setStatus({ phase: "error", text: "请先进入一个会话，再运行命令" });
+        if (sessionId === undefined || projectPath === undefined || projectPath === "") {
+          setStatus({ phase: "error", text: "请先进入一个项目会话，再运行命令" });
           return;
         }
         setMenuOpen(false);
         setBusy(command.id);
         setStatus({ phase: "starting", text: "正在启动：" + command.title });
-        runCommand(runtimeCtx, sessionId, command).then(
-          function (result) {
-            setStatus({
-              phase: "running",
-              text: result.status === "reused" ? ("已在运行 · 已切换到 " + result.title) : ("运行中 · " + result.title)
-            });
+        hostRpc("project/start", { commandId: command.id, projectPath: projectPath }).then(
+          function (value) {
+            if (value === undefined || value.runner === undefined) {
+              setStatus({ phase: "error", text: "启动失败：Host 项目运行器不可用" });
+              return;
+            }
+            setStatus({ phase: "running", text: "运行中 · " + value.runner.title + "（项目日志终端）" });
+            if (sessionId !== undefined) ensureProjectTail(runtimeCtx, sessionId, value.runner, true);
+            window.dispatchEvent(new Event("dsh-runner:project-changed"));
             refreshRunning();
           },
           function (error) {
@@ -2009,21 +2153,24 @@ window.__ModuleLoader__.load({
       }
 
       function handleStopAll() {
-        if (busy !== null || sessionId === undefined || terminalCount === 0) return;
+        if (busy !== null || projectPath === undefined || projectPath === "" || terminalCount === 0) return;
         setMenuOpen(false);
         setBusy("__stop__");
-        setStatus({ phase: "starting", text: "正在关闭本会话终端…" });
-        stopAllTerminals(runtimeCtx, sessionId).then(
-          function (count) {
+        setStatus({ phase: "starting", text: "正在停止本项目的运行进程…" });
+        hostRpc("project/stopAll", { projectPath: projectPath }).then(
+          function (value) {
+            var count = value !== undefined && typeof value.stopped === "number" ? value.stopped : 0;
             setStatus({
               phase: "idle",
-              text: count > 0 ? ("已关闭 " + count + " 个终端（运行中的命令已结束）") : "当前没有可关闭的终端"
+              text: count > 0 ? ("已停止 " + count + " 个本项目进程，并关闭日志终端") : "当前项目没有运行中的命令"
             });
+            closeProjectTails(runtimeCtx, projectPath);
             setRunning({});
             setTerminalCount(0);
+            window.dispatchEvent(new Event("dsh-runner:project-changed"));
           },
           function (error) {
-            setStatus({ phase: "error", text: "关闭终端失败：" + messageOf(error) });
+            setStatus({ phase: "error", text: "停止失败：" + messageOf(error) });
             refreshRunning();
           }
         ).then(function () {
@@ -2081,7 +2228,7 @@ window.__ModuleLoader__.load({
         }
       }
 
-      var menu = menuOpen
+      var menuElement = menuOpen
         ? h("div", { className: "dshLimobRunMenu", style: menuStyle, role: "menu" },
             h("div", { className: "dshLimobRunMenuTitle" },
               h("span", null, "运行命令"),
@@ -2107,18 +2254,18 @@ window.__ModuleLoader__.load({
               type: "button",
               className: "dshLimobRunItem",
               "data-danger": "true",
-              disabled: busy !== null || sessionId === undefined || terminalCount === 0,
-              title: terminalCount > 0 ? "关闭由「运行」打开的终端" : "当前没有可关闭的终端",
+              disabled: busy !== null || projectPath === undefined || projectPath === "" || terminalCount === 0,
+              title: terminalCount > 0 ? "停止当前项目正在运行的命令" : "当前项目没有运行中的命令",
               onClick: handleStopAll
             },
               h("span", { className: "dshLimobRunItemMain" },
-                h("span", { className: "dshLimobRunItemTitle" }, "关闭本会话的运行终端"),
+                h("span", { className: "dshLimobRunItemTitle" }, "停止本项目的运行进程"),
                 h("span", { className: "dshLimobRunItemCmd" },
-                  sessionId === undefined
-                    ? "请先进入会话"
+                  projectPath === undefined || projectPath === ""
+                    ? "请先进入项目会话"
                     : terminalCount > 0
-                      ? "关闭由「运行」打开的 " + terminalCount + " 个终端；正在运行的命令会一并结束"
-                      : "当前没有由「运行」打开的终端"))),
+                      ? "结束当前项目 " + terminalCount + " 个运行进程，并关闭日志终端"
+                      : "当前项目没有运行中的命令"))),
             h("button", {
               type: "button",
               className: "dshLimobRunItem",
@@ -2157,6 +2304,13 @@ window.__ModuleLoader__.load({
                   })),
                 h("span", null, "GitHub"))))
         : null;
+
+      // 菜单 portal 到 body：避免按钮所在容器/右侧栏的 stacking context 把菜单盖住。
+      var menu = menuElement;
+      if (menuElement !== null && reactDom !== null && typeof reactDom.createPortal === "function"
+        && typeof document !== "undefined" && document.body !== null) {
+        menu = reactDom.createPortal(menuElement, document.body);
+      }
 
       var configModal = configOpen
         ? h("div", {
@@ -2226,6 +2380,8 @@ window.__ModuleLoader__.load({
       syncConfigFromHost();
       // 输入框卡片正下方的小按钮（conversation.composer.dock）。
       registerSlot(ctx, "conversation.composer.dock", "dsh-runner-run", LimobComposerButton, 40);
+      // 切会话时自动补开项目日志终端。
+      registerSlot(ctx, "shell.overlay", "dsh-runner-project-keeper", ProjectTailKeeper, 210);
       // 设置弹窗左侧新增「dsh-runner」页（settings.section 的每个条目就是一页）。
       registerSlot(ctx, "settings.section", "dsh-runner", LimobSettingsSection, 60, "dsh-runner");
       // DSH 插件页的更新提示（沿用 0.2 的能力）。
