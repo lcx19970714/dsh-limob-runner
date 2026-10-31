@@ -27,6 +27,7 @@ const READY_POLL_MS = 150;
 const STOP_GRACEFUL_WAIT_MS = 2000;
 const STOP_TIMEOUT_MS = 4000;
 const ADOPTED_REFRESH_MS = 1500;
+const PORT_FALLBACK_GRACE_MS = 3000;
 const MARKER_PREFIX = "dsh-runner-";
 const MAX_PORT = 65535;
 const LOG_DEFAULT_MAX_BYTES = 65536;
@@ -159,10 +160,10 @@ function appendLogLine(logPath, line) {
   });
 }
 
-/** TCP 探测：readyPort 是否已经可以连接。 */
-function canConnectTcp(port, timeoutMs) {
+/** TCP 探测：只用于「声明端口可连接」确认；监听归属由进程树校验负责。 */
+function connectOnce(host, port, timeoutMs) {
   return new Promise((resolve) => {
-    const socket = net.connect({ host: "127.0.0.1", port: port, timeout: timeoutMs });
+    const socket = net.connect({ host: host, port: port, timeout: timeoutMs });
     let settled = false;
     const finish = (value) => {
       if (settled) return;
@@ -175,6 +176,165 @@ function canConnectTcp(port, timeoutMs) {
     socket.once("timeout", () => finish(false));
     socket.once("error", () => finish(false));
   });
+}
+
+/** 同时尝试 IPv4/IPv6 回环：声明端口可能只绑在其中一个地址族上。 */
+async function canConnectAny(port) {
+  if (await connectOnce("127.0.0.1", port, 300)) return true;
+  return connectOnce("::1", port, 300);
+}
+
+/** 轻量进程树：pid -> {parentPid, name}；启动轮询/所有权校验用（不取命令行/窗口）。 */
+function queryProcessTree() {
+  if (process.platform !== "win32") {
+    const map = new Map();
+    const result = spawnSync("ps", ["-eo", "pid=,ppid=,comm="], { encoding: "utf8", windowsHide: true, timeout: 15000 });
+    if (result.error !== undefined && result.error !== null) throw result.error;
+    for (const line of String(result.stdout === undefined || result.stdout === null ? "" : result.stdout).split(/\r?\n/)) {
+      const match = /^\s*(\d+)\s+(\d+)\s+(\S+)/.exec(line);
+      if (match === null) continue;
+      map.set(Number(match[1]), { parentPid: Number(match[2]), name: match[3] });
+    }
+    return map;
+  }
+  const script = [
+    "$procs = Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name",
+    "if ($null -eq $procs) { throw 'Get-CimInstance Win32_Process 返回空' }",
+    "$rows = foreach ($p in $procs) { [pscustomobject]@{ pid = [int]$p.ProcessId; ppid = [int]$p.ParentProcessId; name = [string]$p.Name } }",
+    "ConvertTo-Json -InputObject @($rows) -Depth 3 -Compress"
+  ].join("\n");
+  const result = spawnSync(resolvePowerShell(), ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], {
+    encoding: "utf8",
+    windowsHide: true,
+    timeout: 20000,
+    maxBuffer: 4 * 1024 * 1024
+  });
+  if (result.error !== undefined && result.error !== null) throw result.error;
+  if (typeof result.stdout !== "string") throw new Error("无法读取 Windows 进程树");
+  const text = result.stdout.trim();
+  if (text === "") throw new Error("Windows 进程树为空");
+  let rows;
+  try {
+    rows = JSON.parse(text);
+  } catch (error) {
+    throw new Error("解析 Windows 进程树失败：" + messageOf(error));
+  }
+  const map = new Map();
+  for (const row of Array.isArray(rows) ? rows : [rows]) {
+    if (row === null || typeof row !== "object") continue;
+    const pid = Number(row.pid);
+    if (!Number.isFinite(pid)) continue;
+    map.set(pid, {
+      parentPid: Number.isFinite(Number(row.ppid)) ? Number(row.ppid) : 0,
+      name: typeof row.name === "string" ? row.name : ""
+    });
+  }
+  return map;
+}
+
+/**
+ * 全地址族 TCP 监听表（IPv4 + IPv6）：
+ *   byPort: port -> Set<pid>
+ *   byPid:  pid  -> Set<port>
+ * 只用 netstat/ss 的结果，不依赖 connect 是否成功（服务可能只绑一个地址族）。
+ */
+function queryTcpListeners() {
+  const byPort = new Map();
+  const byPid = new Map();
+  const add = (port, pid) => {
+    if (!Number.isInteger(port) || !Number.isInteger(pid) || pid <= 0) return;
+    let pids = byPort.get(port);
+    if (pids === undefined) {
+      pids = new Set();
+      byPort.set(port, pids);
+    }
+    pids.add(pid);
+    let ports = byPid.get(pid);
+    if (ports === undefined) {
+      ports = new Set();
+      byPid.set(pid, ports);
+    }
+    ports.add(port);
+  };
+  if (process.platform === "win32") {
+    const result = spawnSync("netstat.exe", ["-ano"], { encoding: "utf8", windowsHide: true, timeout: 15000, maxBuffer: 4 * 1024 * 1024 });
+    if (result.error !== undefined && result.error !== null) throw result.error;
+    if (result.status !== 0) throw new Error("netstat 读取端口失败（exit " + String(result.status) + "）");
+    if (typeof result.stdout !== "string") throw new Error("netstat 没有输出");
+    for (const line of result.stdout.split(/\r?\n/)) {
+      const parts = line.trim().split(/\s+/);
+      if (parts.length !== 5) continue;
+      if (parts[0] !== "TCP" || parts[3] !== "LISTENING") continue;
+      const separator = parts[1].lastIndexOf(":");
+      if (separator <= 0) continue;
+      add(Number(parts[1].slice(separator + 1)), Number(parts[4]));
+    }
+    return { byPort: byPort, byPid: byPid };
+  }
+  const result = spawnSync("ss", ["-ltnpH"], { encoding: "utf8", windowsHide: true, timeout: 15000 });
+  if (result.error !== undefined && result.error !== null) throw result.error;
+  for (const line of String(result.stdout === undefined || result.stdout === null ? "" : result.stdout).split(/\r?\n/)) {
+    const parts = line.trim().split(/\s+/);
+    if (parts.length < 4) continue;
+    const separator = parts[3].lastIndexOf(":");
+    if (separator <= 0) continue;
+    const pidMatch = /pid=(\d+)/.exec(line);
+    if (pidMatch !== null) add(Number(parts[3].slice(separator + 1)), Number(pidMatch[1]));
+  }
+  return { byPort: byPort, byPid: byPid };
+}
+
+/** 从 rootPid 向下收集整棵进程树（含 root）。 */
+function collectTreePids(rootPid, tree) {
+  const result = new Set();
+  if (!Number.isInteger(rootPid) || rootPid <= 0) return result;
+  const childrenByParent = new Map();
+  for (const [pid, info] of tree) {
+    const list = childrenByParent.get(info.parentPid);
+    if (list === undefined) childrenByParent.set(info.parentPid, [pid]);
+    else list.push(pid);
+  }
+  result.add(rootPid);
+  const queue = [rootPid];
+  while (queue.length > 0) {
+    const current = queue.shift();
+    const children = childrenByParent.get(current);
+    if (children === undefined) continue;
+    for (const child of children) {
+      if (result.has(child)) continue;
+      result.add(child);
+      queue.push(child);
+    }
+  }
+  return result;
+}
+
+/** 进程树实际监听的端口（用于「声明端口是否真的由我启动的进程监听」）。 */
+function treeListeningPorts(rootPid, tree, listeners) {
+  const pids = collectTreePids(rootPid, tree);
+  const ports = [];
+  for (const pid of pids) {
+    const set = listeners.byPid.get(pid);
+    if (set === undefined) continue;
+    for (const port of set) if (ports.indexOf(port) === -1) ports.push(port);
+  }
+  return { pids: pids, ports: ports };
+}
+
+/** 端口占用者是否疑似同一项目的旧实例（命令行里出现项目根/命令 cwd）。 */
+function occupantText(occupant) {
+  if (occupant === null || occupant === undefined) return "未知进程";
+  const name = typeof occupant.name === "string" && occupant.name !== "" ? occupant.name : "进程";
+  return typeof occupant.pid === "number" ? name + "（PID " + String(occupant.pid) + "）" : name;
+}
+
+function markOccupantRelated(occupant, projectPath, cwd) {
+  const line = normalizeProjectPath(occupant.commandLine);
+  const root = normalizeProjectPath(projectPath);
+  const workdir = normalizeProjectPath(cwd);
+  occupant.related = (root !== "" && line.indexOf(root) !== -1)
+    || (workdir !== "" && line.indexOf(workdir) !== -1);
+  return occupant;
 }
 
 /**
@@ -339,52 +499,6 @@ function describeOccupant(pid, snapshot) {
   }
   return occupant;
 }
-
-
-/**
- * 查询一组端口的监听进程：port -> pid。
- * Windows 用 netstat（快、无需 PowerShell 模块）；其它平台用 ss 兜底。
- */
-function queryListeners(ports) {
-  const wanted = new Set(ports.filter((port) => Number.isInteger(port)));
-  const map = new Map();
-  if (wanted.size === 0) return map;
-  if (process.platform === "win32") {
-    const result = spawnSync("netstat.exe", ["-ano", "-p", "tcp"], { encoding: "utf8", windowsHide: true, timeout: 15000 });
-    if (result.error !== undefined && result.error !== null) throw result.error;
-    if (result.status !== 0) throw new Error("netstat 读取端口失败（exit " + String(result.status) + "）");
-    if (typeof result.stdout !== "string") throw new Error("netstat 没有输出");
-    for (const line of result.stdout.split(/\r?\n/)) {
-      const parts = line.trim().split(/\s+/);
-      if (parts.length !== 5) continue;
-      if (parts[0] !== "TCP" || parts[3] !== "LISTENING") continue;
-      const local = parts[1];
-      const separator = local.lastIndexOf(":");
-      if (separator <= 0) continue;
-      const port = Number(local.slice(separator + 1));
-      const pid = Number(parts[4]);
-      if (!Number.isInteger(port) || !Number.isInteger(pid)) continue;
-      if (!wanted.has(port) || map.has(port)) continue;
-      map.set(port, pid);
-    }
-    return map;
-  }
-  const result = spawnSync("ss", ["-ltnpH"], { encoding: "utf8", windowsHide: true, timeout: 15000 });
-  if (result.error !== undefined && result.error !== null) throw result.error;
-  for (const line of String(result.stdout === undefined || result.stdout === null ? "" : result.stdout).split(/\r?\n/)) {
-    const parts = line.trim().split(/\s+/);
-    if (parts.length < 4) continue;
-    const local = parts[3];
-    const separator = local.lastIndexOf(":");
-    if (separator <= 0) continue;
-    const port = Number(local.slice(separator + 1));
-    if (!wanted.has(port) || map.has(port)) continue;
-    const pidMatch = /pid=(\d+)/.exec(line);
-    if (pidMatch !== null) map.set(port, Number(pidMatch[1]));
-  }
-  return map;
-}
-
 function isStateEntry(entry) {
   return entry !== null && typeof entry === "object"
     && typeof entry.pid === "number" && Number.isFinite(entry.pid) && entry.pid > 0
@@ -469,7 +583,7 @@ export class ProjectRunnerService {
       const key = typeof entry.key === "string" && entry.key !== "" ? entry.key : this.key(entry.projectPath, entry.commandId);
       if (this.records.has(key)) continue;
       const readyPort = Number.isInteger(entry.readyPort) ? entry.readyPort : null;
-      const ready = readyPort === null ? null : await canConnectTcp(readyPort, 300);
+      const ready = readyPort === null ? null : await canConnectAny(readyPort);
       this.records.set(key, {
         key: key,
         projectPath: String(entry.projectPath),
@@ -486,6 +600,7 @@ export class ProjectRunnerService {
         startedAt: typeof entry.startedAt === "number" ? entry.startedAt : Date.now(),
         status: "running",
         ready: ready,
+        actualPorts: [],
         exitCode: undefined,
         stopRequested: false,
         adopted: true,
@@ -511,14 +626,33 @@ export class ProjectRunnerService {
 
   /** 接管进程的存活刷新：确认已退出的接管进程并落状态。 */
   async refresh() {
-    const adopted = [];
+    const active = [];
     for (const record of this.records.values()) {
-      if (record.adopted === true && record.status === "running") adopted.push(record);
+      if (isActive(record)) active.push(record);
     }
-    if (adopted.length === 0) return;
+    if (active.length === 0) return;
     const now = Date.now();
     if (now - this.lastRefreshAt < ADOPTED_REFRESH_MS) return;
     this.lastRefreshAt = now;
+
+    // 实际监听端口：一次 netstat + 一次进程树查询，供所有活跃记录复用。
+    let listeners;
+    let tree;
+    try {
+      listeners = queryTcpListeners();
+      tree = queryProcessTree();
+    } catch (error) {
+      this.reportError("无法刷新进程与端口状态", error);
+      return;
+    }
+    for (const record of active) {
+      const actual = treeListeningPorts(record.pid, tree, listeners).ports.sort((left, right) => left - right);
+      record.actualPorts = actual;
+    }
+
+    // 接管进程的存活校验（pid + 命令行标记）。
+    const adopted = active.filter((record) => record.adopted === true && record.status === "running");
+    if (adopted.length === 0) return;
     let table;
     try {
       table = queryProcessTable(adopted.map((record) => record.pid));
@@ -667,7 +801,8 @@ export class ProjectRunnerService {
       pid: child.pid,
       startedAt: Date.now(),
       status: "starting",
-      ready: readyPort === null ? null : false,
+      ready: ports.length === 0 ? null : false,
+      actualPorts: [],
       exitCode: undefined,
       stopRequested: false,
       adopted: false,
@@ -690,7 +825,9 @@ export class ProjectRunnerService {
 
     await this.persist();
 
-    if (readyPort === null) {
+    // 端口契约：声明了 ports，就必须由「本次启动的进程树」持有；声明了 readyPort 还要可连接。
+    // 未声明任何端口 = 没有契约，直接 running；实际端口由 refresh() 观测。
+    if (ports.length === 0) {
       if (record.status === "starting") {
         record.status = "running";
         await this.persist();
@@ -698,49 +835,158 @@ export class ProjectRunnerService {
       return this.snapshot(record);
     }
 
-    const readyResult = await this.waitReady(record);
-    if (readyResult === "ready") {
+    const contract = await this.waitForPortContract(record);
+    if (contract.status === "ready") {
       if (record.status === "starting") {
         record.status = "running";
         record.ready = true;
+        record.actualPorts = contract.actualPorts;
         await this.persist();
       }
       return this.snapshot(record);
     }
-    if (readyResult === "aborted") {
+    if (contract.status === "aborted") {
       throw new RunnerError(
         "spawn-failed",
         "命令在端口就绪前退出" + (record.exitCode === undefined ? "" : "（code=" + String(record.exitCode) + "）"),
-        { port: readyPort, exitCode: record.exitCode }
+        { ports: ports, exitCode: record.exitCode }
       );
     }
 
-    // ready 超时：Host 杀掉该进程后报 ready-timeout。
-    this.killProcess(record.pid, false);
-    if (!(await this.waitExit(record, STOP_GRACEFUL_WAIT_MS))) this.killProcess(record.pid, true);
-    await this.waitExit(record, STOP_TIMEOUT_MS);
-    if (record.finished !== true) {
-      await this.finish(record, "failed", record.exitCode, undefined, "端口 " + String(readyPort) + " 在 " + String(readyTimeoutMs) + "ms 内未就绪，已结束进程");
+    const actualText = contract.actualPorts.length === 0
+      ? "未监听任何端口"
+      : contract.actualPorts.map((port) => String(port)).join("、");
+    if (contract.status === "mismatch") {
+      const first = contract.conflicts.length > 0 ? contract.conflicts[0] : undefined;
+      const ownerText = first !== undefined && first.occupant !== undefined
+        ? "；占用者：" + occupantText(first.occupant)
+        : "";
+      const targetText = contract.conflicts.length === 0
+        ? ports.map((port) => String(port)).join("、")
+        : contract.conflicts.map((item) => String(item.port)).join("、");
+      await this.failSpawned(record, "声明端口 " + targetText + " 未由本进程监听（实际：" + actualText + "），已结束本次启动");
+      throw new RunnerError(
+        "port-mismatch",
+        "本命令未绑定声明端口 " + targetText + "（实际：" + actualText + "）" + ownerText + "，已终止本次启动",
+        { ports: contract.conflicts, actualPorts: contract.actualPorts }
+      );
     }
+
+    await this.failSpawned(record, "声明端口 " + ports.map((port) => String(port)).join("、") + " 在 " + String(record.readyTimeoutMs) + "ms 内未由本进程监听，已结束本次启动");
     throw new RunnerError(
       "ready-timeout",
-      "端口 " + String(readyPort) + " 在 " + String(readyTimeoutMs) + "ms 内未就绪",
-      { port: readyPort, timeoutMs: readyTimeoutMs }
+      "端口 " + ports.map((port) => String(port)).join("、") + " 在 " + String(record.readyTimeoutMs) + "ms 内未就绪",
+      { ports: ports, timeoutMs: record.readyTimeoutMs }
     );
   }
 
-  /** 等 readyPort 可连接；进程在就绪前退出时返回 aborted。 */
-  async waitReady(record) {
+  /**
+   * 端口契约校验：等「本进程树」真正持有全部声明端口。
+   * - readyPort 存在时，还要求该端口可连接（IPv4/IPv6 任一）；
+   * - 进程树开始监听后，若声明端口被外部进程占用、或声明端口迟迟未被本进程监听：
+   *   判定 port-mismatch（拒绝静默降级到其它端口）。
+   * 返回 { status: "ready"|"mismatch"|"timeout"|"aborted", actualPorts, conflicts? }。
+   */
+  async waitForPortContract(record) {
+    const declared = record.ports.slice();
     const deadline = Date.now() + record.readyTimeoutMs;
+    let firstListenAt;
     while (Date.now() < deadline) {
-      if (record.finished === true || record.status !== "starting") return "aborted";
-      if (await canConnectTcp(record.readyPort, 400)) {
-        if (record.finished === true || record.status !== "starting") return "aborted";
-        return "ready";
+      if (record.finished === true || record.status !== "starting") {
+        return { status: "aborted", actualPorts: record.actualPorts };
+      }
+      let listeners;
+      let tree;
+      try {
+        listeners = queryTcpListeners();
+        tree = queryProcessTree();
+      } catch (error) {
+        // 校验依赖系统进程/端口表；读不到就继续重试，超时后按 ready-timeout 失败，绝不当作成功。
+        await sleep(READY_POLL_MS);
+        continue;
+      }
+      const treePorts = treeListeningPorts(record.pid, tree, listeners);
+      const actual = treePorts.ports.slice().sort((left, right) => left - right);
+      record.actualPorts = actual;
+      if (actual.length > 0 && firstListenAt === undefined) firstListenAt = Date.now();
+      const ownedAll = declared.every((port) => actual.indexOf(port) !== -1);
+      if (ownedAll) {
+        const target = record.readyPort === null ? declared[0] : record.readyPort;
+        if (await canConnectAny(target)) {
+          if (record.finished === true || record.status !== "starting") {
+            return { status: "aborted", actualPorts: actual };
+          }
+          return { status: "ready", actualPorts: actual };
+        }
+      }
+      // 声明端口被「外部进程」占用，而本进程已经开始监听其它端口：立即判定降级。
+      const externallyBlocked = [];
+      for (const port of declared) {
+        if (actual.indexOf(port) !== -1) continue;
+        const owners = listeners.byPort.get(port);
+        if (owners === undefined) continue;
+        let ownedByTree = false;
+        for (const ownerPid of owners) {
+          if (treePorts.pids.has(ownerPid)) {
+            ownedByTree = true;
+            break;
+          }
+        }
+        if (!ownedByTree) externallyBlocked.push(port);
+      }
+      const graceExpired = firstListenAt !== undefined && Date.now() - firstListenAt >= PORT_FALLBACK_GRACE_MS;
+      if (actual.length > 0 && (externallyBlocked.length > 0 || (graceExpired && !ownedAll))) {
+        const conflicts = await this.describePortConflicts(declared, actual, listeners, record);
+        return { status: "mismatch", actualPorts: actual, conflicts: conflicts };
       }
       await sleep(READY_POLL_MS);
     }
-    return "timeout";
+    return { status: "timeout", actualPorts: record.actualPorts };
+  }
+
+  /** 为未持有的声明端口收集占用者详情（给 port-mismatch 用）。 */
+  async describePortConflicts(declared, actual, listeners, record) {
+    let snapshot = null;
+    try {
+      snapshot = queryProcessSnapshot();
+    } catch (error) {
+      this.reportError("无法读取端口占用者详情", error);
+    }
+    const conflicts = [];
+    for (const port of declared) {
+      if (actual.indexOf(port) !== -1) continue;
+      const entry = { port: port };
+      const owners = listeners.byPort.get(port);
+      if (owners !== undefined && snapshot !== null) {
+        const ownerPid = [...owners][0];
+        const occupant = describeOccupant(ownerPid, snapshot);
+        markOccupantRelated(occupant, record.projectPath, record.cwd);
+        const managed = this.findManagedRunner(ownerPid, snapshot);
+        occupant.managed = managed.managed;
+        if (managed.runnerCommandId !== undefined) {
+          occupant.runnerCommandId = managed.runnerCommandId;
+          const runnerRecord = [...this.records.values()].find((item) => item.commandId === managed.runnerCommandId);
+          if (runnerRecord !== undefined) occupant.runnerTitle = runnerRecord.title;
+        }
+        entry.occupant = occupant;
+      }
+      conflicts.push(entry);
+    }
+    return conflicts;
+  }
+
+  /** 启动失败时终止本次 spawn 的进程树，并记录原因。 */
+  async failSpawned(record, note) {
+    if (typeof record.pid === "number" && Number.isFinite(record.pid) && record.pid > 0) {
+      this.killProcess(record.pid, false);
+      if (!(await this.waitExit(record, STOP_GRACEFUL_WAIT_MS))) this.killProcess(record.pid, true);
+      await this.waitExit(record, STOP_TIMEOUT_MS);
+    }
+    if (record.finished !== true) {
+      await this.finish(record, "failed", record.exitCode, undefined, note);
+    } else {
+      await appendLogLine(record.logPath, "\r\n[dsh-runner] " + note + "\r\n");
+    }
   }
 
   effectiveCwd(command, projectPath) {
@@ -757,8 +1003,8 @@ export class ProjectRunnerService {
   async assertPortsFree(command) {
     const ports = Array.isArray(command.ports) ? command.ports.filter((port) => Number.isInteger(port)) : [];
     if (ports.length === 0) return;
-    const listeners = queryListeners(ports);
-    const occupiedPorts = ports.filter((port) => listeners.has(port));
+    const listeners = queryTcpListeners();
+    const occupiedPorts = ports.filter((port) => listeners.byPort.has(port));
     if (occupiedPorts.length === 0) return;
     let snapshot;
     try {
@@ -771,8 +1017,9 @@ export class ProjectRunnerService {
       );
     }
     const conflicts = occupiedPorts.map((port) => {
-      const pid = listeners.get(port);
+      const pid = [...listeners.byPort.get(port)][0];
       const occupant = describeOccupant(pid, snapshot);
+      markOccupantRelated(occupant, command.projectRoot, command.cwd);
       const managed = this.findManagedRunner(pid, snapshot);
       occupant.managed = managed.managed;
       if (managed.runnerCommandId !== undefined) {
@@ -783,9 +1030,7 @@ export class ProjectRunnerService {
       return { port: port, occupant: occupant };
     });
     const first = conflicts[0];
-    const owner = first.occupant.name === ""
-      ? "PID " + String(first.occupant.pid)
-      : first.occupant.name + "（PID " + String(first.occupant.pid) + "）";
+    const owner = occupantText(first.occupant);
     throw new RunnerError(
       "port-conflict",
       "端口 " + String(first.port) + " 已被 " + owner + " 占用"
@@ -876,9 +1121,9 @@ export class ProjectRunnerService {
       }
     }
     if (ports.length === 0) return [];
-    const listeners = queryListeners(ports);
+    const listeners = queryTcpListeners();
     let snapshot = new Map();
-    if (listeners.size > 0) {
+    if (ports.some((port) => listeners.byPort.has(port))) {
       try {
         snapshot = queryProcessSnapshot();
       } catch (error) {
@@ -889,8 +1134,8 @@ export class ProjectRunnerService {
     for (const command of relevant) {
       for (const port of command.ports) {
         if (!Number.isInteger(port)) continue;
-        const pid = listeners.get(port);
-        const listening = pid !== undefined;
+        const owners = listeners.byPort.get(port);
+        const listening = owners !== undefined;
         const entry = {
           port: port,
           listening: listening,
@@ -898,7 +1143,9 @@ export class ProjectRunnerService {
           title: command.title
         };
         if (listening) {
+          const pid = [...owners][0];
           const occupant = describeOccupant(pid, snapshot);
+          markOccupantRelated(occupant, command.projectRoot, command.cwd);
           const managed = this.findManagedRunner(pid, snapshot);
           occupant.managed = managed.managed;
           if (managed.runnerCommandId !== undefined) {
@@ -927,9 +1174,10 @@ export class ProjectRunnerService {
     if (expectedPid !== undefined && expectedPid !== null && (!Number.isInteger(expectedPid) || expectedPid <= 0)) {
       throw new RunnerError("bad-request", "pid 必须是正整数", { pid: expectedPid });
     }
-    const listeners = queryListeners([port]);
-    const pid = listeners.get(port);
-    if (pid === undefined) return { killed: false };
+    const listeners = queryTcpListeners();
+    const owners = listeners.byPort.get(port);
+    if (owners === undefined) return { killed: false };
+    const pid = [...owners][0];
     let snapshot;
     try {
       snapshot = queryProcessSnapshot();
@@ -961,7 +1209,7 @@ export class ProjectRunnerService {
     this.killProcess(pid, true);
     const deadline = Date.now() + 3000;
     while (Date.now() < deadline) {
-      if (!queryListeners([port]).has(port)) return { killed: true, pid: pid, occupant: occupant };
+      if (!queryTcpListeners().byPort.has(port)) return { killed: true, pid: pid, occupant: occupant };
       await sleep(150);
     }
     throw new RunnerError("kill-failed", "无法结束占用端口 " + String(port) + " 的进程 " + String(pid), { port: port, pid: pid, occupant: occupant });
@@ -1134,6 +1382,7 @@ export class ProjectRunnerService {
       readyPort: record.readyPort === undefined ? null : record.readyPort,
       status: record.status,
       ready: record.ready === undefined ? null : record.ready,
+      actualPorts: Array.isArray(record.actualPorts) ? record.actualPorts.slice() : [],
       exitCode: record.exitCode,
       pid: record.pid,
       startedAt: record.startedAt,

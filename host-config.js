@@ -316,6 +316,20 @@ function normalizeConfigDetailed(raw, strict) {
       commands.push(...remaining);
       changed = true;
     }
+
+    // 端口契约：同一作用域（同一 projectRoot / 全局）内端口不允许重复声明。
+    const portConflicts = findDuplicatePortCommands(commands);
+    if (portConflicts.length > 0) {
+      for (const conflict of portConflicts) {
+        fail("命令「" + conflict.command.title + "」的端口 " + String(conflict.port)
+          + " 与「" + conflict.owner.title + "」在同一作用域重复，已丢弃该命令");
+      }
+      const dropped = new Set(portConflicts.map((conflict) => conflict.command.id));
+      const remaining = commands.filter((command) => !dropped.has(command.id));
+      commands.length = 0;
+      commands.push(...remaining);
+      changed = true;
+    }
     if (!changed) break;
   }
 
@@ -338,6 +352,34 @@ function normalizeConfigDetailed(raw, strict) {
     },
     errors: errors
   };
+}
+
+/**
+ * 端口契约：同一作用域内端口只能声明一次。
+ * 作用域 = project 作用域的 projectRoot，或 global。
+ */
+function findDuplicatePortCommands(commands) {
+  const seen = new Map();
+  const conflicts = [];
+  for (const command of commands) {
+    const scopeKey = command.scope === "project" ? "project:" + normalizePath(command.projectRoot) : "global";
+    let duplicatedPort;
+    let owner;
+    for (const port of command.ports) {
+      const key = scopeKey + "|" + String(port);
+      const existing = seen.get(key);
+      if (existing !== undefined && duplicatedPort === undefined) {
+        duplicatedPort = port;
+        owner = existing;
+      }
+    }
+    if (duplicatedPort !== undefined) {
+      conflicts.push({ command: command, port: duplicatedPort, owner: owner });
+      continue;
+    }
+    for (const port of command.ports) seen.set(scopeKey + "|" + String(port), command);
+  }
+  return conflicts;
 }
 
 /** 整份配置归一化（加载语义：非法命令丢弃）。 */

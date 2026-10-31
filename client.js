@@ -42,7 +42,7 @@ window.__ModuleLoader__.load({
     // 一、常量
     // =====================================================================
     var PLUGIN_NAME = "dsh-runner";
-    var PLUGIN_VERSION = "0.13.0";
+    var PLUGIN_VERSION = "0.14.0";
 
     // 左侧导航面板 / main 面板的稳定 id。
     var PANEL_ID = "dsh-runner";
@@ -197,6 +197,7 @@ window.__ModuleLoader__.load({
       ".dshRunnerRowCmd{font-size:10px;line-height:14px;opacity:.55;font-family:ui-monospace,Consolas,'Courier New',monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
       ".dshRunnerRowMeta{display:flex;align-items:center;gap:5px;flex-wrap:wrap;font-size:10px;line-height:14px;opacity:.75;min-width:0}",
       ".dshRunnerPort{flex:none;padding:0 5px;border-radius:999px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));font-size:9px;line-height:14px;font-family:ui-monospace,Consolas,'Courier New',monospace}",
+      ".dshRunnerPortWarn{border-color:rgba(245,158,11,.65);color:#f59e0b;background:rgba(245,158,11,.1)}",
       ".dshRunnerRowActions{display:flex;align-items:center;gap:2px;flex:none}",
       ".dshRunnerMiniBtn{height:20px;padding:0 6px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));border-radius:5px;background:transparent;color:inherit;font:inherit;font-size:10px;line-height:18px;cursor:pointer;white-space:nowrap}",
       ".dshRunnerMiniBtn:hover:not([disabled]){background:rgba(103,158,254,.14)}",
@@ -705,10 +706,15 @@ window.__ModuleLoader__.load({
     function errorDetailText(error) {
       if (error === null || error === undefined) return "";
       var details = error.details;
-      if (error.code === "port-conflict" && details !== null && details !== undefined && Array.isArray(details.ports)) {
-        return details.ports.map(function (item) {
-          return "端口 " + String(item.port) + " · " + occupantSummary(item.occupant);
+      if ((error.code === "port-conflict" || error.code === "port-mismatch")
+        && details !== null && details !== undefined && Array.isArray(details.ports)) {
+        var text = details.ports.map(function (item) {
+          return "端口 " + String(item.port) + (item.occupant === undefined ? "" : " · " + occupantSummary(item.occupant));
         }).join("；");
+        if (Array.isArray(details.actualPorts) && details.actualPorts.length > 0) {
+          text += "；实际绑定：" + details.actualPorts.map(String).join("、");
+        }
+        return text;
       }
       if (error.code === "managed-port" && details !== null && details !== undefined && details.occupant !== undefined) {
         return "端口 " + String(details.port) + " 由托管命令占用：" + occupantSummary(details.occupant);
@@ -765,9 +771,10 @@ window.__ModuleLoader__.load({
       return parts.join("、");
     }
 
-    /** 是否是端口冲突错误（带完整占用者列表）。 */
-    function isPortConflictError(error) {
-      return error !== null && error !== undefined && error.code === "port-conflict"
+    /** 是否是端口阻塞错误（port-conflict / port-mismatch，均带占用者列表）。 */
+    function isPortBlockingError(error) {
+      return error !== null && error !== undefined
+        && (error.code === "port-conflict" || error.code === "port-mismatch")
         && error.details !== null && error.details !== undefined && Array.isArray(error.details.ports);
     }
 
@@ -1826,9 +1833,15 @@ window.__ModuleLoader__.load({
           if (action !== "stop") setSelectedId(commandId);
           await refreshDiagnose();
         } catch (actionError) {
-          if (isPortConflictError(actionError)) {
+          if (isPortBlockingError(actionError)) {
             setError(null);
-            setConflict({ commandId: commandId, action: action, ports: actionError.details.ports });
+            setConflict({
+              commandId: commandId,
+              action: action,
+              kind: actionError.code,
+              ports: actionError.details.ports,
+              actualPorts: Array.isArray(actionError.details.actualPorts) ? actionError.details.actualPorts : []
+            });
             refreshDiagnose();
           } else {
             setError(actionError);
@@ -1849,7 +1862,8 @@ window.__ModuleLoader__.load({
           var conflictFailure = null;
           for (var failedIndex = 0; failedIndex < failed.length; failedIndex += 1) {
             var failedItem = failed[failedIndex];
-            if (failedItem !== null && failedItem !== undefined && failedItem.code === "port-conflict"
+            if (failedItem !== null && failedItem !== undefined
+              && (failedItem.code === "port-conflict" || failedItem.code === "port-mismatch")
               && failedItem.details !== null && failedItem.details !== undefined && Array.isArray(failedItem.details.ports)) {
               conflictFailure = failedItem;
               break;
@@ -1857,7 +1871,13 @@ window.__ModuleLoader__.load({
           }
           if (conflictFailure !== null) {
             setError(null);
-            setConflict({ commandId: conflictFailure.commandId, action: "startAll", ports: conflictFailure.details.ports });
+            setConflict({
+              commandId: conflictFailure.commandId,
+              action: "startAll",
+              kind: conflictFailure.code,
+              ports: conflictFailure.details.ports,
+              actualPorts: Array.isArray(conflictFailure.details.actualPorts) ? conflictFailure.details.actualPorts : []
+            });
           } else if (failed.length > 0) {
             var first = failed[0] !== null && failed[0] !== undefined ? failed[0] : {};
             var label = typeof first.title === "string" && first.title !== "" ? first.title : String(first.commandId);
@@ -1980,7 +2000,8 @@ window.__ModuleLoader__.load({
             var nextConflict = null;
             for (var failedIndex = 0; failedIndex < failed.length; failedIndex += 1) {
               var failedItem = failed[failedIndex];
-              if (failedItem !== null && failedItem !== undefined && failedItem.code === "port-conflict"
+              if (failedItem !== null && failedItem !== undefined
+                && (failedItem.code === "port-conflict" || failedItem.code === "port-mismatch")
                 && failedItem.details !== null && failedItem.details !== undefined && Array.isArray(failedItem.details.ports)) {
                 nextConflict = failedItem;
                 break;
@@ -1988,7 +2009,13 @@ window.__ModuleLoader__.load({
             }
             await refreshDiagnose();
             if (nextConflict !== null) {
-              setConflict({ commandId: nextConflict.commandId, action: "startAll", ports: nextConflict.details.ports });
+              setConflict({
+                commandId: nextConflict.commandId,
+                action: "startAll",
+                kind: nextConflict.code,
+                ports: nextConflict.details.ports,
+                actualPorts: Array.isArray(nextConflict.details.actualPorts) ? nextConflict.details.actualPorts : []
+              });
               setConflictError(rpcError("port-conflict", String(nextConflict.message), nextConflict.details));
               return;
             }
@@ -2006,8 +2033,14 @@ window.__ModuleLoader__.load({
           await refreshDiagnose();
           setConflict(null);
         } catch (actionError) {
-          if (isPortConflictError(actionError)) {
-            setConflict({ commandId: conflict.commandId, action: conflict.action, ports: actionError.details.ports });
+          if (isPortBlockingError(actionError)) {
+            setConflict({
+              commandId: conflict.commandId,
+              action: conflict.action,
+              kind: actionError.code,
+              ports: actionError.details.ports,
+              actualPorts: Array.isArray(actionError.details.actualPorts) ? actionError.details.actualPorts : []
+            });
             setConflictError(actionError);
           } else {
             setConflictError(actionError);
@@ -2051,9 +2084,18 @@ window.__ModuleLoader__.load({
         var disabled = command.enabled === false;
         var active = status === "starting" || status === "running" || status === "stopping";
         var rowBusy = busy !== null;
-        var ports = current !== null && current !== undefined && Array.isArray(current.ports)
-          ? current.ports
-          : (Array.isArray(command.ports) ? command.ports : []);
+        var declaredPorts = Array.isArray(command.ports) ? command.ports : [];
+        var actualPorts = current !== null && current !== undefined && Array.isArray(current.actualPorts)
+          ? current.actualPorts
+          : [];
+        var extraPorts = actualPorts.filter(function (port) {
+          return declaredPorts.indexOf(port) === -1;
+        });
+        var missingPorts = actualPorts.length > 0
+          ? declaredPorts.filter(function (port) {
+              return actualPorts.indexOf(port) === -1;
+            })
+          : [];
         var meta = [];
         if (current !== null && current !== undefined && current.status === "running" && typeof current.startedAt === "number") {
           meta.push(h("span", { key: "uptime", className: "dshRunnerStatusText" }, "运行 " + formatUptime(Date.now() - current.startedAt)));
@@ -2080,8 +2122,22 @@ window.__ModuleLoader__.load({
               h("span", { className: "dshRunnerStateText", "data-status": status }, runnerStatusText(status))),
             h("div", { className: "dshRunnerRowCmd", title: String(command.command) }, String(command.command)),
             h("div", { className: "dshRunnerRowMeta" },
-              ports.map(function (port) {
-                return h("span", { key: String(port), className: "dshRunnerPort", title: "端口 " + String(port) }, ":" + String(port));
+              declaredPorts.map(function (port) {
+                return h("span", { key: "declared-" + String(port), className: "dshRunnerPort", title: "声明端口 " + String(port) }, ":" + String(port));
+              }),
+              extraPorts.map(function (port) {
+                return h("span", {
+                  key: "actual-" + String(port),
+                  className: "dshRunnerPort dshRunnerPortWarn",
+                  title: "实际监听端口（未在声明 ports 中）"
+                }, "实际 :" + String(port));
+              }),
+              missingPorts.map(function (port) {
+                return h("span", {
+                  key: "missing-" + String(port),
+                  className: "dshRunnerPort dshRunnerPortWarn",
+                  title: "声明端口当前未被本命令的进程监听"
+                }, "未绑定 :" + String(port));
               }),
               meta)),
           h("div", { className: "dshRunnerRowActions" },
@@ -2200,6 +2256,9 @@ window.__ModuleLoader__.load({
             h("span", { className: "dshRunnerConflictPort" }, "端口 " + String(item.port)),
             h("span", null, occupantSummary(occupant)),
             h("span", { className: "dshRunnerConflictTag" }, managed ? "本插件托管" : "外部进程"),
+            occupant !== undefined && occupant.related === true
+              ? h("span", { className: "dshRunnerConflictTag" }, "疑似同项目旧实例")
+              : null,
             windowTitle !== "" ? h("span", { className: "dshRunnerConflictTag", title: windowTitle }, "窗口：" + windowTitle) : null),
           managed && occupant !== undefined
             ? h("div", { className: "dshRunnerConflictMeta" },
@@ -2219,7 +2278,13 @@ window.__ModuleLoader__.load({
         h("div", { className: "dshRunnerDialog", "data-dsh-runner-conflict": "1" },
           h("div", { className: "dshRunnerDialogHead" }, "端口被占用"),
           h("div", { className: "dshRunnerDialogSub" },
-            "启动「" + titleOfCommand(conflict.commandId) + "」需要先处理以下端口占用。确认后会结束外部占用进程 / 停止对应托管命令，并自动重试启动。"),
+            conflict.kind === "port-mismatch"
+              ? "「" + titleOfCommand(conflict.commandId) + "」未能绑定声明端口，本次启动已终止"
+                + (Array.isArray(conflict.actualPorts) && conflict.actualPorts.length > 0
+                  ? "（实际绑定了 " + conflict.actualPorts.map(String).join("、") + "）"
+                  : "")
+                + "。处理以下占用后可重试启动。"
+              : "启动「" + titleOfCommand(conflict.commandId) + "」需要先处理以下端口占用。确认后会结束外部占用进程 / 停止对应托管命令，并自动重试启动。"),
           (Array.isArray(conflict.ports) ? conflict.ports : []).map(renderConflictEntry),
           conflictError !== null ? h("div", { className: "dshRunnerDialogError", "data-dsh-runner-error": "1" },
             messageOf(conflictError) + (errorDetailText(conflictError) !== "" ? " · " + errorDetailText(conflictError) : "")) : null,

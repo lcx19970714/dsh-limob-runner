@@ -29,6 +29,7 @@ const SNAPSHOT_KEYS = [
   "readyPort",
   "status",
   "ready",
+  "actualPorts",
   "exitCode",
   "pid",
   "startedAt",
@@ -90,9 +91,9 @@ async function getFreePorts(count) {
   return ports;
 }
 
-function canConnect(port, timeoutMs = 400) {
+function canConnectHost(host, port, timeoutMs = 400) {
   return new Promise((resolve) => {
-    const socket = net.connect({ host: "127.0.0.1", port: port, timeout: timeoutMs });
+    const socket = net.connect({ host: host, port: port, timeout: timeoutMs });
     let settled = false;
     const finish = (value) => {
       if (settled) return;
@@ -105,6 +106,10 @@ function canConnect(port, timeoutMs = 400) {
     socket.once("timeout", () => finish(false));
     socket.once("error", () => finish(false));
   });
+}
+
+function canConnect(port, timeoutMs = 400) {
+  return canConnectHost("127.0.0.1", port, timeoutMs);
 }
 
 const dir = await mkdtemp(path.join(os.tmpdir(), "dsh-runner-smoke-"));
@@ -235,8 +240,11 @@ try {
   const conflictCommand = makeCommand({
     id: "conflict",
     title: "冲突命令",
-    command: "Start-Sleep -Seconds 30",
-    ports: [occupantPort]
+    command: 'node "' + listenScript + '"',
+    env: { SMOKE_PORT: String(occupantPort) },
+    ports: [occupantPort],
+    readyPort: occupantPort,
+    readyTimeoutMs: 20000
   });
   const conflictCommands = [conflictCommand];
   await assert.rejects(
@@ -316,6 +324,10 @@ try {
   assert.equal(readyStarted.status, "running");
   assert.equal(readyStarted.ready, true, "readyPort 可连接后 ready 必须是 true");
   assert.equal(readyStarted.readyPort, readyPort);
+  assert.deepEqual(readyStarted.actualPorts, [readyPort], "snapshot 必须带本进程树实际监听端口");
+  await runner.refresh();
+  const readyAfterRefresh = runner.list(projectRoot).find((entry) => entry.commandId === "ready");
+  assert.deepEqual(readyAfterRefresh.actualPorts, [readyPort], "refresh 后仍应报告实际监听端口");
   assert.equal(await canConnect(readyPort), true, "start 返回时端口应已可连接");
 
   const readyDiagnose = await runner.diagnose([readyCommand], projectRoot);
@@ -357,7 +369,7 @@ try {
     (error) => {
       assert.ok(error instanceof RunnerError);
       assert.equal(error.code, "ready-timeout");
-      assert.equal(error.details.port, timeoutPort);
+      assert.deepEqual(error.details.ports, [timeoutPort]);
       assert.equal(error.details.timeoutMs, 1000);
       return true;
     }
@@ -365,6 +377,121 @@ try {
   const timedOut = runner.list(projectRoot).find((entry) => entry.commandId === "ready-timeout");
   assert.notEqual(timedOut.status, "running", "ready 超时后进程不能还在 running");
   assert.equal(pidAlive(timedOut.pid), false, "ready 超时后 Host 必须杀掉进程");
+
+  // ── 4b) 端口契约：声明端口必须由本进程树监听，拒绝静默降级 ───────────────
+  const mismatchScript = path.join(dir, "mismatch.cjs");
+  await writeFile(mismatchScript, [
+    'const net = require("node:net");',
+    'const server = net.createServer((socket) => socket.end());',
+    'server.listen(Number(process.env.SMOKE_PORT2), "127.0.0.1");',
+    'server.on("error", () => process.exit(1));',
+    'setInterval(() => {}, 1000);'
+  ].join("\n"), "utf8");
+
+  // (i) 声明端口空闲，但命令绑到别的端口 -> port-mismatch，且终止本次启动
+  const [contractPort, fallbackPort] = await getFreePorts(2);
+  const mismatchCommand = makeCommand({
+    id: "contract-mismatch",
+    title: "降级命令",
+    command: 'node "' + mismatchScript + '"',
+    ports: [contractPort],
+    readyPort: contractPort,
+    readyTimeoutMs: 8000,
+    env: { SMOKE_PORT2: String(fallbackPort) }
+  });
+  await assert.rejects(
+    () => runner.start(mismatchCommand, projectRoot),
+    (error) => {
+      assert.ok(error instanceof RunnerError);
+      assert.equal(error.code, "port-mismatch", "声明端口未被本进程监听必须报 port-mismatch");
+      assert.deepEqual(error.details.actualPorts, [fallbackPort], "details 应带实际监听端口");
+      assert.equal(error.details.ports[0].port, contractPort);
+      assert.equal(error.details.ports[0].occupant, undefined, "声明端口空闲时不应有占用者");
+      return true;
+    }
+  );
+  const mismatchRecord = runner.list(projectRoot).find((entry) => entry.commandId === "contract-mismatch");
+  assert.notEqual(mismatchRecord.status, "running");
+  assert.equal(pidAlive(mismatchRecord.pid), false, "端口契约失败后必须终止本次启动的进程");
+  await waitFor(async () => !(await canConnect(fallbackPort)), 8000, "降级进程终止后端口释放");
+
+  // (ii) 启动后声明端口被外部进程占用、命令降级 -> port-mismatch 且带占用者/related
+  const [racePort, raceFallback] = await getFreePorts(2);
+  const relatedOccupantScript = path.join(projectRoot, "occupant-related.cjs");
+  await writeFile(relatedOccupantScript, [
+    'const net = require("node:net");',
+    'const server = net.createServer((socket) => socket.end());',
+    'server.listen(Number(process.env.SMOKE_PORT), "127.0.0.1");',
+    'server.on("error", () => process.exit(1));',
+    'setInterval(() => {}, 1000);'
+  ].join("\n"), "utf8");
+  const raceCommand = makeCommand({
+    id: "contract-race",
+    title: "竞态降级",
+    command: 'node "' + mismatchScript + '"',
+    ports: [racePort],
+    readyPort: racePort,
+    readyTimeoutMs: 12000,
+    env: { SMOKE_PORT2: String(raceFallback) }
+  });
+  const raceStart = runner.start(raceCommand, projectRoot);
+  await waitFor(async () => await canConnect(raceFallback), 10000, "降级实例开始监听");
+  const relatedOccupant = spawn(process.execPath, [relatedOccupantScript], {
+    env: Object.assign({}, process.env, { SMOKE_PORT: String(racePort) }),
+    windowsHide: true,
+    stdio: "ignore"
+  });
+  try {
+    await assert.rejects(
+      () => raceStart,
+      (error) => {
+        assert.equal(error.code, "port-mismatch");
+        assert.deepEqual(error.details.actualPorts, [raceFallback]);
+        const conflict = error.details.ports.find((item) => item.port === racePort);
+        assert.ok(conflict !== undefined && conflict.occupant !== undefined, "被外部占用时必须带占用者");
+        assert.equal(conflict.occupant.pid, relatedOccupant.pid);
+        assert.equal(conflict.occupant.related, true, "占用者命令行含项目路径时应标记 related");
+        return true;
+      }
+    );
+  } finally {
+    try {
+      relatedOccupant.kill();
+    } catch (error) {
+      // 进程可能已退出
+    }
+  }
+
+  // (iii) IPv6-only 监听也必须被启动前预检发现（IPv4 表里看不到）
+  const [v6Port] = await getFreePorts(1);
+  const v6Occupant = spawn(process.execPath, ["-e", 'const net = require("node:net"); net.createServer((socket) => socket.end()).listen(' + String(v6Port) + ', "::1"); setInterval(() => {}, 1000);'], {
+    windowsHide: true,
+    stdio: "ignore"
+  });
+  try {
+    await waitFor(() => canConnectHost("::1", v6Port), 15000, "IPv6 监听就绪");
+    const v6Command = makeCommand({
+      id: "contract-v6",
+      title: "IPv6 端口",
+      command: "Start-Sleep -Seconds 30",
+      ports: [v6Port]
+    });
+    await assert.rejects(
+      () => runner.start(v6Command, projectRoot),
+      (error) => {
+        assert.equal(error.code, "port-conflict", "IPv6 监听也必须被预检发现");
+        assert.equal(error.details.ports[0].port, v6Port);
+        assert.equal(error.details.ports[0].occupant.pid, v6Occupant.pid);
+        return true;
+      }
+    );
+  } finally {
+    try {
+      v6Occupant.kill();
+    } catch (error) {
+      // 进程可能已退出
+    }
+  }
 
   // ── 5) dependsOn：递归启动；startAll 拓扑序与失败收集 ───────────────────
   const depCommandA = makeCommand({

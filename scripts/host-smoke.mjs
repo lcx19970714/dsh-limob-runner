@@ -157,6 +157,37 @@ try {
   });
   assert.deepEqual(graph.commands.map((command) => command.id), ["d"]);
 
+  // 端口契约：同一作用域（同一 projectRoot / 全局）端口不允许重复声明
+  const dupPortConfig = normalizeConfig({
+    version: 2,
+    ui: { visible: true },
+    commands: [
+      { id: "p1", title: "P1", command: "echo", scope: "project", projectRoot: "H:\\A", ports: [9000] },
+      { id: "p2", title: "P2", command: "echo", scope: "project", projectRoot: "H:\\A", ports: [9000] },
+      { id: "p3", title: "P3", command: "echo", scope: "project", projectRoot: "H:\\B", ports: [9000] },
+      { id: "g1", title: "G1", command: "echo", scope: "global", cwd: "", ports: [9001] },
+      { id: "g2", title: "G2", command: "echo", scope: "global", cwd: "", ports: [9001] }
+    ]
+  });
+  assert.deepEqual(
+    dupPortConfig.commands.map((command) => command.id),
+    ["p1", "p3", "g1"],
+    "同一作用域的重复端口命令必须被丢弃，不同项目可复用端口"
+  );
+
+  const dupPath = path.join(dir, "dup-ports.json");
+  await assert.rejects(
+    () => saveConfigFile(dupPath, {
+      version: 2,
+      ui: { visible: true },
+      commands: [
+        { id: "p1", title: "P1", command: "echo", scope: "project", projectRoot: "H:\\A", ports: [9000] },
+        { id: "p2", title: "P2", command: "echo", scope: "project", projectRoot: "H:\\A", ports: [9000] }
+      ]
+    }),
+    /端口/
+  );
+
   // ── 4. loadConfig：非法命令丢弃并给出 errors；保留合法命令 ──────────────
   const rawPath = path.join(dir, "raw.json");
   await writeFile(rawPath, JSON.stringify({

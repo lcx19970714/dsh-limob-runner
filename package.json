@@ -1,6 +1,6 @@
 {
   "name": "dsh-runner",
-  "version": "0.13.0",
+  "version": "0.14.0",
   "private": false,
   "description": "DSH 插件 dsh-runner：左侧「运行」面板按项目启停服务（状态/端口/日志/重启/依赖），输入框下方保留运行快捷菜单，并提供 dsh_runner_config / dsh_runner_run AI 工具。",
   "type": "module",
