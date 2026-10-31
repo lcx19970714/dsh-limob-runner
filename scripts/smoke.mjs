@@ -211,16 +211,8 @@ const ctx = {
 moduleExports.apply(ctx);
 assert.deepEqual(
   registered.map((entry) => entry.options.name).sort(),
-  [
-    "conversation.composer.dock",
-    "main",
-    "plugins.detail.badge",
-    "plugins.detail.section",
-    "settings.section",
-    "shell.overlay",
-    "sidebar.panellist"
-  ].sort(),
-  "应注册输入框按钮、设置页、插件页更新提示、左侧运行入口/面板/补开器"
+  ["conversation.composer.dock", "plugins.detail.badge", "plugins.detail.section", "settings.section"].sort(),
+  "应注册输入框下方按钮、设置页、插件页更新提示"
 );
 assert.equal(registered.find((entry) => entry.options.name === "settings.section").options.label, "dsh-runner");
 

@@ -34,7 +34,7 @@ window.__ModuleLoader__.load({
     // 一、常量与内置命令
     // =====================================================================
     var PLUGIN_NAME = "dsh-runner";
-    var PLUGIN_VERSION = "0.8.1";
+    var PLUGIN_VERSION = "0.9.0";
 
     // 更新检查（GitHub Releases）
     var REPO_SLUG = "lcx19970714/dsh-runner";
@@ -50,7 +50,6 @@ window.__ModuleLoader__.load({
     // 配置与旧终端映射
     var CONFIG_KEY = "dsh.limob-runner.config.v1";
     var TERMINAL_KEY = "dsh.limob-runner.v1";
-    var GLOBAL_TABS_KEY = "dsh.runner.globalTabs.v1";
     var CONFIG_VERSION = 1;
 
     // apply(ctx) 时保存客户端根 Context，组件里按需取 DSH 服务。
@@ -148,32 +147,6 @@ window.__ModuleLoader__.load({
       ".dshLimobRunTag{flex:none;padding:0 6px;border-radius:999px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));font-size:10px;line-height:16px;opacity:.75}",
       ".dshLimobRunRunningDot{flex:none;width:6px;height:6px;margin-top:6px;border-radius:50%;background:#22c55e}",
       ".dshLimobRunSep{height:1px;margin:5px 4px;background:var(--dsw-alias-border-l3,rgba(128,128,128,.3))}",
-      // ---- 左侧导航「运行」页（全局命令） ----
-      ".dshLimobGlobalPage{display:flex;flex-direction:column;gap:16px;width:100%;max-width:780px;margin:0 auto;padding:28px 24px 40px;box-sizing:border-box;font-size:13px;line-height:20px;color:inherit}",
-      ".dshLimobGlobalHead{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;border-bottom:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));padding-bottom:12px}",
-      ".dshLimobGlobalTitle{font-size:17px;font-weight:600;line-height:24px}",
-      ".dshLimobGlobalSub{font-size:12px;line-height:18px;opacity:.6;margin-top:3px}",
-      ".dshLimobGlobalVersion{font-size:10px;opacity:.4;flex:none}",
-      ".dshLimobGlobalToolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap}",
-      ".dshLimobGlobalStat{font-size:12px;opacity:.6;flex:1 1 200px}",
-      ".dshLimobGlobalList{display:flex;flex-direction:column;gap:8px}",
-      ".dshLimobGlobalRow{display:flex;align-items:center;gap:12px;min-width:0;padding:12px 14px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.3));border-radius:10px;background:var(--dsw-alias-bg-layer-1,rgba(128,128,128,.05))}",
-      ".dshLimobGlobalRow[data-status=running]{border-color:rgba(34,197,94,.45)}",
-      ".dshLimobGlobalMain{display:flex;flex-direction:column;gap:2px;min-width:0;flex:1}",
-      ".dshLimobGlobalNameLine{display:flex;align-items:center;gap:7px;min-width:0}",
-      ".dshLimobGlobalName{font-size:13px;font-weight:500;line-height:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
-      ".dshLimobGlobalCmd{font-size:11px;line-height:16px;opacity:.55;font-family:ui-monospace,Consolas,'Courier New',monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
-      ".dshLimobGlobalStatus{display:inline-flex;align-items:center;gap:5px;flex:none;font-size:11px;opacity:.75;white-space:nowrap}",
-      ".dshLimobGlobalDot{width:7px;height:7px;border-radius:50%;background:rgba(128,128,128,.55);flex:none}",
-      ".dshLimobGlobalDot[data-status=running]{background:#22c55e}",
-      ".dshLimobGlobalDot[data-status=exited]{background:#f59e0b}",
-      ".dshLimobGlobalDot[data-status=failed]{background:#f87171}",
-      ".dshLimobGlobalActions{display:flex;align-items:center;gap:6px;flex:none}",
-      ".dshLimobGlobalEmpty{padding:28px 12px;text-align:center;font-size:12px;opacity:.55}",
-      ".dshLimobGlobalTips{font-size:11px;line-height:17px;opacity:.5;border-top:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.28));padding-top:10px}",
-      ".dshLimobGlobalNotice{font-size:11px;line-height:17px;color:#22c55e}",
-      ".dshLimobGlobalError{font-size:11px;line-height:17px;color:#f87171}",
-      ".dshLimobNavIcon{display:inline-flex;align-items:center;justify-content:center;width:100%;height:100%;color:currentColor}",
       // ---- 设置页：命令配置（紧凑布局） ----
       ".dshLimobCfgPage{display:flex;flex-direction:column;gap:10px;width:100%;max-width:100%;padding:0 0 18px;font-size:12px;line-height:18px;color:inherit;box-sizing:border-box}",
       ".dshLimobPageHead{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:2px 2px 9px;border-bottom:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35))}",
@@ -1917,9 +1890,7 @@ window.__ModuleLoader__.load({
       var configOpen = configOpenPair[0];
       var setConfigOpen = configOpenPair[1];
 
-      var commands = visibleCommands(config, projectPath, sessionId !== undefined).filter(function (command) {
-        return command.scope === "project";
-      });
+      var commands = visibleCommands(config, projectPath, sessionId !== undefined);
 
       // 状态提示 6 秒后自动消失。
       react.useEffect(function () {
@@ -2116,7 +2087,7 @@ window.__ModuleLoader__.load({
               h("span", null, "运行命令"),
               h("span", null, projectPath !== undefined ? String(projectPath) : "当前会话")),
             commands.length === 0
-              ? h("div", { className: "dshLimobRunMenuTitle" }, "当前项目没有项目级命令；全局命令请在左侧「运行」页打开。")
+              ? h("div", { className: "dshLimobRunMenuTitle" }, "当前项目没有可用命令：去「管理命令」里添加，或把命令作用域设为全局。")
               : commands.map(function (command) {
                   return h("button", {
                     key: command.id,
@@ -2230,323 +2201,6 @@ window.__ModuleLoader__.load({
 
     // =====================================================================
     // =====================================================================
-    // 十二、左侧导航「运行」页 + 全局命令后台运行 + 右侧日志终端
-    // =====================================================================
-    // 全局命令不再依赖会话终端：Host 侧启动独立进程并写日志；
-    // 每个会话右侧栏打开一个「跟随日志」的原生终端，切换项目仍能看到同一份输出。
-    var globalTailOpening = {};
-    var lastActiveProjectPath = undefined;
-
-    function loadGlobalTabs() {
-      try {
-        if (typeof localStorage === "undefined") return { sessions: {} };
-        var raw = localStorage.getItem(GLOBAL_TABS_KEY);
-        if (raw === null) return { sessions: {} };
-        var parsed = JSON.parse(raw);
-        if (parsed !== null && typeof parsed === "object" && parsed.sessions !== null && typeof parsed.sessions === "object") return parsed;
-      } catch (_error) {
-        /* ignore */
-      }
-      return { sessions: {} };
-    }
-
-    function saveGlobalTabs(registry) {
-      try {
-        if (typeof localStorage !== "undefined") localStorage.setItem(GLOBAL_TABS_KEY, JSON.stringify(registry));
-      } catch (_error) {
-        /* ignore */
-      }
-    }
-
-    function globalTabKey(sessionId, commandId) {
-      return sessionId + "::" + commandId;
-    }
-
-    function globalTerminalTitle(runner) {
-      return "全局 · " + runner.title;
-    }
-
-    function buildGlobalTailCommand(runner) {
-      var logPath = String(runner.logPath || "").replace(/'/g, "''");
-      return "chcp 65001 | Out-Null; Get-Content -LiteralPath '" + logPath + "' -Encoding UTF8 -Tail 600 -Wait";
-    }
-
-    /**
-     * 在当前会话打开（或聚焦）某个全局命令的日志终端。
-     * 终端只是 Get-Content -Wait 的“跟随日志”视图；真正的进程在 Host 侧。
-     */
-    async function ensureGlobalTail(ctx, sessionId, runner, openIt) {
-      if (ctx === null || sessionId === undefined || runner === null || runner === undefined) return;
-      if (typeof runner.logPath !== "string" || runner.logPath === "") return;
-      var key = globalTabKey(sessionId, runner.commandId);
-      if (globalTailOpening[key] === true) return;
-      globalTailOpening[key] = true;
-      try {
-        var remote = getTerminalRemote(ctx);
-        if (remote === undefined || remote === null) return;
-        var registry = loadGlobalTabs();
-        if (registry.sessions[sessionId] === undefined || registry.sessions[sessionId] === null) registry.sessions[sessionId] = {};
-        var entry = registry.sessions[sessionId][runner.commandId];
-        if (entry !== undefined && entry !== null && typeof entry.terminalId === "string") {
-          var list = await listTerminals(remote, sessionId);
-          var live = list.find(function (info) {
-            return info !== null && info !== undefined && info.id === entry.terminalId;
-          });
-          if (live !== undefined) {
-            if (openIt) await openOrFocusTab(ctx, sessionId, entry.terminalId);
-            return;
-          }
-        }
-        var shellPath = await pickShellPath(remote, sessionId);
-        var baseId = ("dsh-runner-global-" + String(runner.commandId || "")).replace(/[^\w-]/g, "-").slice(0, 110);
-        var created = await createTerminal(remote, sessionId, baseId, shellPath);
-        var title = globalTerminalTitle(runner);
-        await safeRename(remote, sessionId, created.id, title);
-        await sendCommands(remote, sessionId, created.id, [buildGlobalTailCommand(runner)]);
-        registry.sessions[sessionId][runner.commandId] = {
-          terminalId: created.id,
-          title: title,
-          logPath: runner.logPath,
-          savedAt: Date.now()
-        };
-        saveGlobalTabs(registry);
-        if (openIt) await openOrFocusTab(ctx, sessionId, created.id);
-      } catch (_error) {
-        /* 终端打不开不影响 Host 进程；页面可以提示日志不可用 */
-      } finally {
-        delete globalTailOpening[key];
-      }
-    }
-
-    /** 关闭某个全局命令在所有会话里的日志终端（命令停止时调用）。 */
-    async function closeGlobalTails(ctx, commandId) {
-      var registry = loadGlobalTabs();
-      var sessionIds = Object.keys(registry.sessions || {});
-      for (var i = 0; i < sessionIds.length; i += 1) {
-        var sessionId = sessionIds[i];
-        var entry = registry.sessions[sessionId] !== null && registry.sessions[sessionId] !== undefined
-          ? registry.sessions[sessionId][commandId]
-          : undefined;
-        if (entry === undefined || entry === null || typeof entry.terminalId !== "string") continue;
-        await closeTerminal(ctx, sessionId, entry.terminalId);
-        delete registry.sessions[sessionId][commandId];
-        if (Object.keys(registry.sessions[sessionId]).length === 0) delete registry.sessions[sessionId];
-      }
-      saveGlobalTabs(registry);
-    }
-
-    /** 左侧导航图标：一个简单的播放三角。 */
-    function GlobalRunPanelIcon(props) {
-      var size = props !== undefined && typeof props.size === "number" ? props.size : 18;
-      return h("span", { className: "dshLimobNavIcon" },
-        h("svg", { width: size, height: size, viewBox: "0 0 16 16", "aria-hidden": "true", focusable: "false" },
-          h("path", { d: "M5 3.2l8 4.8-8 4.8V3.2z", fill: "currentColor" })));
-    }
-
-    /** 切会话时在后台补开全局命令的日志终端。 */
-    function GlobalTailKeeper(props) {
-      var active = useActiveSession(props);
-      react.useEffect(function () {
-        if (active.sessionId === undefined) return undefined;
-        if (active.projectPath !== undefined && active.projectPath !== "") lastActiveProjectPath = active.projectPath;
-        var cancelled = false;
-        async function syncTails() {
-          var value = await hostRpc("global/status", {});
-          if (cancelled || value === undefined) return;
-          var runners = Array.isArray(value.runners) ? value.runners : [];
-          for (var i = 0; i < runners.length; i += 1) {
-            if (cancelled) return;
-            if (runners[i].status !== "running") continue;
-            await ensureGlobalTail(runtimeCtx, active.sessionId, runners[i], true);
-          }
-        }
-        function onChanged() {
-          syncTails();
-        }
-        var timer = setTimeout(syncTails, 500);
-        window.addEventListener("dsh-runner:global-changed", onChanged);
-        return function () {
-          cancelled = true;
-          clearTimeout(timer);
-          window.removeEventListener("dsh-runner:global-changed", onChanged);
-        };
-      }, [active.sessionId]);
-      return null;
-    }
-
-    /** 左侧导航「运行」主面板：全局命令列表 + 运行/停止/日志。 */
-    function GlobalRunnerPage(props) {
-      var config = useConfig();
-      var active = useActiveSession(props);
-      var runnersPair = react.useState([]);
-      var runners = runnersPair[0];
-      var setRunners = runnersPair[1];
-      var busyPair = react.useState(null);
-      var busy = busyPair[0];
-      var setBusy = busyPair[1];
-      var noticePair = react.useState("");
-      var notice = noticePair[0];
-      var setNotice = noticePair[1];
-      var errorPair = react.useState("");
-      var error = errorPair[0];
-      var setError = errorPair[1];
-
-      var globalCommands = config.commands.filter(function (command) {
-        return command.scope === "global";
-      });
-
-      async function refresh() {
-        // AI 可能刚通过 dsh_runner_config 创建/修改了全局命令，刷新状态时顺带同步配置。
-        await syncConfigFromHost();
-        var value = await hostRpc("global/status", {});
-        if (value !== undefined) setRunners(Array.isArray(value.runners) ? value.runners : []);
-      }
-
-      react.useEffect(function () {
-        refresh();
-        var timer = setInterval(refresh, 2500);
-        return function () {
-          clearInterval(timer);
-        };
-      }, []);
-
-      function runnerOf(commandId) {
-        for (var i = 0; i < runners.length; i += 1) {
-          if (runners[i].commandId === commandId) return runners[i];
-        }
-        return undefined;
-      }
-
-      async function start(command) {
-        if (busy !== null) return;
-        setBusy(command.id);
-        setError("");
-        var value = await hostRpc("global/start", {
-          commandId: command.id,
-          workspacePath: active.projectPath !== undefined ? active.projectPath : lastActiveProjectPath
-        });
-        if (value === undefined || value.runner === undefined) {
-          setError("启动失败：Host 运行器不可用");
-        } else {
-          setNotice("已启动「" + command.title + "」，日志终端已准备");
-          await refresh();
-          if (active.sessionId !== undefined) await ensureGlobalTail(runtimeCtx, active.sessionId, value.runner, true);
-          window.dispatchEvent(new Event("dsh-runner:global-changed"));
-        }
-        setBusy(null);
-      }
-
-      async function stop(command) {
-        if (busy !== null) return;
-        setBusy(command.id);
-        setError("");
-        var value = await hostRpc("global/stop", { commandId: command.id });
-        if (value === undefined) {
-          setError("停止失败：Host 运行器不可用");
-        } else {
-          setNotice("已停止「" + command.title + "」");
-          await closeGlobalTails(runtimeCtx, command.id);
-          await refresh();
-          window.dispatchEvent(new Event("dsh-runner:global-changed"));
-        }
-        setBusy(null);
-      }
-
-      async function openLog(command) {
-        var runner = runnerOf(command.id);
-        if (runner === undefined) {
-          setError("还没有运行记录；请先点「运行」");
-          return;
-        }
-        if (active.sessionId === undefined) {
-          setError("请先进入一个会话，右侧栏才能显示日志终端");
-          return;
-        }
-        await ensureGlobalTail(runtimeCtx, active.sessionId, runner, true);
-        setError("");
-      }
-
-      function stateText(runner) {
-        if (runner === undefined) return "未运行";
-        if (runner.status === "running") return "运行中";
-        if (runner.status === "failed") return "启动失败";
-        if (runner.status === "stopped") return "已停止";
-        return "已退出";
-      }
-
-      return h("div", { className: "dshLimobGlobalPage" },
-        h("div", { className: "dshLimobGlobalHead" },
-          h("div", null,
-            h("div", { className: "dshLimobGlobalTitle" }, "运行"),
-            h("div", { className: "dshLimobGlobalSub" }, "全局命令：任何项目都能用；运行日志会跟随到当前项目右侧栏")),
-          h("span", { className: "dshLimobGlobalVersion" }, "v" + PLUGIN_VERSION)),
-        h("div", { className: "dshLimobGlobalToolbar" },
-          h("span", { className: "dshLimobGlobalStat" }, globalCommands.length + " 条全局命令"), 
-          h("button", {
-            type: "button",
-            className: "dshLimobCfgBtn dshLimobCfgBtnGhost",
-            onClick: refresh
-          }, "刷新状态")),
-        globalCommands.length === 0
-          ? h("div", { className: "dshLimobGlobalEmpty" }, "还没有全局命令。可以直接对 AI 说「给所有项目加一个全局命令：打开记事本」，或去 设置 → dsh-runner 新增一条并把作用域选「所有项目」。")
-          : h("div", { className: "dshLimobGlobalList" },
-              globalCommands.map(function (command) {
-                var runner = runnerOf(command.id);
-                var status = runner !== undefined ? runner.status : "idle";
-                return h("div", { key: command.id, className: "dshLimobGlobalRow", "data-status": status },
-                  h("div", { className: "dshLimobGlobalMain" },
-                    h("div", { className: "dshLimobGlobalNameLine" },
-                      h("span", { className: "dshLimobGlobalName" }, command.title),
-                      h("span", { className: "dshLimobRunTag" }, "全局")),
-                    h("div", { className: "dshLimobGlobalCmd" }, command.command)),
-                  h("span", { className: "dshLimobGlobalStatus" },
-                    h("span", { className: "dshLimobGlobalDot", "data-status": status }),
-                    stateText(runner)),
-                  h("div", { className: "dshLimobGlobalActions" },
-                    runner !== undefined && runner.status === "running"
-                      ? h("button", {
-                          type: "button",
-                          className: "dshLimobCfgBtn dshLimobCfgBtnDanger",
-                          disabled: busy !== null,
-                          onClick: function () { stop(command); }
-                        }, "停止")
-                      : h("button", {
-                          type: "button",
-                          className: "dshLimobCfgBtn dshLimobCfgBtnPrimary",
-                          disabled: busy !== null || command.enabled === false,
-                          onClick: function () { start(command); }
-                        }, "运行"),
-                    h("button", {
-                      type: "button",
-                      className: "dshLimobCfgBtn",
-                      disabled: runner === undefined,
-                      onClick: function () { openLog(command); }
-                    }, "日志")));
-              })),
-        h("div", { className: "dshLimobGlobalTips" },
-          "全局命令由 Host 侧独立进程执行，不绑定会话；右侧栏里的终端是它的只读日志（Get-Content -Wait），所以切换项目后仍然能看到。项目级命令仍在输入框下方的「运行」按钮里。"),
-        error !== "" ? h("div", { className: "dshLimobGlobalError" }, error) : null,
-        notice !== "" ? h("div", { className: "dshLimobGlobalNotice" }, notice) : null);
-    }
-
-    /** 注册左侧导航「运行」入口、主面板和会话切换时的日志终端补开器。 */
-    function registerGlobalRunnerUi(ctx) {
-      try {
-        ctx.slots.inject("sidebar.panellist", function () {
-          return ctx.slots.register({ name: "sidebar.panellist", id: "dsh-runner-global", order: 20, label: "运行" }, GlobalRunPanelIcon);
-        });
-      } catch (error) {
-        logPluginError(ctx, "注册左侧导航失败", error);
-      }
-      try {
-        ctx.slots.inject("main", function () {
-          return ctx.slots.register({ name: "main", key: "dsh-runner-global" }, GlobalRunnerPage);
-        });
-      } catch (error) {
-        logPluginError(ctx, "注册运行主面板失败", error);
-      }
-      registerSlot(ctx, "shell.overlay", "dsh-runner-global-keeper", GlobalTailKeeper, 210);
-    }
     // 十二、注册
     // =====================================================================
     function registerSlot(ctx, slotName, entryId, component, order, label) {
@@ -2572,8 +2226,6 @@ window.__ModuleLoader__.load({
       syncConfigFromHost();
       // 输入框卡片正下方的小按钮（conversation.composer.dock）。
       registerSlot(ctx, "conversation.composer.dock", "dsh-runner-run", LimobComposerButton, 40);
-      // 左侧导航「运行」：全局命令入口 + 主面板 + 切会话补开日志终端。
-      registerGlobalRunnerUi(ctx);
       // 设置弹窗左侧新增「dsh-runner」页（settings.section 的每个条目就是一页）。
       registerSlot(ctx, "settings.section", "dsh-runner", LimobSettingsSection, 60, "dsh-runner");
       // DSH 插件页的更新提示（沿用 0.2 的能力）。

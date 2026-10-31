@@ -43,8 +43,7 @@ dsh plugin --profile desktop add file:<仓库绝对路径>
 
 - 位置：对话输入框卡片**正下方**（DSH 的 `conversation.composer.dock` 槽位，和输入框下方的状态胶囊同一行）；
 - 样式：按钮只有「▶」图标 + 「运行」两个字，**无外边框、无胶囊底色**（默认透明，悬停才显示淡背景），不占额外高度、不遮挡对话和输入框；
-- 点击：向上展开**项目级命令**菜单（按当前项目过滤、显示运行中绿点、关闭本会话终端、管理命令、更新状态与 GitHub 入口）；
-- 全局命令不再放在这个按钮里，而是放在左侧导航新增的 **「运行」** 页（见下）；
+- 点击：向上展开命令菜单（按当前项目过滤、显示运行中绿点、关闭本会话终端、管理命令、更新状态与 GitHub 入口）；
 - 有新版本时按钮上会有一个小橙点；
 - 运行结果（启动中/运行中/失败）以小字显示在按钮右侧，6 秒后自动消失。
 
@@ -74,18 +73,10 @@ DSH 左下角 **设置**（Settings）弹窗 → 左侧导航新增一页 **「d
 
 界面是紧凑的列表 + 内联表单，不再是多张留白很大的卡片：顶部是命令统计和「运行按钮」开关，列表中一行一条命令，编辑时在列表上方展开表单。
 
-### 全局命令：左侧导航「运行」页
-
-- 左侧导航（插件/自动化任务下面）新增 **「运行」** 入口，点开是全局命令页；
-- 全局命令由 Host 侧独立进程执行，**不绑定会话**；
-- 每个项目/会话的右侧栏会打开一个「跟随日志」的原生终端，切换项目后会自动补开，所以切来切去都能看到同一份全局输出；
-- 该终端是**只读日志**（`Get-Content -Wait`），真正的进程在 Host；需要输入交互的命令请用项目级命令的终端；
-- 左侧「运行」页可以运行、停止、打开日志，并显示进程状态。
-
 ### 全局 vs 项目作用域
 
-- **全局**：在左侧「运行」页显示，任何项目都能启动；输入框下方按钮不再展示全局命令。
-- **指定项目**：只有当前会话所属的**工作区路径**等于所选项目，或位于它下面（子目录）时，命令才出现在输入框下方的「运行」菜单里，并使用 DSH 原生交互终端。
+- **全局**：任何项目/会话都能看到并运行这条命令，出现在输入框下方的「运行」菜单里。
+- **指定项目**：只有当前会话所属的**工作区路径**等于所选项目，或位于它下面（子目录）时，命令才出现在「运行」菜单里。
 - 项目直接从下拉列表选择（来自 DSH 侧栏已经添加的工作区，例如 `Limob-windows · H:\Limob-windows`），不需要手输路径；如果项目尚未注册到 DSH，可选「自定义路径…」手动填写。
 
 ---
@@ -106,10 +97,10 @@ AI 调用工具时的默认行为：
 - 作用域 = **当前项目**（project），项目路径 = 当前会话的工作区，不需要你手写 `H:\...`；
 - 工作目录 = 项目路径（除非显式指定 `cwd`）；
 - 命令里含中文时自动勾选 chcp 65001；
-- 只有你明确说「全局」时才会创建全局命令；全局命令会自动出现在左侧导航「运行」页。
+- 只有你明确说「全局」时才会创建全局命令；全局命令会出现在输入框下方的「运行」菜单里。
 - 全局命令没有显式 `cwd` 时，运行时会使用当前项目路径。
 
-保存后**不需要重启 DSH**：左侧导航「运行」页每 2.5 秒同步一次配置，AI 创建的全局命令会自动出现；输入框下方的「运行」菜单和设置页也会在打开时同步。设置页底部也有「同步宿主」按钮可手动刷新。
+保存后**不需要重启 DSH**：打开输入框下方的「运行」菜单，或进入设置页「dsh-runner」，插件会自动从 Host 同步；设置页底部也有「同步宿主」按钮可手动刷新。
 
 配置由 Host 统一保存到：
 
@@ -178,9 +169,7 @@ C:\Users\main\.dsh\dsh-runner\commands.json
 ## 数据与回退
 
 - 配置：Host 侧 `C:\Users\main\.dsh\dsh-runner\commands.json`（主数据）；浏览器 `localStorage["dsh.limob-runner.config.v1"]` 作为缓存/离线兜底
-- 全局命令运行日志：`C:\Users\main\.dsh\dsh-runner\logs\<命令 id>.log`（右侧日志终端读取它）
 - 终端复用记录：`localStorage["dsh.limob-runner.v1"]`
-- 全局日志终端映射：`localStorage["dsh.runner.globalTabs.v1"]`
 - 更新缓存：`localStorage["dsh.limob-runner.update.v1"]`
 
 以上都是本机本地数据，删掉只会丢失自定义命令/按钮开关，不会影响 DSH 其它功能。卸载插件后如需彻底清理，删除 `commands.json` 和这三个 localStorage 键即可。
@@ -191,8 +180,6 @@ C:\Users\main\.dsh\dsh-runner\commands.json
 
 - 客户端插件与 DSH 内置 UI 插件在同一个 Cordis 根 Context 中运行，可访问 `remote.terminal`、`webTerminals`、`sidebarRight` 等客户端服务。
 - 运行按钮：`conversation.composer.dock`（输入框卡片下方的环境条目槽位）。
-- 左侧运行入口：`sidebar.panellist`（导航图标）+ `main`（全局命令页）。
-- 全局进程：Host 侧 `host-runner.js`（child_process），浏览器通过 `global/start|stop|status` RPC 控制。
 - 配置页：`settings.section`（设置弹窗的页面列表，每个条目一页）。
 - 更新提示：`plugins.detail.badge` / `plugins.detail.section`（插件页详情扩展点）。
 - 终端：`remote.terminal.create/list/attach/rename/close` + `sidebarRight.openTab("terminal",{params:{terminalId}})`。
@@ -204,15 +191,12 @@ C:\Users\main\.dsh\dsh-runner\commands.json
 node --check index.js
 node --check client.js
 node --check host-config.js
-node --check host-runner.js
 node scripts/host-smoke.mjs
-node scripts/runner-smoke.mjs
 node scripts/smoke.mjs
 ```
 
-`scripts/smoke.mjs` 在 Node 里用假的 `window.__ModuleLoader__` / react / ctx 执行 `client.js`，并测试：7 个 slot 注册、配置默认值与作用域匹配、GitHub 更新检查（mock fetch/localStorage）、最小 props 下的组件首次渲染。
+`scripts/smoke.mjs` 在 Node 里用假的 `window.__ModuleLoader__` / react / ctx 执行 `client.js`，并测试：4 个 slot 注册、配置默认值与作用域匹配、GitHub 更新检查（mock fetch/localStorage）、最小 props 下的组件首次渲染。
 `scripts/host-smoke.mjs` 用临时目录测试 Host 侧 `commands.json` 的读写和 AI Tool 的 create/update/delete 核心逻辑。
-`scripts/runner-smoke.mjs` 验证 Host 全局运行器能启动短命令、写入日志并停止长命令。
 
 ## License
 

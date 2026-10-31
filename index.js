@@ -16,7 +16,6 @@ import {
   saveConfigFile,
   updateCommand
 } from "./host-config.js";
-import { GlobalRunnerService } from "./host-runner.js";
 
 export const name = "dsh-runner";
 // tools：注册 AI Tool；connection 在 apply 里按需注入（浏览器 RPC 需要）。
@@ -33,7 +32,7 @@ export const CONFIG_PATH = process.env.DSH_RUNNER_CONFIG
 
 const RPC_CHANNEL = "/api";
 const RPC_NAMESPACE = "dsh-runner";
-const RPC_ENDPOINTS = ["config/get", "config/save", "global/status", "global/start", "global/stop"];
+const RPC_ENDPOINTS = ["config/get", "config/save"];
 
 /** 读取配置；如果新路径还不存在而旧版文件存在，就自动迁移一次。 */
 async function ensureConfigFile() {
@@ -163,7 +162,7 @@ function fail(code, message) {
   return { ok: false, error: { code: code, message: message, details: {} } };
 }
 
-async function dispatch(runner, endpoint, payload) {
+async function dispatch(endpoint, payload) {
   if (endpoint === "config/get") {
     const loaded = await ensureConfigFile();
     return {
@@ -179,32 +178,11 @@ async function dispatch(runner, endpoint, payload) {
     const saved = await saveConfigFile(CONFIG_PATH, payload.config);
     return { saved: true, filePath: CONFIG_PATH, config: saved };
   }
-  if (endpoint === "global/status") {
-    return { runners: runner.list() };
-  }
-  if (endpoint === "global/start") {
-    if (payload === null || payload === undefined || typeof payload !== "object" || typeof payload.commandId !== "string") {
-      throw new Error("global/start 需要 {commandId}");
-    }
-    const loaded = await ensureConfigFile();
-    const command = loaded.config.commands.find((item) => item.id === payload.commandId);
-    if (command === undefined) throw new Error("找不到命令：" + payload.commandId);
-    if (command.scope !== "global") throw new Error("只有全局命令可以在全局运行器中启动");
-    if (command.enabled === false) throw new Error("命令已停用");
-    return { runner: await runner.start(command, typeof payload.workspacePath === "string" ? payload.workspacePath : undefined), runners: runner.list() };
-  }
-  if (endpoint === "global/stop") {
-    if (payload === null || payload === undefined || typeof payload !== "object" || typeof payload.commandId !== "string") {
-      throw new Error("global/stop 需要 {commandId}");
-    }
-    const stopped = await runner.stop(payload.commandId);
-    return { stopped: stopped, runners: runner.list() };
-  }
   throw new Error("未知 endpoint：" + endpoint);
 }
 
 /** 注册浏览器 RPC 路由（POST /api/dsh-runner/config/get 等）。 */
-function registerRpc(ctx, runner) {
+function registerRpc(ctx) {
   for (const endpoint of RPC_ENDPOINTS) {
     const routePath = RPC_CHANNEL + "/" + RPC_NAMESPACE + "/" + endpoint;
     const method = RPC_NAMESPACE + "/" + endpoint;
@@ -228,7 +206,7 @@ function registerRpc(ctx, runner) {
           }
           let result;
           try {
-            result = ok(await dispatch(runner, endpoint, message.payload));
+            result = ok(await dispatch(endpoint, message.payload));
           } catch (error) {
             result = fail("internal", error instanceof Error ? error.message : String(error));
           }
@@ -248,10 +226,8 @@ function registerRpc(ctx, runner) {
 }
 
 export function apply(ctx) {
-  const runner = new GlobalRunnerService();
-  ctx.effect(() => () => runner.disposeAll(), "dsh-runner: global runner cleanup");
   registerConfigTool(ctx);
   ctx.inject(["connection"], (connectionCtx) => {
-    registerRpc(connectionCtx, runner);
+    registerRpc(connectionCtx);
   });
 }

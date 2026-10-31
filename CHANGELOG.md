@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.9.0
+
+### Removed
+
+- 移除左侧导航「运行」全局命令页、Host 全局运行器和右侧栏「全局日志终端」；
+- 全局命令恢复到输入框下方的「运行」菜单（与项目命令一致），不再单独放在左侧；
+- 移除 `host-runner.js` 和对应的 `global/start|stop|status` RPC / 测试。
+
+### Kept
+
+- AI 的 `dsh_runner_config` 仍支持 `scope=global`，创建后全局命令会出现在「运行」菜单里；
+- 设置页的全局/项目作用域配置不变。
+
 ## 0.8.1
 
 ### Changed
