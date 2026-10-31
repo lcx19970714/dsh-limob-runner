@@ -1,105 +1,316 @@
-// Host 侧配置存储的离线冒烟测试。
-// 不启动 DSH，只验证 commands.json 的读写和 CRUD，避免 AI Tool 改坏配置格式。
+// Host 侧配置存储（commands.json version 2）的离线冒烟测试。
+//
+// 覆盖 SPEC 第 1 节与第 5 节 host-smoke：
+//   - 默认配置为空；
+//   - normalize 校验（env key、ports、readyPort∈ports、dependsOn 存在/环、未知字段忽略）；
+//   - CRUD / reorder / ui；
+//   - 加载时非法命令丢弃并给出错误，保存时非法直接抛错；
+//   - 路径归一化与原子写入后的文件内容。
 import assert from "node:assert/strict";
 import os from "node:os";
 import path from "node:path";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import {
+  CONFIG_VERSION,
+  ConfigError,
+  cleanProjectPath,
   createCommand,
   defaultConfig,
   deleteCommand,
+  findCommand,
   loadConfig,
+  normalizeCommand,
   normalizeConfig,
+  normalizePath,
+  reorderCommands,
   saveConfigFile,
+  setUi,
   updateCommand
 } from "../host-config.js";
 
-const dir = await mkdtemp(path.join(os.tmpdir(), "dsh-limob-host-"));
+const dir = await mkdtemp(path.join(os.tmpdir(), "dsh-runner-host-smoke-"));
 const file = path.join(dir, "commands.json");
-try {
-  const defaults = defaultConfig();
-  assert.equal(defaults.commands.length, 4);
 
-  // 文件不存在时给默认配置
+function isConfigError(error) {
+  return error instanceof ConfigError;
+}
+
+try {
+  // ── 1. 默认配置为空（不再内置任何命令） ───────────────────────────────
+  assert.equal(CONFIG_VERSION, 2);
+  assert.deepEqual(defaultConfig(), { version: 2, ui: { visible: true }, commands: [] });
+
   const missing = await loadConfig(file);
   assert.equal(missing.exists, false);
-  assert.equal(missing.config.commands.length, 4);
+  assert.deepEqual(missing.config, defaultConfig());
+  assert.deepEqual(missing.errors, []);
 
-  // 写入并读回
-  await saveConfigFile(file, defaults);
-  const loaded = await loadConfig(file);
-  assert.equal(loaded.exists, true);
-  assert.equal(loaded.config.commands.length, 4);
-  const raw = JSON.parse(await readFile(file, "utf8"));
-  assert.equal(raw.version, 1);
+  // ── 2. normalizeCommand：合法命令的缺省值与 trim/归一化 ─────────────────
+  const base = normalizeCommand({
+    title: " 调试后端 ",
+    command: " python -m uvicorn main:app --port 8001 ",
+    scope: "project",
+    projectRoot: "H:/proj/",
+    cwd: "H:/proj/backend/",
+    env: { APP_ENV: "dev" },
+    ports: [8001, 8001]
+  });
+  assert.ok(base, "合法命令不应被丢弃");
+  assert.equal(base.title, "调试后端");
+  assert.equal(base.command, "python -m uvicorn main:app --port 8001");
+  assert.equal(base.projectRoot, "H:\\proj");
+  assert.equal(base.cwd, "H:\\proj\\backend");
+  assert.deepEqual(base.ports, [8001], "ports 去重");
+  assert.equal(base.readyPort, null);
+  assert.equal(base.readyTimeoutMs, 120000);
+  assert.deepEqual(base.env, { APP_ENV: "dev" });
+  assert.deepEqual(base.dependsOn, []);
+  assert.equal(base.enabled, true);
+  assert.match(base.id, /^cmd-[a-z0-9]+-[a-z0-9]+$/);
 
-  // 项目作用域默认使用调用方工作区
-  const created = createCommand(loaded.config, {
-    title: "启动开发服务器",
-    command: "pnpm dev"
-  }, "H:\\Limob-windows");
+  // 未知/旧字段被忽略，不保留、不回写
+  const legacy = normalizeCommand({
+    title: "旧命令",
+    command: "echo hi",
+    scope: "global",
+    cwd: "",
+    terminalTitle: "legacy-title",
+    utf8CodePage: true,
+    longRunning: true
+  });
+  assert.ok(legacy);
+  for (const field of ["terminalTitle", "utf8CodePage", "longRunning"]) {
+    assert.equal(Object.hasOwn(legacy, field), false, "旧字段必须被丢弃：" + field);
+  }
+
+  // 非法命令 → null
+  const invalidCommands = [
+    { command: "echo hi", scope: "global", cwd: "" }, // 缺 title
+    { title: "x", command: "", scope: "global", cwd: "" }, // 空 command
+    { title: "x", command: "echo", scope: "bad", cwd: "" }, // 非法 scope
+    { title: "x", command: "echo", scope: "global", cwd: "relative/path" }, // cwd 非绝对
+    { title: "x", command: "echo", scope: "project", projectRoot: "", cwd: "" }, // 项目缺 projectRoot
+    { title: "x", command: "echo", scope: "project", projectRoot: "relative", cwd: "" }, // projectRoot 非绝对
+    { title: "x", command: "echo", scope: "global", cwd: "", env: { "1BAD": "x" } }, // env key 非法
+    { title: "x", command: "echo", scope: "global", cwd: "", env: { OK: 1 } }, // env value 非字符串
+    { title: "x", command: "echo", scope: "global", cwd: "", env: ["A=1"] }, // env 非对象
+    { title: "x", command: "echo", scope: "global", cwd: "", ports: [70000] }, // 端口越界
+    { title: "x", command: "echo", scope: "global", cwd: "", ports: [1.5] }, // 端口非整数
+    { title: "x", command: "echo", scope: "global", cwd: "", ports: [8001], readyPort: 8002 }, // readyPort 不在 ports
+    { title: "x", command: "echo", scope: "global", cwd: "", readyTimeoutMs: 500 }, // 超时越界
+    { id: "self-dep", title: "x", command: "echo", scope: "global", cwd: "", dependsOn: ["self-dep"] } // 依赖自身
+  ];
+  for (const entry of invalidCommands) {
+    assert.equal(normalizeCommand(entry), null, "非法命令应返回 null：" + JSON.stringify(entry));
+  }
+
+  // dependsOn 存在性（传入 allCommands 时）
+  const commandA = normalizeCommand({ id: "a", title: "A", command: "echo a", scope: "global", cwd: "" });
+  assert.ok(commandA);
+  assert.equal(
+    normalizeCommand({ id: "b", title: "B", command: "echo b", scope: "global", cwd: "", dependsOn: ["missing"] }, [commandA]),
+    null,
+    "dependsOn 引用不存在的命令应非法"
+  );
+  const commandB = normalizeCommand({ id: "b", title: "B", command: "echo b", scope: "global", cwd: "", dependsOn: ["a", "a"] }, [commandA]);
+  assert.ok(commandB);
+  assert.deepEqual(commandB.dependsOn, ["a"], "dependsOn 去重");
+
+  // ── 3. normalizeConfig：丢弃非法命令、吞掉未知字段、检测依赖环 ──────────
+  const normalized = normalizeConfig({
+    version: 1,
+    ui: { visible: false },
+    commands: [
+      {
+        id: "a",
+        title: "A",
+        command: "echo a",
+        scope: "global",
+        cwd: "",
+        terminalTitle: "x",
+        utf8CodePage: true,
+        longRunning: true
+      },
+      { id: "bad", title: "", command: "x", scope: "global", cwd: "" },
+      { id: "b", title: "B", command: "echo b", scope: "global", cwd: "", ports: [3000, 3000] }
+    ]
+  });
+  assert.equal(normalized.version, 2);
+  assert.equal(normalized.ui.visible, false);
+  assert.deepEqual(normalized.commands.map((command) => command.id), ["a", "b"]);
+  assert.deepEqual(normalized.commands[1].ports, [3000]);
+  assert.equal(Object.hasOwn(normalized.commands[0], "terminalTitle"), false);
+  assert.equal(Object.hasOwn(normalized.commands[0], "utf8CodePage"), false);
+
+  assert.deepEqual(normalizeConfig(null), defaultConfig());
+  assert.deepEqual(normalizeConfig("bad"), defaultConfig());
+  assert.deepEqual(normalizeConfig({ commands: "bad" }).commands, []);
+
+  // 依赖环：环内命令与依赖它们的命令级联丢弃，剩下的合法
+  const graph = normalizeConfig({
+    commands: [
+      { id: "a", title: "A", command: "echo", scope: "global", cwd: "", dependsOn: ["b"] },
+      { id: "b", title: "B", command: "echo", scope: "global", cwd: "", dependsOn: ["a"] },
+      { id: "c", title: "C", command: "echo", scope: "global", cwd: "", dependsOn: ["a"] },
+      { id: "d", title: "D", command: "echo", scope: "global", cwd: "" }
+    ]
+  });
+  assert.deepEqual(graph.commands.map((command) => command.id), ["d"]);
+
+  // ── 4. loadConfig：非法命令丢弃并给出 errors；保留合法命令 ──────────────
+  const rawPath = path.join(dir, "raw.json");
+  await writeFile(rawPath, JSON.stringify({
+    version: 1,
+    ui: { visible: true },
+    commands: [
+      {
+        id: "ok",
+        title: "OK",
+        command: "echo ok",
+        scope: "global",
+        cwd: "",
+        terminalTitle: "legacy",
+        utf8CodePage: true,
+        longRunning: true
+      },
+      { id: "bad-env", title: "Bad", command: "echo", scope: "global", cwd: "", env: { "1x": "v" } }
+    ]
+  }), "utf8");
+  const loadedRaw = await loadConfig(rawPath);
+  assert.equal(loadedRaw.exists, true);
+  assert.deepEqual(loadedRaw.config.commands.map((command) => command.id), ["ok"]);
+  assert.equal(loadedRaw.errors.length, 1, "加载时应报告被丢弃的命令");
+  assert.equal(Object.hasOwn(loadedRaw.config.commands[0], "terminalTitle"), false);
+
+  const corruptPath = path.join(dir, "corrupt.json");
+  await writeFile(corruptPath, "{not json", "utf8");
+  await assert.rejects(() => loadConfig(corruptPath), /不是合法 JSON/);
+
+  // ── 5. createCommand：默认作用域/projectRoot/cwd/新字段 ─────────────────
+  const created = createCommand(defaultConfig(), { title: "启动开发服务器", command: "pnpm dev" }, "H:\\Limob-windows");
   assert.equal(created.command.scope, "project");
   assert.equal(created.command.projectRoot, "H:\\Limob-windows");
   assert.equal(created.command.cwd, "H:\\Limob-windows");
-  assert.equal(created.command.utf8CodePage, false);
 
-  // 全局命令默认不锁死 cwd（运行时用当前项目路径）
-  const globalCreated = createCommand(created.config, {
-    title: "全局启动",
-    command: "pnpm dev",
-    scope: "global"
-  }, "H:\\Limob-windows");
+  const created2 = createCommand(created.config, {
+    command: "python app.py",
+    scope: "project",
+    projectRoot: "H:/proj2/",
+    ports: [8123],
+    readyPort: 8123,
+    readyTimeoutMs: 5000,
+    env: { APP_PORT: "8123" },
+    dependsOn: [created.command.id]
+  }, undefined);
+  assert.equal(created2.command.scope, "project");
+  assert.equal(created2.command.projectRoot, "H:\\proj2");
+  assert.equal(created2.command.cwd, "H:\\proj2");
+  assert.deepEqual(created2.command.ports, [8123]);
+  assert.equal(created2.command.readyPort, 8123);
+  assert.equal(created2.command.readyTimeoutMs, 5000);
+  assert.deepEqual(created2.command.env, { APP_PORT: "8123" });
+  assert.deepEqual(created2.command.dependsOn, [created.command.id]);
+
+  const globalCreated = createCommand(defaultConfig(), { command: "pnpm dev", scope: "global" }, undefined);
   assert.equal(globalCreated.command.scope, "global");
   assert.equal(globalCreated.command.projectRoot, "");
   assert.equal(globalCreated.command.cwd, "");
 
-  // 中文命令自动 chcp
-  const chinese = createCommand(created.config, {
-    command: "pnpm 客户端-调试"
-  }, "H:\\Limob-windows");
-  assert.equal(chinese.command.utf8CodePage, true);
+  assert.throws(
+    () => createCommand(defaultConfig(), { command: "x", scope: "project" }, undefined),
+    isConfigError,
+    "project 作用域没有 projectRoot/工作区时必须抛错"
+  );
+  assert.throws(() => createCommand(defaultConfig(), { title: "x" }, undefined), isConfigError, "create 缺 command 必须抛错");
 
-  // 项目路径归一化：尾斜杠/正斜杠收敛成稳定形态；项目命令 cwd 默认 projectRoot
-  const trailing = createCommand(created.config, {
-    title: "尾斜杠",
-    command: "npm run dev",
-    scope: "project",
-    projectRoot: "H:/Limob-windows/"
-  }, undefined);
-  assert.equal(trailing.command.projectRoot, "H:\\Limob-windows");
-  assert.equal(trailing.command.cwd, "H:\\Limob-windows");
-
-  // 全局命令不能偷偷保留 projectRoot
-  const globalRoot = createCommand(created.config, {
-    title: "全局带根",
-    command: "echo hi",
-    scope: "global",
-    projectRoot: "H:\\Limob-windows"
-  }, undefined);
-  assert.equal(globalRoot.command.projectRoot, "");
-  assert.equal(globalRoot.command.cwd, "");
-
-  // 更新：按标题找到并改名
-  const updated = updateCommand(chinese.config, "启动开发服务器", { title: "启动开发服务器-改" });
+  // ── 6. updateCommand：id 不可改、依赖校验 ──────────────────────────────
+  const updated = updateCommand(created2.config, created.command.id, { title: "改名", ports: [9000], readyPort: null });
   assert.equal(updated.command.id, created.command.id);
-  assert.equal(updated.command.title, "启动开发服务器-改");
+  assert.equal(updated.command.title, "改名");
+  assert.deepEqual(updated.command.ports, [9000]);
+  assert.equal(updated.command.readyPort, null);
 
-  // 删除
-  const deleted = deleteCommand(updated.config, updated.command.id);
+  const idIgnored = updateCommand(updated.config, created.command.id, { id: "hacked" });
+  assert.equal(idIgnored.command.id, created.command.id, "id 创建后不可改");
+
+  assert.throws(() => updateCommand(updated.config, created.command.id, { dependsOn: ["nope"] }), isConfigError);
+  assert.throws(
+    () => updateCommand(updated.config, created.command.id, { dependsOn: [created2.command.id] }),
+    isConfigError,
+    "A 依赖 B、B 依赖 A 时应检测到环"
+  );
+
+  // ── 7. deleteCommand：级联清理 dependsOn，整份配置仍合法 ────────────────
+  const deleted = deleteCommand(updated.config, created.command.id);
+  assert.equal(deleted.command.id, created.command.id);
   assert.equal(deleted.config.commands.some((command) => command.id === created.command.id), false);
-  assert.equal(deleted.command.title, "启动开发服务器-改");
+  const survivor = deleted.config.commands.find((command) => command.id === created2.command.id);
+  assert.deepEqual(survivor.dependsOn, [], "删除被依赖命令时应级联移除 dependsOn");
 
-  // 保存后读回仍合法
-  const saved = await saveConfigFile(file, deleted.config);
-  assert.equal(saved.commands.length, 5);
+  // ── 8. reorderCommands / setUi / 保存读回 ──────────────────────────────
+  const three = createCommand(deleted.config, { command: "echo third", scope: "global" }, undefined).config;
+  const ids = three.commands.map((command) => command.id);
+  const reordered = reorderCommands(three, [...ids].reverse());
+  assert.deepEqual(reordered.config.commands.map((command) => command.id), [...ids].reverse());
+  assert.throws(() => reorderCommands(three, ids.slice(1)), isConfigError, "缺 id 的排列非法");
+  assert.throws(() => reorderCommands(three, [...ids.slice(1), ids[1]]), isConfigError, "重复 id 的排列非法");
+
+  const hidden = setUi(three, { visible: false }).config;
+  assert.equal(hidden.ui.visible, false);
+  assert.throws(() => setUi(three, { visible: "yes" }), isConfigError);
+  assert.throws(() => setUi(three, {}), isConfigError);
+
+  const saved = await saveConfigFile(file, hidden);
+  const raw = JSON.parse(await readFile(file, "utf8"));
+  assert.equal(raw.version, 2);
+  assert.equal(raw.ui.visible, false);
+  assert.deepEqual(saved.commands.map((command) => command.id), ids);
   const reloaded = await loadConfig(file);
-  assert.equal(reloaded.config.commands.length, 5);
+  assert.equal(reloaded.exists, true);
+  assert.deepEqual(reloaded.errors, []);
+  assert.deepEqual(reloaded.config, saved);
 
-  // 非法配置收敛
-  assert.equal(normalizeConfig({ commands: "bad" }).commands.length, 0);
-  assert.throws(() => createCommand(defaultConfig(), { command: "" }, undefined), /需要 command/);
+  // ── 9. 非法保存：整份配置非法直接抛错，不写盘 ──────────────────────────
+  const validCommand = { id: "x", title: "X", command: "echo x", scope: "global", cwd: "" };
+  const badConfigs = [
+    { version: 2, commands: [validCommand, { ...validCommand, id: "y", env: { "bad-key": "1" } }] },
+    { version: 2, commands: [validCommand, { ...validCommand, id: "y", ports: [8001], readyPort: 8002 }] },
+    { version: 2, commands: [validCommand, { ...validCommand, id: "y", dependsOn: ["nope"] }] },
+    {
+      version: 2,
+      commands: [
+        { ...validCommand, id: "a", dependsOn: ["b"] },
+        { ...validCommand, id: "b", dependsOn: ["a"] }
+      ]
+    },
+    { version: 2, commands: [validCommand, { ...validCommand, id: "dupe" }, { ...validCommand, id: "dupe" }] },
+    { version: 2, ui: { visible: "yes" }, commands: [validCommand] },
+    { version: 2, commands: [{ ...validCommand, cwd: "relative" }] }
+  ];
+  for (const bad of badConfigs) {
+    const target = path.join(dir, "bad-" + Math.random().toString(36).slice(2) + ".json");
+    await assert.rejects(() => saveConfigFile(target, bad), ConfigError, "非法配置保存必须抛错：" + JSON.stringify(bad).slice(0, 120));
+  }
 
-  console.log(JSON.stringify({ ok: true, file, commands: saved.commands.length }, null, 2));
+  // ── 10. 路径工具与 findCommand ─────────────────────────────────────────
+  assert.equal(normalizePath("H:/Proj/Sub/"), "h:\\proj\\sub");
+  assert.equal(normalizePath(""), "");
+  assert.equal(cleanProjectPath("H:/Proj/Sub/"), "H:\\Proj\\Sub");
+  assert.equal(cleanProjectPath("H:\\"), "H:\\");
+  assert.equal(cleanProjectPath("H:/"), "H:\\");
+  assert.equal(cleanProjectPath(""), "");
+
+  assert.equal(findCommand(three, ids[0]).id, ids[0]);
+  assert.equal(findCommand(three, three.commands[0].title.toUpperCase()).id, ids[0]);
+  assert.equal(findCommand(three, "不存在的命令"), undefined);
+
+  console.log(JSON.stringify({
+    ok: true,
+    file,
+    commandsSaved: saved.commands.length,
+    invalidCommandCases: invalidCommands.length,
+    invalidSaveCases: badConfigs.length
+  }, null, 2));
 } finally {
   await rm(dir, { recursive: true, force: true });
 }

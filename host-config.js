@@ -1,86 +1,49 @@
-// dsh-runner 的宿主侧配置存储（不依赖 DSH 运行时，方便离线测试）。
+// dsh-runner 宿主侧配置存储（配置模型 version 2）。
 //
-// 为什么需要它：
-//   浏览器端插件的配置原本只存在 localStorage 里，AI（Host 侧的 Agent）看不到；
-//   为了让 AI 能直接创建/修改运行命令，把配置改存到 Host 侧 JSON 文件，
-//   浏览器通过 RPC 读写同一个文件，AI 通过 Tool 读写同一个文件。
+// 数据流：AI Tool / 浏览器设置页 -> 本文件的 CRUD -> commands.json
+//         进程启动时由 index.js 读取，runner 只消费归一化后的命令对象。
 //
-// 数据流：AI Tool / 浏览器设置页  ->  本文件的 CRUD  ->  commands.json
-//         启动时浏览器 RPC config/get 读取它，写操作 RPC config/save 回写它。
+// 约定（与 SPEC 第 1 节一致）：
+//   - 配置文件固定 ~/.dsh/dsh-runner/commands.json，没有环境变量覆盖、没有旧路径迁移。
+//   - 加载时非法命令丢弃并返回错误说明（由 Host 记日志）；保存时整份配置必须合法，非法直接抛错。
+//   - 归一化时忽略未知字段（旧文件里的 terminalTitle/utf8CodePage/longRunning 等直接丢弃，不回写）。
+//   - 可选字段的缺省值不是兼容分支：env/ports/readyPort/readyTimeoutMs/dependsOn/enabled。
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 
-export const CONFIG_VERSION = 1;
+export const CONFIG_VERSION = 2;
+const DEFAULT_READY_TIMEOUT_MS = 120000;
+const MIN_READY_TIMEOUT_MS = 1000;
+const MAX_READY_TIMEOUT_MS = 1800000;
+const MAX_PORT = 65535;
+const ENV_KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const SCOPES = new Set(["project", "global"]);
 
-// 与 client.js 的 BUILTIN_COMMANDS 保持一致（同一份默认命令的宿主侧副本）。
-// 为什么保留副本：Host 与浏览器是两个独立的 JS 运行时，无法共享同一个模块；
-// 修改默认命令时两边要一起改（README 的「开发与测试」里会提醒）。
-const BUILTIN_COMMANDS = [
-  {
-    id: "dev",
-    title: "开发调试",
-    terminalTitle: "Limob-dev",
-    cwd: "H:\\Limob-windows",
-    command: "pnpm 客户端-调试",
-    scope: "global",
-    projectRoot: "",
-    enabled: true,
-    utf8CodePage: true,
-    longRunning: true
-  },
-  {
-    id: "cargo-check",
-    title: "Rust 检查（cargo check）",
-    terminalTitle: "Limob-cargo-check",
-    cwd: "H:\\Limob-windows\\src-tauri",
-    command: "cargo check",
-    scope: "global",
-    projectRoot: "",
-    enabled: true,
-    utf8CodePage: false,
-    longRunning: false
-  },
-  {
-    id: "build-debug",
-    title: "快速构建（tauri build --debug）",
-    terminalTitle: "Limob-build-debug",
-    cwd: "H:\\Limob-windows",
-    command: "pnpm exec tauri build --debug --no-bundle",
-    scope: "global",
-    projectRoot: "",
-    enabled: true,
-    utf8CodePage: true,
-    longRunning: true
-  },
-  {
-    id: "build-release",
-    title: "正式构建（pnpm 构建桌面端）",
-    terminalTitle: "Limob-build-release",
-    cwd: "H:\\Limob-windows",
-    command: "pnpm 构建桌面端",
-    scope: "global",
-    projectRoot: "",
-    enabled: true,
-    utf8CodePage: true,
-    longRunning: true
+/** 配置校验错误（调用方据此返回 bad-request；普通 I/O 错误不会用它）。 */
+export class ConfigError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "ConfigError";
   }
-];
-
-/** 新建命令的稳定 id（只要求不重复，不参与业务判断）。 */
-function makeId() {
-  return "cmd-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
 }
 
-/** 默认配置：4 条内置全局命令 + 运行按钮显示。 */
-export function defaultConfig() {
-  return {
-    version: CONFIG_VERSION,
-    commands: BUILTIN_COMMANDS.map((command) => Object.assign({}, command)),
-    ui: { visible: true }
-  };
+let tempCounter = 0;
+
+function isPlainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-/** 路径比较用的归一化：统一反斜杠、去掉末尾斜杠、小写。 */
+function makeId(existingIds) {
+  for (;;) {
+    const id = "cmd-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
+    if (existingIds === undefined || !existingIds.has(id)) return id;
+  }
+}
+
+/**
+ * 路径比较用归一化：统一反斜杠、去掉末尾斜杠、小写。
+ * 只用于比较，不用于存储。
+ */
 export function normalizePath(value) {
   return String(value === undefined || value === null ? "" : value)
     .trim()
@@ -89,90 +52,354 @@ export function normalizePath(value) {
     .toLowerCase();
 }
 
-/** 存储用的项目路径形态：保留大小写，统一反斜杠，去掉非根目录的末尾斜杠。 */
+/**
+ * 存储用路径形态：统一反斜杠、去掉非根目录的末尾斜杠、保留大小写。
+ * 盘符根目录保留为 "H:\"，与 normalizePath 的 "h:" 不同（后者只用于比较）。
+ */
 export function cleanProjectPath(value) {
   const text = String(value === undefined || value === null ? "" : value).trim().replace(/\//g, "\\");
   if (text === "") return "";
-  if (/^[a-zA-Z]:\\?$/.test(text)) return text.replace(/\\+$/g, "") + "\\";
+  if (/^[a-zA-Z]:\\?$/.test(text)) return text.slice(0, 2) + "\\";
   return text.replace(/\\+$/g, "");
 }
 
+/** 是否绝对路径（Windows 盘符/UNC/根路径都算；相对路径拒绝）。 */
+function isAbsolutePath(value) {
+  return typeof value === "string" && value !== "" && path.isAbsolute(value);
+}
+
+function normalizeEnv(raw) {
+  if (raw === undefined || raw === null) return { env: {} };
+  if (!isPlainObject(raw)) return { error: "env 必须是对象（Record<string,string>）" };
+  const env = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (!ENV_KEY_PATTERN.test(key)) {
+      return { error: "env 键不合法：" + key + "（必须匹配 " + ENV_KEY_PATTERN.source + "）" };
+    }
+    if (typeof value !== "string") {
+      return { error: "env[" + key + "] 必须是字符串（数字/布尔请由调用方转成字符串）" };
+    }
+    env[key] = value;
+  }
+  return { env };
+}
+
+function normalizePorts(raw) {
+  if (raw === undefined || raw === null) return { ports: [] };
+  if (!Array.isArray(raw)) return { error: "ports 必须是整数数组" };
+  const ports = [];
+  for (const value of raw) {
+    if (!Number.isInteger(value) || value < 0 || value > MAX_PORT) {
+      return { error: "ports 的每一项必须是 0–" + MAX_PORT + " 的整数（收到 " + String(value) + "）" };
+    }
+    if (ports.indexOf(value) === -1) ports.push(value);
+  }
+  return { ports };
+}
+
+function normalizeReadyPort(raw, ports) {
+  if (raw === undefined || raw === null) return { readyPort: null };
+  if (!Number.isInteger(raw) || raw < 0 || raw > MAX_PORT) {
+    return { error: "readyPort 必须是 0–" + MAX_PORT + " 的整数或 null" };
+  }
+  if (ports.indexOf(raw) === -1) {
+    return { error: "readyPort " + raw + " 必须出现在 ports 里" };
+  }
+  return { readyPort: raw };
+}
+
+function normalizeReadyTimeoutMs(raw) {
+  if (raw === undefined || raw === null) return { readyTimeoutMs: DEFAULT_READY_TIMEOUT_MS };
+  if (!Number.isInteger(raw) || raw < MIN_READY_TIMEOUT_MS || raw > MAX_READY_TIMEOUT_MS) {
+    return { error: "readyTimeoutMs 必须是 " + MIN_READY_TIMEOUT_MS + "–" + MAX_READY_TIMEOUT_MS + " 的整数" };
+  }
+  return { readyTimeoutMs: raw };
+}
+
+function normalizeDependsOn(raw, selfId) {
+  if (raw === undefined || raw === null) return { dependsOn: [] };
+  if (!Array.isArray(raw)) return { error: "dependsOn 必须是命令 id 数组" };
+  const dependsOn = [];
+  for (const value of raw) {
+    if (typeof value !== "string" || value.trim() === "") {
+      return { error: "dependsOn 的每一项必须是非空命令 id" };
+    }
+    const id = value.trim();
+    if (id === selfId) return { error: "dependsOn 不能包含自身" };
+    if (dependsOn.indexOf(id) === -1) dependsOn.push(id);
+  }
+  return { dependsOn };
+}
+
 /**
- * 把任意来源（AI 参数、旧 JSON、浏览器配置）的命令对象收敛成稳定结构。
- * 返回 null 表示这条命令不合法（缺名称/命令，或者项目作用域缺项目路径）。
+ * 把单个命令对象归一化成稳定结构。
+ * 返回 {command} 或 {error}（error 是可读的非法原因）。
+ * allCommands 传入时额外校验 dependsOn 引用存在性；整个配置的环检测在 normalizeConfigDetailed 里做。
  */
-export function normalizeCommand(raw) {
-  if (raw === null || raw === undefined || typeof raw !== "object") return null;
+function normalizeCommandDetailed(raw, allCommands) {
+  if (!isPlainObject(raw)) return { error: "命令必须是对象" };
   const title = typeof raw.title === "string" ? raw.title.trim() : "";
-  const command = typeof raw.command === "string" ? raw.command.trim() : "";
-  if (title === "" || command === "") return null;
-  const id = typeof raw.id === "string" && raw.id !== "" ? raw.id : makeId();
-  const scope = raw.scope === "project" ? "project" : "global";
-  const projectRoot = cleanProjectPath(typeof raw.projectRoot === "string" ? raw.projectRoot : "");
-  if (scope === "project" && projectRoot === "") return null;
-  const cwd = typeof raw.cwd === "string" && raw.cwd.trim() !== ""
-    ? cleanProjectPath(raw.cwd)
-    : (scope === "project" ? projectRoot : "");
+  if (title === "") return { error: "title 必须是非空字符串" };
+  const commandText = typeof raw.command === "string" ? raw.command.trim() : "";
+  if (commandText === "") return { error: "command 必须是非空字符串" };
+  if (typeof raw.scope !== "string" || !SCOPES.has(raw.scope)) {
+    return { error: "scope 必须是 \"project\" 或 \"global\"" };
+  }
+  const scope = raw.scope;
+  const hasAllCommands = Array.isArray(allCommands);
+  const existingIds = new Set(
+    hasAllCommands
+      ? allCommands.filter((item) => isPlainObject(item) && typeof item.id === "string").map((item) => item.id)
+      : []
+  );
+  let id;
+  if (raw.id === undefined || raw.id === null) {
+    id = makeId(existingIds);
+  } else if (typeof raw.id === "string" && raw.id.trim() !== "") {
+    id = raw.id.trim();
+  } else {
+    return { error: "id 必须是非空字符串" };
+  }
+
+  let projectRoot = "";
+  if (scope === "project") {
+    if (raw.projectRoot !== undefined && raw.projectRoot !== null && typeof raw.projectRoot !== "string") {
+      return { error: "projectRoot 必须是字符串" };
+    }
+    projectRoot = cleanProjectPath(raw.projectRoot);
+    if (projectRoot === "") return { error: "项目作用域命令必须提供 projectRoot" };
+    if (!isAbsolutePath(projectRoot)) return { error: "projectRoot 必须是绝对路径：" + projectRoot };
+  }
+
+  if (raw.cwd !== undefined && raw.cwd !== null && typeof raw.cwd !== "string") {
+    return { error: "cwd 必须是字符串" };
+  }
+  const cwdRaw = typeof raw.cwd === "string" ? raw.cwd.trim() : "";
+  const cwd = cwdRaw === "" ? "" : cleanProjectPath(cwdRaw);
+  if (cwd !== "" && !isAbsolutePath(cwd)) return { error: "cwd 必须是绝对路径或空字符串：" + cwd };
+
+  if (raw.enabled !== undefined && typeof raw.enabled !== "boolean") {
+    return { error: "enabled 必须是布尔值" };
+  }
+  const enabled = raw.enabled !== false;
+
+  const envResult = normalizeEnv(raw.env);
+  if (envResult.error !== undefined) return { error: envResult.error };
+  const portsResult = normalizePorts(raw.ports);
+  if (portsResult.error !== undefined) return { error: portsResult.error };
+  const readyPortResult = normalizeReadyPort(raw.readyPort, portsResult.ports);
+  if (readyPortResult.error !== undefined) return { error: readyPortResult.error };
+  const timeoutResult = normalizeReadyTimeoutMs(raw.readyTimeoutMs);
+  if (timeoutResult.error !== undefined) return { error: timeoutResult.error };
+  const dependsResult = normalizeDependsOn(raw.dependsOn, id);
+  if (dependsResult.error !== undefined) return { error: dependsResult.error };
+
+  if (hasAllCommands) {
+    for (const dependencyId of dependsResult.dependsOn) {
+      if (!existingIds.has(dependencyId)) {
+        return { error: "dependsOn 引用了不存在的命令：" + dependencyId };
+      }
+    }
+  }
+
   return {
-    id: id,
-    title: title,
-    terminalTitle: typeof raw.terminalTitle === "string" ? raw.terminalTitle.trim() : "",
-    cwd: cwd,
-    command: command,
-    scope: scope,
-    projectRoot: scope === "project" ? projectRoot : "",
-    enabled: raw.enabled !== false,
-    utf8CodePage: raw.utf8CodePage === true || /[^\x00-\x7f]/.test(command),
-    longRunning: raw.longRunning === true
+    command: {
+      id: id,
+      title: title,
+      command: commandText,
+      cwd: cwd,
+      scope: scope,
+      projectRoot: projectRoot,
+      enabled: enabled,
+      env: envResult.env,
+      ports: portsResult.ports,
+      readyPort: readyPortResult.readyPort,
+      readyTimeoutMs: timeoutResult.readyTimeoutMs,
+      dependsOn: dependsResult.dependsOn
+    }
   };
 }
 
-/** 收敛整份配置；commands 非法项直接丢弃，保持列表可渲染。 */
-export function normalizeConfig(raw) {
-  if (raw === null || raw === undefined || typeof raw !== "object") return defaultConfig();
+/** 归一化单条命令；非法返回 null。allCommands 用于 dependsOn 存在性校验。 */
+export function normalizeCommand(raw, allCommands) {
+  const detailed = normalizeCommandDetailed(raw, allCommands);
+  return detailed.error === undefined ? detailed.command : null;
+}
+
+/** 找出所有处于依赖环里的命令 id。 */
+function findCyclicIds(commands) {
+  const byId = new Map(commands.map((command) => [command.id, command]));
+  const state = new Map(); // 0/未访问、1/访问中、2/已完成
+  const cyclic = new Set();
+  const visit = (id, stack) => {
+    const current = state.get(id) || 0;
+    if (current === 1) {
+      const index = stack.indexOf(id);
+      for (let position = index; position < stack.length; position += 1) cyclic.add(stack[position]);
+      return;
+    }
+    if (current === 2) return;
+    state.set(id, 1);
+    stack.push(id);
+    const command = byId.get(id);
+    if (command !== undefined) {
+      for (const dependencyId of command.dependsOn) visit(dependencyId, stack);
+    }
+    stack.pop();
+    state.set(id, 2);
+  };
+  for (const command of commands) visit(command.id, []);
+  return cyclic;
+}
+
+/**
+ * 整份配置归一化。
+ * strict=true 时遇到任何非法直接抛 ConfigError（保存用）；
+ * strict=false 时丢弃非法命令并把原因写进 errors（加载用）。
+ */
+function normalizeConfigDetailed(raw, strict) {
+  const fail = (message) => {
+    if (strict) throw new ConfigError(message);
+    errors.push(message);
+  };
+  const errors = [];
+  if (!isPlainObject(raw)) {
+    fail("配置根节点必须是对象");
+    return { config: defaultConfig(), errors: errors };
+  }
+
+  const rawCommands = raw.commands;
+  if (rawCommands !== undefined && rawCommands !== null && !Array.isArray(rawCommands)) {
+    fail("commands 必须是数组");
+  }
+  const entries = Array.isArray(rawCommands) ? rawCommands : [];
+
   const commands = [];
-  if (Array.isArray(raw.commands)) {
-    for (const item of raw.commands) {
-      const normalized = normalizeCommand(item);
-      if (normalized !== null) commands.push(normalized);
+  const seenIds = new Set();
+  for (let index = 0; index < entries.length; index += 1) {
+    const detailed = normalizeCommandDetailed(entries[index]);
+    if (detailed.error !== undefined) {
+      fail("第 " + (index + 1) + " 条命令已丢弃：" + detailed.error);
+      continue;
+    }
+    if (seenIds.has(detailed.command.id)) {
+      fail("第 " + (index + 1) + " 条命令的 id 重复：" + detailed.command.id);
+      continue;
+    }
+    seenIds.add(detailed.command.id);
+    commands.push(detailed.command);
+  }
+
+  // dependsOn 引用缺失 / 环：反复清理直到稳定（删除命令会让依赖它的命令也变非法）。
+  for (;;) {
+    let changed = false;
+    const ids = new Set(commands.map((command) => command.id));
+    const referencedOk = [];
+    for (const command of commands) {
+      const missing = command.dependsOn.find((dependencyId) => !ids.has(dependencyId));
+      if (missing !== undefined) {
+        fail("命令「" + command.title + "」的 dependsOn 引用了不存在的命令：" + missing);
+        changed = true;
+        continue;
+      }
+      referencedOk.push(command);
+    }
+    commands.length = 0;
+    commands.push(...referencedOk);
+
+    const cyclic = findCyclicIds(commands);
+    if (cyclic.size > 0) {
+      const labels = [...cyclic].join("、");
+      fail("dependsOn 存在环，涉及命令：" + labels);
+      const remaining = commands.filter((command) => !cyclic.has(command.id));
+      commands.length = 0;
+      commands.push(...remaining);
+      changed = true;
+    }
+    if (!changed) break;
+  }
+
+  const uiRaw = raw.ui;
+  let visible = true;
+  if (uiRaw !== undefined && uiRaw !== null) {
+    if (!isPlainObject(uiRaw)) {
+      fail("ui 必须是对象");
+    } else if (uiRaw.visible !== undefined) {
+      if (typeof uiRaw.visible !== "boolean") fail("ui.visible 必须是布尔值");
+      else visible = uiRaw.visible;
     }
   }
-  const ui = raw.ui !== null && typeof raw.ui === "object" ? raw.ui : {};
+
+  return {
+    config: {
+      version: CONFIG_VERSION,
+      ui: { visible: visible },
+      commands: commands
+    },
+    errors: errors
+  };
+}
+
+/** 整份配置归一化（加载语义：非法命令丢弃）。 */
+export function normalizeConfig(raw) {
+  return normalizeConfigDetailed(raw, false).config;
+}
+
+/** 默认配置：空命令列表 + 运行按钮显示（不再内置任何默认命令）。 */
+export function defaultConfig() {
   return {
     version: CONFIG_VERSION,
-    commands: commands,
-    ui: { visible: ui.visible !== false }
+    ui: { visible: true },
+    commands: []
   };
 }
 
 /**
  * 读取配置文件。
- * 返回 {exists, config, error?}；文件不存在时给默认配置，便于 Tool 直接 create。
+ * - 文件不存在：{exists:false, config:默认空配置, errors:[]}
+ * - JSON 损坏 / 根节点不是对象：抛错（不静默兜底）
+ * - 非法命令：丢弃并放进 errors（由调用方记日志）
  */
 export async function loadConfig(filePath) {
+  let text;
   try {
-    const text = await readFile(filePath, "utf8");
-    const parsed = JSON.parse(text);
-    return { exists: true, config: normalizeConfig(parsed) };
+    text = await readFile(filePath, "utf8");
   } catch (error) {
     if (error !== null && error !== undefined && error.code === "ENOENT") {
-      return { exists: false, config: defaultConfig() };
+      return { exists: false, config: defaultConfig(), errors: [] };
     }
-    return { exists: false, config: defaultConfig(), error: String(error) };
+    throw new Error("读取配置文件失败：" + filePath + "：" + (error instanceof Error ? error.message : String(error)));
   }
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    throw new Error("配置文件不是合法 JSON：" + filePath + "：" + (error instanceof Error ? error.message : String(error)));
+  }
+  if (!isPlainObject(parsed)) {
+    throw new Error("配置文件根节点必须是对象：" + filePath);
+  }
+  const detailed = normalizeConfigDetailed(parsed, false);
+  return { exists: true, config: detailed.config, errors: detailed.errors };
 }
 
-/** 原子写入配置文件（先写临时文件再 rename，避免 AI/浏览器同时写坏 JSON）。 */
+/** 整份配置严格校验；非法抛 ConfigError，合法返回归一化后的配置。 */
+export function validateConfig(raw) {
+  return normalizeConfigDetailed(raw, true).config;
+}
+
+/** 原子写入配置文件（严格校验；非法直接抛错，不写盘）。 */
 export async function saveConfigFile(filePath, raw) {
-  const config = normalizeConfig(raw);
+  const config = validateConfig(raw);
   await mkdir(path.dirname(filePath), { recursive: true });
-  const tempPath = filePath + ".tmp";
+  tempCounter += 1;
+  const tempPath = filePath + "." + String(process.pid) + "." + String(tempCounter) + ".tmp";
   await writeFile(tempPath, JSON.stringify(config, null, 2), "utf8");
   await rename(tempPath, filePath);
   return config;
 }
 
-/** 从命令的 title 生成默认标题（AI 只给 command 时用）。 */
+/** 从命令文本生成默认标题（AI 只给 command 时用）。 */
 function defaultTitle(command) {
   const value = String(command === undefined || command === null ? "" : command).trim();
   if (value === "") return "启动命令";
@@ -180,77 +407,129 @@ function defaultTitle(command) {
 }
 
 /**
- * 新增命令。项目作用域的默认值来自调用方所在会话的工作区：
- * AI 在 A 项目里说“创建启动命令”，就不需要再手写 projectRoot。
+ * 新增命令。
+ * scope 默认 project（有 workspacePath 时）否则 global；project 的 projectRoot 默认 workspacePath；
+ * cwd 默认 projectRoot（global 默认空，运行时用当前项目路径）。
  */
 export function createCommand(config, input, workspacePath) {
-  if (input === null || input === undefined || typeof input !== "object") {
-    throw new Error("create 需要参数对象");
-  }
+  if (!isPlainObject(input)) throw new ConfigError("create 需要参数对象");
   const commandText = typeof input.command === "string" ? input.command.trim() : "";
-  if (commandText === "") throw new Error("create 需要 command（要执行的命令）");
-  const workspace = typeof workspacePath === "string" && workspacePath.trim() !== ""
-    ? workspacePath.trim()
-    : undefined;
-  const scope = input.scope === "global" ? "global" : (input.scope === "project" ? "project" : (workspace !== undefined ? "project" : "global"));
-  const projectRoot = scope === "project"
-    ? (typeof input.projectRoot === "string" && input.projectRoot.trim() !== "" ? input.projectRoot.trim() : (workspace || ""))
-    : "";
-  if (scope === "project" && projectRoot === "") {
-    throw new Error("项目作用域需要 projectRoot：请从当前工作区调用，或显式传 projectRoot");
+  if (commandText === "") throw new ConfigError("create 需要 command（要执行的命令）");
+  if (input.scope !== undefined && (typeof input.scope !== "string" || !SCOPES.has(input.scope))) {
+    throw new ConfigError("scope 必须是 \"project\" 或 \"global\"");
   }
-  const command = normalizeCommand({
-    id: makeId(),
-    title: typeof input.title === "string" && input.title.trim() !== "" ? input.title : defaultTitle(commandText),
+  const workspace = typeof workspacePath === "string" && workspacePath.trim() !== ""
+    ? cleanProjectPath(workspacePath)
+    : "";
+  const scope = input.scope !== undefined ? input.scope : (workspace !== "" ? "project" : "global");
+
+  if (scope === "project" && input.projectRoot !== undefined && input.projectRoot !== null && typeof input.projectRoot !== "string") {
+    throw new ConfigError("projectRoot 必须是字符串");
+  }
+  let projectRoot = "";
+  if (scope === "project") {
+    projectRoot = cleanProjectPath(input.projectRoot);
+    if (projectRoot === "") projectRoot = workspace;
+    if (projectRoot === "") {
+      throw new ConfigError("项目作用域需要 projectRoot：请从当前工作区调用，或显式传 projectRoot");
+    }
+  }
+
+  if (input.cwd !== undefined && input.cwd !== null && typeof input.cwd !== "string") {
+    throw new ConfigError("cwd 必须是字符串");
+  }
+  const cwdInput = typeof input.cwd === "string" ? input.cwd.trim() : "";
+  const cwd = cwdInput !== "" ? cleanProjectPath(cwdInput) : (scope === "project" ? projectRoot : "");
+
+  const title = typeof input.title === "string" && input.title.trim() !== "" ? input.title : defaultTitle(commandText);
+  const candidate = {
+    id: makeId(new Set(config.commands.map((command) => command.id))),
+    title: title,
     command: commandText,
-    // 全局命令默认不锁死 cwd：运行时使用当前项目路径；项目命令才默认项目目录。
-    cwd: typeof input.cwd === "string" && input.cwd.trim() !== ""
-      ? input.cwd
-      : (scope === "project" ? (projectRoot || workspace || "") : ""),
+    cwd: cwd,
     scope: scope,
     projectRoot: projectRoot,
-    terminalTitle: input.terminalTitle,
-    enabled: input.enabled !== false,
-    utf8CodePage: input.utf8CodePage
-  });
-  if (command === null) throw new Error("命令不合法：请检查名称、工作目录和命令");
-  return {
-    config: Object.assign({}, config, { commands: config.commands.concat([command]) }),
-    command: command
+    enabled: input.enabled,
+    env: input.env,
+    ports: input.ports,
+    readyPort: input.readyPort,
+    readyTimeoutMs: input.readyTimeoutMs,
+    dependsOn: input.dependsOn
   };
+  const detailed = normalizeCommandDetailed(candidate, config.commands);
+  if (detailed.error !== undefined) throw new ConfigError("命令不合法：" + detailed.error);
+  const next = { ...config, commands: config.commands.concat([detailed.command]) };
+  return { config: validateConfig(next), command: detailed.command };
 }
 
-/** 按 id 或标题查找命令（AI 通常先 list 拿到 id，也允许直接用标题）。 */
+/** 按 id 或标题查找命令（RPC 用 id；Tool 允许用标题给 AI 兜底）。 */
 export function findCommand(config, idOrTitle) {
   const key = String(idOrTitle === undefined || idOrTitle === null ? "" : idOrTitle).trim();
   if (key === "") return undefined;
-  return config.commands.find((command) => command.id === key)
-    || config.commands.find((command) => command.title.toLowerCase() === key.toLowerCase());
+  const byId = config.commands.find((command) => command.id === key);
+  if (byId !== undefined) return byId;
+  const folded = key.toLowerCase();
+  return config.commands.find((command) => command.title.toLowerCase() === folded);
 }
 
-/** 修改命令；未提供的字段保持原值。 */
-export function updateCommand(config, idOrTitle, patch) {
-  const target = findCommand(config, idOrTitle);
-  if (target === undefined) throw new Error("找不到要修改的命令：" + String(idOrTitle));
-  const merged = Object.assign({}, target, patch, { id: target.id });
-  const normalized = normalizeCommand(merged);
-  if (normalized === null) throw new Error("修改后的命令不合法：请检查名称、工作目录、命令和项目路径");
-  return {
-    config: Object.assign({}, config, {
-      commands: config.commands.map((command) => (command.id === target.id ? normalized : command))
-    }),
-    command: normalized
+/** 修改命令；id 不可改，未提供的字段保持原值。 */
+export function updateCommand(config, id, patch) {
+  const target = findCommand(config, id);
+  if (target === undefined) throw new ConfigError("找不到要修改的命令：" + String(id));
+  if (!isPlainObject(patch)) throw new ConfigError("update 需要 patch 对象");
+  const merged = { ...target };
+  for (const [key, value] of Object.entries(patch)) {
+    if (value !== undefined) merged[key] = value;
+  }
+  merged.id = target.id;
+  const detailed = normalizeCommandDetailed(merged, config.commands);
+  if (detailed.error !== undefined) throw new ConfigError("修改后的命令不合法：" + detailed.error);
+  const next = {
+    ...config,
+    commands: config.commands.map((command) => (command.id === target.id ? detailed.command : command))
   };
+  return { config: validateConfig(next), command: detailed.command };
 }
 
-/** 删除命令；返回删除后的配置和被删命令，方便 Tool 汇报。 */
-export function deleteCommand(config, idOrTitle) {
-  const target = findCommand(config, idOrTitle);
-  if (target === undefined) throw new Error("找不到要删除的命令：" + String(idOrTitle));
-  return {
-    config: Object.assign({}, config, {
-      commands: config.commands.filter((command) => command.id !== target.id)
-    }),
-    command: target
-  };
+/**
+ * 删除命令；同时从其它命令的 dependsOn 里移除被删 id（否则整份配置会因悬空依赖而非法）。
+ * 这是契约未明说的必要行为，报告里会注明。
+ */
+export function deleteCommand(config, id) {
+  const target = findCommand(config, id);
+  if (target === undefined) throw new ConfigError("找不到要删除的命令：" + String(id));
+  const commands = config.commands
+    .filter((command) => command.id !== target.id)
+    .map((command) => {
+      if (command.dependsOn.indexOf(target.id) === -1) return command;
+      return { ...command, dependsOn: command.dependsOn.filter((dependencyId) => dependencyId !== target.id) };
+    });
+  return { config: validateConfig({ ...config, commands: commands }), command: target };
+}
+
+/** 重排命令；ids 必须是现有 id 的完整排列。 */
+export function reorderCommands(config, ids) {
+  if (!Array.isArray(ids)) throw new ConfigError("reorder 需要 ids 数组");
+  const currentIds = config.commands.map((command) => command.id);
+  if (ids.length !== currentIds.length) {
+    throw new ConfigError("reorder 的 ids 必须是现有命令 id 的完整排列");
+  }
+  const seen = new Set();
+  for (const id of ids) {
+    if (typeof id !== "string" || currentIds.indexOf(id) === -1) {
+      throw new ConfigError("reorder 的 ids 包含未知命令：" + String(id));
+    }
+    if (seen.has(id)) throw new ConfigError("reorder 的 ids 有重复：" + id);
+    seen.add(id);
+  }
+  const byId = new Map(config.commands.map((command) => [command.id, command]));
+  return { config: { ...config, commands: ids.map((id) => byId.get(id)) } };
+}
+
+/** 设置 UI 状态（只接受布尔 visible）。 */
+export function setUi(config, patch) {
+  if (!isPlainObject(patch)) throw new ConfigError("ui 需要 {visible} 对象");
+  if (patch.visible === undefined) throw new ConfigError("ui 需要 visible（布尔值）");
+  if (typeof patch.visible !== "boolean") throw new ConfigError("visible 必须是布尔值");
+  return { config: { ...config, ui: { visible: patch.visible } } };
 }

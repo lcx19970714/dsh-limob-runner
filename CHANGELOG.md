@@ -1,8 +1,49 @@
 # Changelog
 
+## 0.12.0
+
+### Added（VS Code 式「运行」面板）
+
+- **左侧导航「运行」面板**（`sidebar.panellist` + `main` 页）：按项目列出服务，每行显示状态、
+  端口、运行时长、退出码，行内提供**启动 / 停止 / 重启**；顶部提供**启动全部 / 停止全部 / 刷新 / 管理命令**。
+- **单一日志视图**：选中命令后每秒轮询 Host 日志，去掉 ANSI、自动贴底、支持清空/复制；
+  不再依赖 DSH 右侧终端，也不再每命令/每会话开一个 tail 终端。
+- **端口模型**：命令声明 `ports`；启动前预检，占用时返回 `port-conflict`（PID/进程名/命令行/是否托管）；
+  面板提供 `project/diagnose` 端口诊断，未托管占用可一键 `project/killPort`（托管进程拒绝误杀）。
+- **就绪判定**：`readyPort` + `readyTimeoutMs`，端口可连接才算启动成功；超时结束进程并报错。
+- **依赖编排**：`dependsOn` 递归启动 + `startAll` 拓扑序。
+- **结构化环境变量**：`env` 直接注入子进程，不再把 `$env:X=...` 拼进命令文本。
+- **AI 工具 `dsh_runner_run`**：status/start/stop/restart/startAll/stopAll/diagnose/log，默认使用会话所属工作区；
+  工具描述明确「长驻服务用本工具，不要用终端工具」。
+- **RPC 细化为 per-action**：`config/get|create|update|delete|reorder|ui`，Host 是唯一写入方；
+  `project/status|start|stop|restart|startAll|stopAll|diagnose|killPort|log|log/clear`。
+
+### Changed
+
+- **Client 不再有本地配置/归一化**：删除 localStorage 配置缓存、双份 `normalizeCommand`、防抖写回与
+  页面隐藏 flush；配置只从 Host 读取，写操作走 CRUD RPC，避免多写者互相覆盖。
+- **错误显式化**：RPC 失败一律 throw（code/details 透传）；Client 不再有「返回 undefined 当没事发生」的兜底；
+  端口冲突/依赖失败直接在面板错误条展示。
+- Host 运行器延续 0.11 的进程模型：项目级 key、状态机、stop 返回前落状态、pid+命令行标记重启接管、
+  日志直接落盘、插件卸载只落盘不杀进程。
+
+### Removed（不做兼容冗余）
+
+- 右侧「跟随日志」终端、`ProjectTailKeeper`、项目终端注册表、`Get-Content -Wait` 相关全部代码与依赖
+  （`sidebarRight`/`webTerminals`/`remote.terminal` 不再使用）。
+- 旧配置路径迁移、`DSH_RUNNER_CONFIG` 环境变量、内置 Limob 默认命令、`terminalTitle`/`utf8CodePage`/`longRunning`。
+- 旧会话级终端执行路径、旧 `global/*` RPC、`disposeAll`。
+
+### Breaking
+
+- 配置升级到 `version 2`：旧文件仍可读取（未知字段忽略、可选字段按空/默认），但 `ports`/`readyPort`
+  需要手动补上才能获得端口预检与就绪等待。
+- 日志不再出现在 DSH 右侧终端：统一在左侧「运行」面板查看；需要交互式终端仍可使用 DSH 自带终端。
+
 ## 0.11.0
 
 ### Fixed（按第一性原理重构项目级运行器）
+
 
 - **停止立即生效**：`stop()/stopProject()` 在返回前把状态推进到 `stopped`，并等待子进程退出；
   不再出现「提示已停止、进程仍在跑」，也不会因为状态滞后让 tail 终端被重新补开。

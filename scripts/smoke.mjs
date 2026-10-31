@@ -1,11 +1,14 @@
-// dsh-runner 的离线冒烟测试（CI 与本地都用它）。
+// dsh-runner 0.12.0 的离线冒烟测试（CI 与本地都用它）。
 //
-// 覆盖：
-// 1. 用假的 window.__ModuleLoader__ / react / ctx 执行 client.js，确认插件能注册 4 个 slot；
-// 2. client.js 的 PLUGIN_VERSION 与 package.json version 一致；
-// 3. 版本比较与 GitHub 更新检查（mock fetch/localStorage）；
-// 4. 配置模型：默认 4 条命令、命令校验、全局/项目作用域匹配、可见命令过滤；
-// 5. 浮动按钮 / 设置页组件能在最小 props 下完成首次渲染。
+// 覆盖（SPEC 第 5 节 smoke 要求）：
+// 1. 用假的 window.__ModuleLoader__ / react / localStorage 执行 client.js，确认模块 id 与注入；
+// 2. client.js 的 PLUGIN_VERSION 与 package.json version 一致（0.12.0）；
+// 3. slot 注册集合恰为 6 个：conversation.composer.dock / main / sidebar.panellist /
+//    settings.section / plugins.detail.badge / plugins.detail.section；
+// 4. __test 纯函数断言：stripAnsi / formatUptime / formatBytes / commandMatchesProject /
+//    visibleCommandsForProject / runnerStatusText；
+// 5. 用最小 props 渲染 RunnerPage（无会话 → 提示）、composer 按钮、settings 页、导航图标，
+//    不报错且关键 data-* 属性存在。
 import fs from "node:fs";
 import path from "node:path";
 import assert from "node:assert/strict";
@@ -25,12 +28,13 @@ globalThis.window = {
   }
 };
 new Function("window", source)(globalThis.window);
+assert.ok(registration !== null, "client.js 必须通过 window.__ModuleLoader__.load 注册");
 assert.equal(registration.id, "dsh-runner", "client.js 的模块 id 必须等于包名");
 
-// ---- 2. 假 react ----
+// ---- 2. 假 react（只实现 client.js 用到的 hook；不提供 useSyncExternalStore，走 fallback shim）----
 const reactStub = {
   createElement(type, props, ...children) {
-    return { type, props, children };
+    return { type, props: props === null || props === undefined ? {} : props, children };
   },
   useState(initial) {
     return [typeof initial === "function" ? initial() : initial, () => {}];
@@ -50,172 +54,82 @@ const moduleExports = registration.factory((name) => {
 assert.equal(moduleExports.name, "dsh-runner");
 assert.deepEqual(moduleExports.inject, ["slots", "connection"]);
 
-const internals = moduleExports.__limob;
-assert.notEqual(internals, undefined, "client.js 必须导出 __limob 测试入口");
+const __test = moduleExports.__test;
+assert.notEqual(__test, undefined, "client.js 必须导出 __test 纯函数入口");
+assert.deepEqual(
+  Object.keys(__test).sort(),
+  ["commandMatchesProject", "formatBytes", "formatUptime", "runnerStatusText", "stripAnsi", "visibleCommandsForProject"],
+  "__test 只应包含契约要求的 6 个纯函数"
+);
 
-// ---- 3. 版本一致性 ----
-assert.equal(internals.pluginVersion, manifest.version, "PLUGIN_VERSION 必须与 package.json version 一致");
-assert.equal(internals.installSpec, "github:" + internals.repoSlug);
+// ---- 3. 版本一致性（source 里的 PLUGIN_VERSION 必须与 package.json 一致）----
+const versionMatch = /var PLUGIN_VERSION = "([^"]+)";/.exec(source);
+assert.ok(versionMatch !== null, "client.js 必须有 PLUGIN_VERSION 常量");
+assert.equal(versionMatch[1], manifest.version, "PLUGIN_VERSION 必须与 package.json version 一致");
+assert.equal(manifest.version, "0.12.0", "目标版本是 0.12.0");
 
-// ---- 4. semver ----
-const compareCases = [
-  ["0.3.0", "0.2.9", 1],
-  ["v0.3.0", "0.3.0", 0],
-  ["0.3.0-beta.1", "0.3.0", -1],
-  ["0.3.0", "0.3.0-beta.1", 1],
-  ["1.10.0", "1.9.9", 1],
-  ["0.3.0-rc.1", "0.3.0-rc.2", -1]
-];
-for (const [left, right, expected] of compareCases) {
-  assert.equal(internals.compareVersions(left, right), expected, `compareVersions(${left}, ${right})`);
-}
-assert.deepEqual(internals.parseVersion("v1.2.3"), { major: 1, minor: 2, patch: 3, prerelease: [] });
-assert.equal(internals.parseVersion("not-a-version"), null);
+// ---- 4. 纯函数断言 ----
+assert.equal(__test.stripAnsi("\u001b[31mred\u001b[0m"), "red");
+assert.equal(__test.stripAnsi("\u001b]0;title\u0007hi"), "hi");
+assert.equal(__test.stripAnsi(undefined), "");
+assert.equal(__test.stripAnsi("plain"), "plain");
 
-// ---- 5. 假 localStorage / fetch ----
-function createStorage() {
-  const map = new Map();
-  return {
-    getItem(key) {
-      return map.has(key) ? map.get(key) : null;
-    },
-    setItem(key, value) {
-      map.set(key, String(value));
-    },
-    removeItem(key) {
-      map.delete(key);
-    },
-    clear() {
-      map.clear();
-    }
-  };
-}
-globalThis.localStorage = createStorage();
-const realFetch = globalThis.fetch;
-function jsonResponse(body, status = 200) {
-  return {
-    ok: status >= 200 && status < 300,
-    status,
-    async json() {
-      return body;
-    }
-  };
-}
-async function withFetch(impl, run) {
-  globalThis.fetch = impl;
-  try {
-    return await run();
-  } finally {
-    globalThis.fetch = realFetch;
-  }
-}
+assert.equal(__test.formatUptime(0), "0s");
+assert.equal(__test.formatUptime(59_000), "59s");
+assert.equal(__test.formatUptime(65_000), "1m 05s");
+assert.equal(__test.formatUptime(3_725_000), "1h 02m");
+assert.equal(__test.formatUptime(-1), "—");
 
-// 5.1 有更新的 release
-globalThis.localStorage.clear();
-await withFetch(async () => jsonResponse({ tag_name: "v9.9.9", html_url: "https://example.test/release" }), async () => {
-  const result = await internals.checkForUpdate(true);
-  assert.equal(result.phase, "ready");
-  assert.equal(result.available, true);
-  assert.equal(result.latestVersion, "9.9.9");
-});
+assert.equal(__test.formatBytes(0), "0 B");
+assert.equal(__test.formatBytes(512), "512 B");
+assert.equal(__test.formatBytes(65536), "64.0 KB");
+assert.equal(__test.formatBytes(1024 * 1024), "1.0 MB");
 
-// 5.2 同版本无更新
-globalThis.localStorage.clear();
-await withFetch(async () => jsonResponse({ tag_name: "v0.3.0", html_url: "https://example.test/release" }), async () => {
-  const result = await internals.checkForUpdate(true);
-  assert.equal(result.available, false);
-});
-
-// 5.3 无 release 回退 package.json
-globalThis.localStorage.clear();
-let step = 0;
-await withFetch(async () => {
-  step += 1;
-  if (step === 1) return jsonResponse({}, 404);
-  return jsonResponse({ version: "9.9.9" });
-}, async () => {
-  const result = await internals.checkForUpdate(true);
-  assert.equal(result.available, true);
-  assert.equal(result.latestVersion, "9.9.9");
-});
-
-// 5.4 断网兜底
-globalThis.localStorage.clear();
-await withFetch(async () => {
-  throw new Error("offline");
-}, async () => {
-  const result = await internals.checkForUpdate(true);
-  assert.equal(result.phase, "error");
-  assert.equal(result.available, false);
-});
-
-// ---- 6. 配置模型 ----
-const defaults = internals.config.defaults();
-assert.equal(defaults.commands.length, 4, "默认应有 4 条内置命令");
-assert.ok(defaults.commands.every((command) => command.scope === "global"), "内置命令默认全局");
-assert.equal(internals.config.normalizePath("H:\\Limob-windows\\"), "h:\\limob-windows");
-
-// 全局命令：任何会话都可见
-const globalVisible = internals.config.visibleCommands(defaults, "H:\\Other", true);
-assert.equal(globalVisible.length, 4);
-
-// 项目命令：只有匹配项目（含子目录）才可见
-const projectCommand = internals.config.normalizeCommand({
+const projectCommand = {
   id: "p1",
   title: "项目命令",
-  cwd: "H:\\Limob-windows",
   command: "echo hi",
   scope: "project",
   projectRoot: "H:\\Limob-windows"
-});
-assert.notEqual(projectCommand, null);
-assert.equal(internals.config.commandMatchesProject(projectCommand, "H:\\Limob-windows"), true);
-assert.equal(internals.config.commandMatchesProject(projectCommand, "h:/limob-windows/src-tauri"), true);
-assert.equal(internals.config.commandMatchesProject(projectCommand, "H:\\Other"), false);
-const withProject = internals.config.normalize({
-  commands: defaults.commands.concat([projectCommand]),
-  ui: { floating: { x: 10, y: 20 }, visible: true }
-});
-assert.equal(withProject.ui.floating, undefined, "旧配置里的 ui.floating 应被忽略");
-assert.equal(internals.config.visibleCommands(withProject, "H:\\Other", true).length, 4);
-assert.equal(internals.config.visibleCommands(withProject, "H:\\Limob-windows", true).length, 5);
-assert.equal(internals.config.visibleCommands(withProject, "H:\\Limob-windows", false).length, 4);
+};
+assert.equal(__test.commandMatchesProject(projectCommand, "H:\\Limob-windows"), true);
+assert.equal(__test.commandMatchesProject(projectCommand, "h:/limob-windows/src-tauri"), true);
+assert.equal(__test.commandMatchesProject(projectCommand, "H:\\Other"), false);
+assert.equal(__test.commandMatchesProject(projectCommand, undefined), false);
+assert.equal(__test.commandMatchesProject({ scope: "global" }, "H:\\Limob-windows"), false);
 
-// 非法命令被丢弃
-assert.equal(internals.config.normalizeCommand({ title: "", command: "x" }), null);
-assert.equal(internals.config.normalizeCommand({ title: "t", command: "x", scope: "project" }), null);
+const configFixture = {
+  version: 2,
+  ui: { visible: true },
+  commands: [
+    { id: "g1", title: "全局命令", command: "echo g", scope: "global", projectRoot: "", enabled: true },
+    projectCommand,
+    { id: "p2", title: "别的项目", command: "echo p2", scope: "project", projectRoot: "H:\\Other", enabled: true }
+  ]
+};
+assert.deepEqual(
+  __test.visibleCommandsForProject(configFixture, "H:\\Limob-windows").map((command) => command.id),
+  ["g1", "p1"]
+);
+assert.deepEqual(
+  __test.visibleCommandsForProject(configFixture, "H:\\Limob-windows\\sub").map((command) => command.id),
+  ["g1", "p1"]
+);
+assert.deepEqual(
+  __test.visibleCommandsForProject(configFixture, undefined).map((command) => command.id),
+  ["g1"]
+);
+assert.deepEqual(__test.visibleCommandsForProject(null, "H:\\Limob-windows"), []);
 
-// 配置非法/缺失时回到默认
-assert.equal(internals.config.normalize(null).commands.length, 4);
-assert.equal(internals.config.normalize({ commands: "bad" }).commands.length, 0);
+assert.equal(__test.runnerStatusText("starting"), "启动中");
+assert.equal(__test.runnerStatusText("running"), "运行中");
+assert.equal(__test.runnerStatusText("stopping"), "停止中");
+assert.equal(__test.runnerStatusText("stopped"), "已停止");
+assert.equal(__test.runnerStatusText("exited"), "已退出");
+assert.equal(__test.runnerStatusText("failed"), "启动失败");
+assert.equal(__test.runnerStatusText("idle"), "未运行");
 
-// 归一化规则必须与 Host 端保持一致（否则每次同步都会互相改写）：
-// 项目命令 cwd 默认 projectRoot、projectRoot 去尾斜杠、非 ASCII 自动 chcp、
-// 全局命令不保留 projectRoot。
-const normalizedProject = internals.config.normalizeCommand({
-  id: "p2",
-  title: "项目",
-  command: "pnpm 开发",
-  scope: "project",
-  projectRoot: "H:\\Limob-windows\\"
-});
-assert.equal(normalizedProject.projectRoot, "H:\\Limob-windows");
-assert.equal(normalizedProject.cwd, "H:\\Limob-windows");
-assert.equal(normalizedProject.utf8CodePage, true);
-const normalizedGlobal = internals.config.normalizeCommand({
-  id: "g2",
-  title: "全局",
-  command: "echo hi",
-  scope: "global",
-  projectRoot: "H:\\Limob-windows"
-});
-assert.equal(normalizedGlobal.projectRoot, "");
-assert.equal(normalizedGlobal.cwd, "");
-// 终端 id 里的项目短 hash：路径写法不同必须得到同一个 id，不同项目不能碰撞。
-assert.equal(internals.config.projectIdOf("H:\\Limob-windows\\"), internals.config.projectIdOf("h:/limob-windows"));
-assert.notEqual(internals.config.projectIdOf("H:\\Limob-windows"), internals.config.projectIdOf("H:\\Other"));
-
-// ---- 7. apply 注册 ----
+// ---- 5. apply 注册（slot 集合必须与契约一致）----
 const registered = [];
 const ctx = {
   slots: {
@@ -235,24 +149,78 @@ const ctx = {
   logger: { error() {} }
 };
 moduleExports.apply(ctx);
+
 assert.deepEqual(
   registered.map((entry) => entry.options.name).sort(),
-  ["conversation.composer.dock", "plugins.detail.badge", "plugins.detail.section", "settings.section", "shell.overlay"].sort(),
-  "应注册输入框按钮、设置页、插件页更新提示、项目终端补开器"
+  [
+    "conversation.composer.dock",
+    "main",
+    "plugins.detail.badge",
+    "plugins.detail.section",
+    "settings.section",
+    "sidebar.panellist"
+  ],
+  "slot 注册集合必须与 SPEC 完全一致"
 );
-assert.equal(registered.find((entry) => entry.options.name === "settings.section").options.label, "dsh-runner");
 
-// ---- 8. 首次渲染（最小 props） ----
-const runButton = registered.find((entry) => entry.options.name === "conversation.composer.dock").component;
-const runTree = runButton({ sessionId: "session-test" });
-assert.equal(runTree.props.className, "dshLimobRunDock", "输入框下方按钮根节点应渲染");
+const bySlot = (slotName) => registered.find((entry) => entry.options.name === slotName);
+const sidebar = bySlot("sidebar.panellist");
+assert.equal(sidebar.options.id, "dsh-runner");
+assert.equal(sidebar.options.order, 20);
+assert.equal(sidebar.options.label, "运行");
+const mainEntry = bySlot("main");
+assert.equal(mainEntry.options.key, "dsh-runner");
+assert.equal(bySlot("settings.section").options.label, "dsh-runner");
 
-const settings = registered.find((entry) => entry.options.name === "settings.section").component;
-const settingsTree = settings({});
-assert.equal(settingsTree.props.className, "dshLimobCfgPage", "设置页根节点应渲染");
+// ---- 6. 最小 props 渲染 ----
+function collect(tree, predicate, found = []) {
+  if (tree === null || tree === undefined) return found;
+  if (Array.isArray(tree)) {
+    for (const item of tree) collect(item, predicate, found);
+    return found;
+  }
+  if (typeof tree !== "object") {
+    if (predicate(tree)) found.push(tree);
+    return found;
+  }
+  if (tree.props !== undefined && tree.props !== null && predicate(tree)) found.push(tree);
+  for (const child of tree.children || []) collect(child, predicate, found);
+  return found;
+}
 
-const badge = registered.find((entry) => entry.options.name === "plugins.detail.badge").component;
-const section = registered.find((entry) => entry.options.name === "plugins.detail.section").component;
+function textOf(tree) {
+  if (tree === null || tree === undefined) return "";
+  if (typeof tree === "string" || typeof tree === "number") return String(tree);
+  if (Array.isArray(tree)) return tree.map(textOf).join("");
+  if (tree.children !== undefined) return (tree.children || []).map(textOf).join("");
+  return "";
+}
+
+// 6.1 左侧导航图标：播放三角，props.size 生效
+const iconTree = sidebar.component({ size: 20 });
+assert.equal(iconTree.type, "svg");
+assert.equal(iconTree.props.width, 20);
+assert.equal(iconTree.props.height, 20);
+assert.equal(sidebar.component({}).props.width, 16, "默认图标尺寸 16");
+
+// 6.2 RunnerPage：无会话 → 提示"请先进入一个项目会话"
+const page = mainEntry.component({});
+assert.equal(page.props["data-dsh-runner-page"], "1", "RunnerPage 根节点必须有 data-dsh-runner-page");
+assert.ok(textOf(page).includes("请先进入一个项目会话"), "无项目时应提示先进入项目会话");
+
+// 6.3 composer 按钮：紧凑「▶ 运行」
+const composer = bySlot("conversation.composer.dock").component;
+const dockTree = composer({ sessionId: "session-test" });
+assert.equal(dockTree.props.className, "dshLimobRunDock");
+assert.ok(textOf(dockTree).includes("运行"), "输入框下方按钮应显示「运行」");
+
+// 6.4 设置页：命令编辑器容器渲染
+const settingsTree = bySlot("settings.section").component({});
+assert.equal(settingsTree.props.className, "dshLimobCfgPage");
+
+// 6.5 插件详情页只在 subject 是自己时才显示
+const badge = bySlot("plugins.detail.badge").component;
+const section = bySlot("plugins.detail.section").component;
 assert.equal(badge({ subject: { kind: "bundle", pkg: { name: "other" } } }), null);
 assert.equal(section({ subject: { kind: "bundle", pkg: { name: "other" } } }), null);
 
@@ -261,6 +229,6 @@ console.log(JSON.stringify({
   name: manifest.name,
   version: manifest.version,
   slots: registered.map((entry) => entry.options.name),
-  config: "passed",
-  updateLogic: "passed"
+  pureFunctions: Object.keys(__test).sort(),
+  render: "passed"
 }, null, 2));

@@ -1,22 +1,23 @@
-/* dsh-runner —— 客户端半体（浏览器侧）
+/* dsh-runner —— 客户端半体（浏览器侧，0.12.0）
  *
  * 功能总览：
- *   1) 在对话输入框「正下方」放一个低调的「▶ 运行」小按钮
- *      （conversation.composer.dock 槽位）：点击向上展开命令菜单；
- *   2) 命令配置页（settings.section）：在 DSH 设置弹窗里新增「dsh-runner」页，
- *      支持命令的增删改查、排序、启停、全局/项目作用域；
- *   3) 命令由 Host 按「项目路径 + 命令」启动（host-runner.js）；右侧栏终端只是当前
- *      会话里按需打开的只读日志视图（Get-Content -Wait），切会话不改变用户当前视图；
- *   4) GitHub Releases 更新检查（按钮/菜单/插件页提示），只提示不自动升级。
+ *   1) 左侧导航新增「运行」面板（sidebar.panellist + main 槽位）：
+ *      当前项目的运行命令列表（启停重启、状态/端口/uptime/退出码）+ 实时日志 +
+ *      端口诊断（未托管占用者可一键结束）；
+ *   2) 输入框下方保留紧凑「▶ 运行」按钮（conversation.composer.dock）：
+ *      按项目过滤的快捷菜单，只做启动/停止/重启，不再创建任何终端；
+ *   3) 命令配置页（settings.section）：命令编辑器，直接调用 Host 的
+ *      config/create|update|delete|reorder RPC；
+ *   4) 插件详情页更新提示（plugins.detail.badge / plugins.detail.section）。
  *
- * 数据流：
- *   配置：localStorage(dsh.limob-runner.config.v1) 为缓存，Host commands.json 为主数据
- *   进程：project/start|stop|stopAll|status RPC
- *   终端：remote.terminal.create/list/attach/rename/close
- *   页签：webTerminals.recover + sidebarRight.openTab("terminal",{params:{terminalId}})
+ * 数据流（单一事实来源 = Host）：
+ *   配置：config/*            —— 只从 Host RPC 读，内存 store + 订阅，无 localStorage
+ *   进程：project/status|start|stop|restart|startAll|stopAll
+ *   日志：project/log|log/clear（轮询 tail，客户端只展示）
+ *   诊断：project/diagnose|killPort
  *
- * 依赖的 DSH 客户端服务是内部接口（非官方稳定 API），调用都有能力检测与 try/catch；
- * 任何失败只影响对应提示，不影响 DSH 正常聊天。
+ * 所有 RPC 失败一律 throw（err.code / err.details 透传），界面显示 messageOf(error)。
+ * 不依赖右侧栏 / 内置终端 / 终端 RPC；不再有终端创建、tail、项目页签注册表。
  */
 window.__ModuleLoader__.load({
   id: "dsh-runner",
@@ -27,7 +28,7 @@ window.__ModuleLoader__.load({
     var exports = module.exports;
     Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
 
-    // 只用基线共享模块 react；react-dom 用于把菜单 portal 到 body，避免被右侧栏盖住。
+    // 只用基线共享模块 react；react-dom 仅用于把弹出菜单 portal 到 body（有则用，无则内联）。
     var react = require("react");
     var reactDom = null;
     try {
@@ -38,12 +39,16 @@ window.__ModuleLoader__.load({
     var h = react.createElement;
 
     // =====================================================================
-    // 一、常量与内置命令
+    // 一、常量
     // =====================================================================
     var PLUGIN_NAME = "dsh-runner";
-    var PLUGIN_VERSION = "0.11.0";
+    var PLUGIN_VERSION = "0.12.0";
 
-    // 更新检查（GitHub Releases）
+    // 左侧导航面板 / main 面板的稳定 id。
+    var PANEL_ID = "dsh-runner";
+    var PANEL_LABEL = "运行";
+
+    // 更新检查（GitHub Releases）；只提示不自动升级。
     var REPO_SLUG = "lcx19970714/dsh-runner";
     var INSTALL_SPEC = "github:" + REPO_SLUG;
     var UPGRADE_COMMAND = "dsh plugin --profile desktop add " + INSTALL_SPEC;
@@ -52,108 +57,63 @@ window.__ModuleLoader__.load({
     var GITHUB_API_LATEST = "https://api.github.com/repos/" + REPO_SLUG + "/releases/latest";
     var GITHUB_RAW_PACKAGE = "https://raw.githubusercontent.com/" + REPO_SLUG + "/main/package.json";
     var UPDATE_CACHE_KEY = "dsh.limob-runner.update.v1";
-    var UPDATE_TTL_MS = 10 * 60 * 1000; // 10 分钟：菜单打开时能较快看到 GitHub 新版本
+    var UPDATE_TTL_MS = 10 * 60 * 1000;
 
-    // 配置（浏览器 localStorage 只作为缓存；Host 侧 commands.json 才是主数据）
-    var CONFIG_KEY = "dsh.limob-runner.config.v1";
-    var CONFIG_VERSION = 1;
+    // Host RPC：POST /api/dsh-runner/<endpoint>，信封由 client.rpc.call 负责。
+    var RPC_CHANNEL = "/api";
+    var RPC_NAMESPACE = PLUGIN_NAME;
 
-    // apply(ctx) 时保存客户端根 Context，组件里按需取 DSH 服务。
+    // 轮询节奏与日志单次读取上限（与 SPEC 2.2 一致）。
+    var STATUS_POLL_MS = 2000;
+    var LOG_POLL_MS = 1000;
+    var LOG_MAX_BYTES = 65536;
+
+    // apply(ctx) 时保存客户端根 Context；组件里按需取 DSH 服务。
     var runtimeCtx = null;
-    // Host 侧配置存储的 RPC 连接；Host 半体负责写 commands.json，AI Tool 和浏览器共用同一份配置。
+    // Host RPC 连接（connection 服务）。
     var hostConnection = null;
-    var hostSaveTimer = null;
-    var hostSavePending = null;
-
-    // 内置默认命令：命令文本全部是常量，不接受用户输入拼接。
-    // scope 默认 global，保持旧版行为；用户可在设置页改成「仅项目」。
-    var BUILTIN_COMMANDS = [
-      {
-        id: "dev",
-        title: "开发调试",
-        terminalTitle: "Limob-dev",
-        cwd: "H:\\Limob-windows",
-        command: "pnpm 客户端-调试",
-        scope: "global",
-        projectRoot: "",
-        enabled: true,
-        utf8CodePage: true,
-        longRunning: true
-      },
-      {
-        id: "cargo-check",
-        title: "Rust 检查（cargo check）",
-        terminalTitle: "Limob-cargo-check",
-        cwd: "H:\\Limob-windows\\src-tauri",
-        command: "cargo check",
-        scope: "global",
-        projectRoot: "",
-        enabled: true,
-        utf8CodePage: false,
-        longRunning: false
-      },
-      {
-        id: "build-debug",
-        title: "快速构建（tauri build --debug）",
-        terminalTitle: "Limob-build-debug",
-        cwd: "H:\\Limob-windows",
-        command: "pnpm exec tauri build --debug --no-bundle",
-        scope: "global",
-        projectRoot: "",
-        enabled: true,
-        utf8CodePage: false,
-        longRunning: false
-      },
-      {
-        id: "build-release",
-        title: "正式构建（pnpm 构建桌面端）",
-        terminalTitle: "Limob-build-release",
-        cwd: "H:\\Limob-windows",
-        command: "pnpm 构建桌面端",
-        scope: "global",
-        projectRoot: "",
-        enabled: true,
-        utf8CodePage: true,
-        longRunning: false
-      }
-    ];
 
     // =====================================================================
     // 二、样式（factory 阶段注入一次，模块系统会随插件卸载清理）
     // =====================================================================
     var STYLE_ID = "dsh-limob-runner-css";
     var CSS = [
-      // ---- 输入框下方的运行按钮 ----
+      // ---- 输入框下方的「运行」按钮与快捷菜单 ----
       ".dshLimobRunDock{position:relative;display:flex;align-items:center;gap:8px;min-width:0;max-width:100%}",
       ".dshLimobRunBtn{display:inline-flex;align-items:center;gap:4px;height:24px;padding:0 6px;border-radius:6px;border:0;background:transparent;color:var(--dsw-alias-label-secondary,inherit);font:inherit;font-size:11px;line-height:22px;cursor:pointer;white-space:nowrap;user-select:none}",
       ".dshLimobRunBtn:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.16));color:inherit}",
       ".dshLimobRunBtn[data-busy=true]{cursor:progress;opacity:.7}",
-      ".dshLimobRunDot{width:6px;height:6px;border-radius:50%;background:#f59e0b;margin-left:1px}",
       ".dshLimobRunStatus{display:inline-flex;align-items:center;min-width:0;font-size:11px;line-height:16px;opacity:.8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
       ".dshLimobRunStatus[data-phase=error]{color:#f87171}",
-      ".dshLimobRunMenu{position:fixed;z-index:1000;box-sizing:border-box;min-width:260px;max-width:min(400px,92vw);max-height:min(60vh,520px);overflow:auto;padding:6px;border-radius:11px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));background:var(--dsw-alias-bg-layer-2,#26282c);box-shadow:0 12px 32px rgba(0,0,0,.38);font-family:inherit;font-size:12px;line-height:18px;color:inherit}",
-      ".dshLimobRunMenuTitle{padding:5px 9px 3px;font-size:11px;opacity:.6;user-select:none;display:flex;justify-content:space-between;gap:8px}",
-      ".dshLimobRunFoot{display:flex;align-items:center;justify-content:space-between;gap:8px;border-top:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.28));margin-top:4px;padding:4px 4px 1px 7px;font-size:10px;line-height:16px;opacity:.75}",
-      ".dshLimobRunFootBtn{display:inline-flex;align-items:center;gap:4px;min-width:0;padding:2px 4px;border:0;border-radius:5px;background:transparent;color:inherit;font:inherit;font-size:10px;line-height:16px;cursor:pointer;white-space:nowrap;opacity:.8}",
-      ".dshLimobRunFootBtn:hover:not(:disabled){background:rgba(128,128,128,.14);opacity:1}",
-      ".dshLimobRunFootBtn:disabled{cursor:default;opacity:.55}",
-      ".dshLimobRunFootDot{width:6px;height:6px;border-radius:50%;background:var(--dsw-alias-label-tertiary,rgba(128,128,128,.65));flex:none}",
-      ".dshLimobRunFootDot[data-state=update]{background:#f59e0b}",
-      ".dshLimobRunFootDot[data-state=checking]{background:#679efe}",
-      ".dshLimobRunFootDot[data-state=error]{background:#f87171}",
-      ".dshLimobRunFootGitHub{display:inline-flex;align-items:center;gap:3px;flex:none;padding:2px 4px;border-radius:5px;color:inherit;text-decoration:none;font-size:10px;line-height:16px;opacity:.8;white-space:nowrap}",
-      ".dshLimobRunFootGitHub:hover{opacity:1;background:rgba(128,128,128,.14);text-decoration:none}",
-      ".dshLimobRunItem{display:flex;align-items:flex-start;gap:7px;width:100%;padding:7px 9px;border:0;border-radius:7px;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}",
-      ".dshLimobRunItem:hover{background:rgba(103,158,254,.14)}",
-      ".dshLimobRunItem[disabled]{opacity:.55;cursor:default}",
-      ".dshLimobRunItem[data-danger=true]:hover:not([disabled]){background:rgba(239,68,68,.12)}",
-      ".dshLimobRunItemMain{display:flex;flex-direction:column;gap:1px;min-width:0;flex:1}",
+      ".dshLimobRunMenu{position:fixed;z-index:1000;box-sizing:border-box;min-width:280px;max-width:min(400px,92vw);max-height:min(60vh,520px);overflow:auto;padding:6px;border-radius:11px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));background:var(--dsw-alias-bg-layer-2,#26282c);box-shadow:0 12px 32px rgba(0,0,0,.38);font-family:inherit;font-size:12px;line-height:18px;color:inherit}",
+      ".dshLimobRunMenuTitle{padding:5px 9px 3px;font-size:11px;opacity:.6;user-select:none;display:flex;justify-content:space-between;gap:8px;min-width:0}",
+      ".dshLimobRunMenuTitle > span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+      ".dshLimobRunRow{display:flex;align-items:center;gap:6px;width:100%;box-sizing:border-box;padding:6px 8px;border-radius:7px;min-width:0}",
+      ".dshLimobRunRow:hover{background:rgba(103,158,254,.1)}",
+      ".dshLimobRunRowMain{display:flex;flex-direction:column;gap:1px;min-width:0;flex:1}",
       ".dshLimobRunItemTitle{font-size:12px;line-height:17px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
       ".dshLimobRunItemCmd{font-size:10px;line-height:14px;opacity:.6;font-family:ui-monospace,Consolas,'Courier New',monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
-      ".dshLimobRunTag{flex:none;padding:0 6px;border-radius:999px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));font-size:10px;line-height:16px;opacity:.75}",
-      ".dshLimobRunRunningDot{flex:none;width:6px;height:6px;margin-top:6px;border-radius:50%;background:#22c55e}",
+      ".dshLimobRunRowActions{display:flex;align-items:center;gap:2px;flex:none}",
       ".dshLimobRunSep{height:1px;margin:5px 4px;background:var(--dsw-alias-border-l3,rgba(128,128,128,.3))}",
-      // ---- 设置页：命令配置（紧凑布局） ----
+      ".dshLimobRunHint{padding:5px 9px 3px;font-size:10px;line-height:15px;opacity:.55;user-select:none}",
+      ".dshLimobRunEmpty{padding:8px 9px;font-size:11px;line-height:16px;opacity:.6}",
+      // ---- 通用小按钮 / 标签 ----
+      ".dshLimobCfgBtn{display:inline-flex;align-items:center;justify-content:center;gap:4px;height:24px;padding:0 9px;border-radius:6px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));background:transparent;color:inherit;font:inherit;font-size:11px;line-height:22px;cursor:pointer;white-space:nowrap}",
+      ".dshLimobCfgBtn:hover:not([disabled]){background:rgba(103,158,254,.12)}",
+      ".dshLimobCfgBtn[disabled]{opacity:.45;cursor:default}",
+      ".dshLimobCfgBtnPrimary{border-color:rgba(103,158,254,.55);background:rgba(103,158,254,.16);color:#679efe}",
+      ".dshLimobCfgBtnPrimary:hover:not([disabled]){background:rgba(103,158,254,.24)}",
+      ".dshLimobCfgBtnDanger{border-color:rgba(239,68,68,.45);color:#f87171}",
+      ".dshLimobCfgBtnDanger:hover:not([disabled]){background:rgba(239,68,68,.12)}",
+      ".dshLimobCfgBtnGhost{border:0;padding:0 6px;height:22px;opacity:.72}",
+      ".dshLimobCfgBtnGhost:hover:not([disabled]){opacity:1;background:rgba(128,128,128,.12)}",
+      ".dshLimobIconBtn{width:26px;height:26px;display:inline-flex;align-items:center;justify-content:center;border:0;border-radius:6px;background:transparent;color:inherit;font:inherit;font-size:13px;line-height:1;cursor:pointer;opacity:.6}",
+      ".dshLimobIconBtn:hover:not([disabled]){background:rgba(128,128,128,.16);opacity:1}",
+      ".dshLimobIconBtn[disabled]{opacity:.25;cursor:default}",
+      ".dshLimobIconBtn[data-danger=true]:hover:not([disabled]){background:rgba(239,68,68,.14);color:#f87171}",
+      ".dshLimobTag{flex:none;padding:0 5px;border-radius:999px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));font-size:9px;line-height:14px;opacity:.8;white-space:nowrap;max-width:46%;overflow:hidden;text-overflow:ellipsis}",
+      ".dshLimobTag[data-scope=project]{border-color:rgba(103,158,254,.45);color:#679efe;background:rgba(103,158,254,.08)}",
+      // ---- 设置页 / 配置编辑器 ----
       ".dshLimobCfgPage{display:flex;flex-direction:column;gap:10px;width:100%;max-width:100%;padding:0 0 18px;font-size:12px;line-height:18px;color:inherit;box-sizing:border-box}",
       ".dshLimobPageHead{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:2px 2px 9px;border-bottom:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35))}",
       ".dshLimobPageTitle{font-size:15px;font-weight:600;line-height:22px}",
@@ -168,15 +128,6 @@ window.__ModuleLoader__.load({
       ".dshLimobSwitchTrack::after{content:\"\";position:absolute;top:2px;left:2px;width:11px;height:11px;border-radius:50%;background:#fff;transition:left .15s}",
       ".dshLimobSwitch input:checked + .dshLimobSwitchTrack{background:#679efe}",
       ".dshLimobSwitch input:checked + .dshLimobSwitchTrack::after{left:13px}",
-      ".dshLimobCfgBtn{display:inline-flex;align-items:center;justify-content:center;gap:4px;height:24px;padding:0 9px;border-radius:6px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));background:transparent;color:inherit;font:inherit;font-size:11px;line-height:22px;cursor:pointer;white-space:nowrap}",
-      ".dshLimobCfgBtn:hover{background:rgba(103,158,254,.12)}",
-      ".dshLimobCfgBtn[disabled]{opacity:.45;cursor:default}",
-      ".dshLimobCfgBtnPrimary{border-color:rgba(103,158,254,.55);background:rgba(103,158,254,.16);color:#679efe}",
-      ".dshLimobCfgBtnPrimary:hover{background:rgba(103,158,254,.24)}",
-      ".dshLimobCfgBtnDanger{border-color:rgba(239,68,68,.45);color:#f87171}",
-      ".dshLimobCfgBtnDanger:hover{background:rgba(239,68,68,.12)}",
-      ".dshLimobCfgBtnGhost{border:0;padding:0 6px;height:22px;opacity:.72}",
-      ".dshLimobCfgBtnGhost:hover{opacity:1;background:rgba(128,128,128,.12)}",
       ".dshLimobCmdList{display:flex;flex-direction:column;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));border-radius:10px;overflow:hidden;background:var(--dsw-alias-bg-layer-1,rgba(128,128,128,.05))}",
       ".dshLimobCmdRow{display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.22));min-width:0}",
       ".dshLimobCmdRow:last-child{border-bottom:0}",
@@ -185,14 +136,8 @@ window.__ModuleLoader__.load({
       ".dshLimobCmdMain{display:flex;flex-direction:column;gap:1px;min-width:0;flex:1;cursor:pointer}",
       ".dshLimobCmdTitleLine{display:flex;align-items:center;gap:6px;min-width:0}",
       ".dshLimobCmdTitle{font-size:12px;font-weight:500;line-height:17px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
-      ".dshLimobTag{flex:none;padding:0 5px;border-radius:999px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));font-size:9px;line-height:14px;opacity:.8;white-space:nowrap;max-width:46%;overflow:hidden;text-overflow:ellipsis}",
-      ".dshLimobTag[data-scope=project]{border-color:rgba(103,158,254,.45);color:#679efe;background:rgba(103,158,254,.08)}",
       ".dshLimobCmdPreview{font-size:10px;line-height:14px;opacity:.5;font-family:ui-monospace,Consolas,'Courier New',monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
       ".dshLimobCmdActions{display:flex;align-items:center;gap:2px;flex:none}",
-      ".dshLimobIconBtn{width:26px;height:26px;display:inline-flex;align-items:center;justify-content:center;border:0;border-radius:6px;background:transparent;color:inherit;font:inherit;font-size:13px;line-height:1;cursor:pointer;opacity:.6}",
-      ".dshLimobIconBtn:hover{background:rgba(128,128,128,.16);opacity:1}",
-      ".dshLimobIconBtn[disabled]{opacity:.25;cursor:default}",
-      ".dshLimobIconBtn[data-danger=true]:hover{background:rgba(239,68,68,.14);color:#f87171}",
       ".dshLimobCfgEmpty{padding:18px 12px;text-align:center;font-size:11px;opacity:.55}",
       ".dshLimobCfgForm{border:.5px solid rgba(103,158,254,.35);border-radius:10px;background:rgba(103,158,254,.05);padding:11px 12px;display:flex;flex-direction:column;gap:9px}",
       ".dshLimobCfgFormTop{display:flex;align-items:center;justify-content:space-between;gap:8px}",
@@ -211,19 +156,65 @@ window.__ModuleLoader__.load({
       ".dshLimobLinkBtn{border:0;background:transparent;color:#679efe;font:inherit;font-size:10px;line-height:16px;padding:0;cursor:pointer;opacity:.85}",
       ".dshLimobLinkBtn:hover{opacity:1;text-decoration:underline}",
       ".dshLimobFormFoot{display:flex;align-items:center;gap:8px;justify-content:flex-end;min-height:24px}",
-      ".dshLimobFormError{color:#f87171;font-size:11px;line-height:16px;margin-right:auto}",
-      ".dshLimobCfgFooter{display:flex;align-items:center;gap:2px;border-top:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.28));padding-top:7px;margin-top:1px;flex-wrap:wrap}",
-      ".dshLimobCfgFooterVersion{margin-left:auto;font-size:10px;line-height:16px;opacity:.35;flex:none}",
-      ".dshLimobImportBox{display:flex;flex-direction:column;gap:6px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.3));border-radius:8px;padding:8px}",
-      ".dshLimobImportBox .dshLimobTextarea{min-height:76px}",
+      ".dshLimobFormError{color:#f87171;font-size:11px;line-height:16px;margin-right:auto;word-break:break-word}",
+      ".dshLimobCfgError{color:#f87171;font-size:11px;line-height:16px;word-break:break-word}",
       ".dshLimobCfgNotice{color:#22c55e;font-size:11px;line-height:16px}",
-      ".dshLimobCfgError{color:#f87171;font-size:11px;line-height:16px}",
       ".dshLimobFieldHint{font-size:10px;line-height:14px;opacity:.5;margin-top:2px}",
-      ".dshLimobCfgTips{display:flex;flex-direction:column;gap:3px;border-top:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.28));padding:9px 2px 0;margin-top:2px;font-size:11px;line-height:17px;opacity:.55}",
-      ".dshLimobCfgTipsTitle{font-size:11px;font-weight:600;opacity:.9}",
+      ".dshLimobDepList{display:flex;flex-wrap:wrap;gap:4px 12px;padding:2px 0 0}",
+      ".dshLimobDepItem{display:inline-flex;align-items:center;gap:4px;font-size:11px;line-height:16px;opacity:.85;cursor:pointer;max-width:100%}",
+      ".dshLimobDepItem span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
       ".dshLimobCfgModalBackdrop{pointer-events:auto;position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,.42);display:flex;align-items:center;justify-content:center;padding:20px}",
-      ".dshLimobCfgModal{box-sizing:border-box;width:min(720px,94vw);max-height:min(86vh,780px);overflow:auto;border-radius:12px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));background:var(--dsw-alias-bg-layer-2,#26282c);box-shadow:0 18px 48px rgba(0,0,0,.45);padding:14px}",
+      ".dshLimobCfgModal{box-sizing:border-box;width:min(760px,94vw);max-height:min(86vh,820px);overflow:auto;border-radius:12px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));background:var(--dsw-alias-bg-layer-2,#26282c);box-shadow:0 18px 48px rgba(0,0,0,.45);padding:14px}",
       ".dshLimobCfgH{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:13px;font-weight:600}",
+      // ---- 运行面板 ----
+      ".dshRunnerPage{display:flex;flex-direction:column;gap:10px;box-sizing:border-box;width:100%;height:100%;min-height:0;padding:12px 14px;font-size:12px;line-height:18px;color:inherit}",
+      ".dshRunnerHead{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding-bottom:8px;border-bottom:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));min-width:0}",
+      ".dshRunnerHeadMain{display:flex;align-items:baseline;gap:8px;min-width:0;flex:1 1 240px}",
+      ".dshRunnerTitle{font-size:14px;font-weight:600;line-height:20px;flex:none}",
+      ".dshRunnerProject{font-size:11px;line-height:16px;opacity:.6;font-family:ui-monospace,Consolas,'Courier New',monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}",
+      ".dshRunnerToolbar{display:flex;align-items:center;gap:6px;flex-wrap:wrap;flex:none}",
+      ".dshRunnerBody{display:grid;grid-template-columns:minmax(300px,42%) minmax(0,1fr);gap:10px;flex:1;min-height:0}",
+      "@media (max-width:860px){.dshRunnerBody{grid-template-columns:minmax(0,1fr);grid-template-rows:minmax(0,auto) minmax(160px,1fr)}}",
+      ".dshRunnerList{display:flex;flex-direction:column;min-width:0;min-height:0;overflow:auto;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));border-radius:10px;background:var(--dsw-alias-bg-layer-1,rgba(128,128,128,.05))}",
+      ".dshRunnerRow{display:flex;align-items:flex-start;gap:7px;padding:8px 10px;border-bottom:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.22));min-width:0;cursor:pointer}",
+      ".dshRunnerRow:last-child{border-bottom:0}",
+      ".dshRunnerRow:hover{background:rgba(103,158,254,.06)}",
+      ".dshRunnerRow[data-selected=true]{background:rgba(103,158,254,.12)}",
+      ".dshRunnerRow[data-disabled=true]{opacity:.55}",
+      ".dshRunnerDot{width:7px;height:7px;border-radius:50%;margin-top:6px;flex:none;background:rgba(128,128,128,.6)}",
+      ".dshRunnerDot[data-status=starting]{background:#f59e0b}",
+      ".dshRunnerDot[data-status=running]{background:#22c55e}",
+      ".dshRunnerDot[data-status=stopping]{background:#f59e0b}",
+      ".dshRunnerDot[data-status=failed]{background:#f87171}",
+      ".dshRunnerDot[data-status=exited]{background:#f87171}",
+      ".dshRunnerRowMain{display:flex;flex-direction:column;gap:2px;min-width:0;flex:1}",
+      ".dshRunnerRowTitle{display:flex;align-items:center;gap:5px;min-width:0}",
+      ".dshRunnerRowTitleText{font-size:12px;font-weight:500;line-height:17px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}",
+      ".dshRunnerStateText{font-size:10px;line-height:14px;opacity:.65;flex:none;white-space:nowrap}",
+      ".dshRunnerStateText[data-status=running]{color:#22c55e;opacity:1}",
+      ".dshRunnerStateText[data-status=starting],.dshRunnerStateText[data-status=stopping]{color:#f59e0b;opacity:1}",
+      ".dshRunnerStateText[data-status=failed],.dshRunnerStateText[data-status=exited]{color:#f87171;opacity:1}",
+      ".dshRunnerRowCmd{font-size:10px;line-height:14px;opacity:.55;font-family:ui-monospace,Consolas,'Courier New',monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+      ".dshRunnerRowMeta{display:flex;align-items:center;gap:5px;flex-wrap:wrap;font-size:10px;line-height:14px;opacity:.75;min-width:0}",
+      ".dshRunnerPort{flex:none;padding:0 5px;border-radius:999px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));font-size:9px;line-height:14px;font-family:ui-monospace,Consolas,'Courier New',monospace}",
+      ".dshRunnerRowActions{display:flex;align-items:center;gap:2px;flex:none}",
+      ".dshRunnerMiniBtn{height:20px;padding:0 6px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));border-radius:5px;background:transparent;color:inherit;font:inherit;font-size:10px;line-height:18px;cursor:pointer;white-space:nowrap}",
+      ".dshRunnerMiniBtn:hover:not([disabled]){background:rgba(103,158,254,.14)}",
+      ".dshRunnerMiniBtn[disabled]{opacity:.35;cursor:default}",
+      ".dshRunnerMiniBtn[data-action=stop]:hover:not([disabled]){background:rgba(239,68,68,.12);color:#f87171}",
+      ".dshRunnerEmpty{padding:22px 12px;text-align:center;font-size:11px;line-height:17px;opacity:.55}",
+      ".dshRunnerLogPane{display:flex;flex-direction:column;min-width:0;min-height:0;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));border-radius:10px;background:var(--dsw-alias-bg-layer-1,rgba(128,128,128,.05));overflow:hidden}",
+      ".dshRunnerLogHead{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:6px 9px;border-bottom:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.28));font-size:11px;line-height:16px;min-width:0}",
+      ".dshRunnerLogTitle{font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;flex:1 1 120px}",
+      ".dshRunnerLogMeta{font-size:10px;opacity:.55;white-space:nowrap;flex:none}",
+      ".dshRunnerPre{flex:1;min-height:140px;margin:0;padding:8px 10px;overflow:auto;font-family:ui-monospace,Consolas,'Courier New',monospace;font-size:11px;line-height:16px;white-space:pre-wrap;word-break:break-all;user-select:text;background:rgba(0,0,0,.18);color:inherit}",
+      ".dshRunnerDiag{display:flex;flex-direction:column;gap:4px;flex:none}",
+      ".dshRunnerDiagTitle{font-size:11px;font-weight:600;line-height:16px;opacity:.85}",
+      ".dshRunnerDiagRow{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:11px;line-height:16px;padding:5px 9px;border:.5px solid rgba(245,158,11,.38);border-radius:8px;background:rgba(245,158,11,.07)}",
+      ".dshRunnerDiagText{flex:1 1 200px;min-width:0;word-break:break-word}",
+      ".dshRunnerError{display:flex;align-items:flex-start;gap:8px;flex-wrap:wrap;border:.5px solid rgba(239,68,68,.45);background:rgba(239,68,68,.08);color:#f87171;border-radius:8px;padding:7px 9px;font-size:11px;line-height:16px;flex:none}",
+      ".dshRunnerErrorText{flex:1 1 220px;min-width:0;word-break:break-word}",
+      ".dshRunnerErrorDetail{flex:0 0 100%;opacity:.85;font-family:ui-monospace,Consolas,'Courier New',monospace;font-size:10px;line-height:15px;word-break:break-word}",
       // ---- 插件详情页更新区 ----
       ".dshLimobUpdateBadge{display:inline-flex;align-items:center;height:20px;padding:0 8px;border-radius:999px;border:.5px solid rgba(245,158,11,.5);background:rgba(245,158,11,.12);color:#f59e0b;font-size:11px;line-height:18px;white-space:nowrap}",
       ".dshLimobDetailSection{display:flex;flex-direction:column;gap:8px;padding:14px 16px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));border-radius:10px;background:var(--dsw-alias-bg-layer-1,rgba(128,128,128,.06));font-size:12px;line-height:18px}",
@@ -252,30 +243,12 @@ window.__ModuleLoader__.load({
     // 三、通用小工具
     // =====================================================================
     function getService(ctx, name) {
-      if (!ctx) return undefined;
+      if (ctx === null || ctx === undefined) return undefined;
       try {
         return ctx.get(name);
       } catch (_error) {
         return undefined;
       }
-    }
-
-    function getTerminalRemote(ctx) {
-      var direct = getService(ctx, "remote.terminal");
-      if (direct !== undefined && direct !== null) return direct;
-      var remote = getService(ctx, "remote");
-      if (remote !== undefined && remote !== null) return remote.terminal;
-      return undefined;
-    }
-
-    function unwrapResult(result) {
-      if (result !== null && typeof result === "object" && "ok" in result) {
-        if (!result.ok) {
-          throw result.error !== undefined && result.error !== null ? result.error : new Error("DSH Remote 调用失败");
-        }
-        return result.value;
-      }
-      return result;
     }
 
     function messageOf(error) {
@@ -285,26 +258,9 @@ window.__ModuleLoader__.load({
       return String(error);
     }
 
-    function withTimeout(promise, timeoutMs, message) {
-      return new Promise(function (resolve, reject) {
-        var timer = setTimeout(function () {
-          reject(new Error(message));
-        }, timeoutMs);
-        promise.then(
-          function (value) {
-            clearTimeout(timer);
-            resolve(value);
-          },
-          function (error) {
-            clearTimeout(timer);
-            reject(error);
-          }
-        );
-      });
-    }
-
     function logPluginError(ctx, message, error) {
-      if (ctx !== null && ctx.logger !== undefined && ctx.logger !== null && typeof ctx.logger.error === "function") {
+      if (ctx !== null && ctx !== undefined && ctx.logger !== undefined && ctx.logger !== null
+        && typeof ctx.logger.error === "function") {
         ctx.logger.error("dsh-runner: " + message, error);
       } else if (typeof console !== "undefined") {
         console.error("dsh-runner: " + message, error);
@@ -319,7 +275,7 @@ window.__ModuleLoader__.load({
           return true;
         }
       } catch (_error) {
-        /* 回退 */
+        /* 回退到 execCommand */
       }
       try {
         if (typeof document !== "undefined") {
@@ -334,9 +290,14 @@ window.__ModuleLoader__.load({
           return copied;
         }
       } catch (_error) {
-        /* ignore */
+        /* 复制失败由调用方提示 */
       }
       return false;
+    }
+
+    function confirmAction(text) {
+      if (typeof window === "undefined" || typeof window.confirm !== "function") return false;
+      return window.confirm(text) === true;
     }
 
     // =====================================================================
@@ -406,7 +367,7 @@ window.__ModuleLoader__.load({
         if (typeof localStorage === "undefined") return;
         localStorage.setItem(UPDATE_CACHE_KEY, JSON.stringify(value));
       } catch (_error) {
-        /* ignore */
+        /* 缓存写失败只影响下次是否重新请求 GitHub，忽略 */
       }
     }
 
@@ -495,7 +456,7 @@ window.__ModuleLoader__.load({
           navigation.openBundle(PLUGIN_NAME);
           return true;
         } catch (_error) {
-          /* 回退 */
+          /* 回退到复制发布页地址 */
         }
       }
       var url = releaseUrl || GITHUB_RELEASES_PAGE;
@@ -507,225 +468,91 @@ window.__ModuleLoader__.load({
     }
 
     // =====================================================================
-    // 五、配置 store（localStorage）+ 作用域匹配
+    // 五、Host RPC（失败一律 throw，code/details 透传）
     // =====================================================================
-    function makeId() {
-      return "cmd-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 6);
-    }
-
-    /** 存储用的项目路径形态：保留大小写，统一反斜杠，去掉非根目录的末尾斜杠。 */
-    function cleanProjectPath(value) {
-      var text = String(value === undefined || value === null ? "" : value).trim().replace(/\//g, "\\");
-      if (text === "") return "";
-      if (/^[a-zA-Z]:\\?$/.test(text)) return text.replace(/\\+$/g, "") + "\\";
-      return text.replace(/\\+$/g, "");
-    }
-
-    // 注意：这里的归一化必须与 host-config.js 的 normalizeCommand 保持一致，
-    // 否则浏览器保存的配置会被 Host 改写，下一次同步又反向覆盖，形成来回抖动。
-    function normalizeCommand(raw) {
-      if (raw === null || typeof raw !== "object") return null;
-      var id = typeof raw.id === "string" && raw.id.trim() !== "" ? raw.id.trim() : makeId();
-      var title = typeof raw.title === "string" ? raw.title.trim() : "";
-      var command = typeof raw.command === "string" ? raw.command.trim() : "";
-      if (title === "" || command === "") return null;
-      var scope = raw.scope === "project" ? "project" : "global";
-      var projectRoot = cleanProjectPath(typeof raw.projectRoot === "string" ? raw.projectRoot : "");
-      if (scope === "project" && projectRoot === "") {
-        // 项目命令必须有项目根目录，否则无法判断何时显示。
-        return null;
-      }
-      var cwd = typeof raw.cwd === "string" ? cleanProjectPath(raw.cwd) : "";
-      return {
-        id: id,
-        title: title,
-        terminalTitle: typeof raw.terminalTitle === "string" ? raw.terminalTitle.trim() : "",
-        cwd: cwd !== "" ? cwd : (scope === "project" ? projectRoot : ""),
-        command: command,
-        scope: scope,
-        projectRoot: scope === "project" ? projectRoot : "",
-        enabled: raw.enabled !== false,
-        utf8CodePage: raw.utf8CodePage === true || /[^\x00-\x7f]/.test(command),
-        longRunning: raw.longRunning === true
-      };
-    }
-
-    function defaultConfig() {
-      return {
-        version: CONFIG_VERSION,
-        commands: BUILTIN_COMMANDS.map(function (item) {
-          return {
-            id: item.id,
-            title: item.title,
-            terminalTitle: item.terminalTitle,
-            cwd: item.cwd,
-            command: item.command,
-            scope: item.scope,
-            projectRoot: item.projectRoot,
-            enabled: true,
-            utf8CodePage: item.utf8CodePage,
-            longRunning: item.longRunning
-          };
-        }),
-        ui: { visible: true }
-      };
-    }
-
-    function normalizeConfig(raw) {
-      var fallback = defaultConfig();
-      if (raw === null || typeof raw !== "object") return fallback;
-      var commands = [];
-      if (Array.isArray(raw.commands)) {
-        for (var i = 0; i < raw.commands.length; i += 1) {
-          var normalized = normalizeCommand(raw.commands[i]);
-          if (normalized !== null) commands.push(normalized);
+    function connectionOf() {
+      if (hostConnection !== null && hostConnection !== undefined) return hostConnection;
+      // connection 服务可能比 apply 晚就绪：这里再取一次（不是数据兜底）。
+      if (runtimeCtx !== null && runtimeCtx !== undefined) {
+        try {
+          var value = runtimeCtx.get("connection");
+          if (value !== undefined && value !== null) {
+            hostConnection = value;
+            return value;
+          }
+        } catch (_error) {
+          /* 没有 connection 服务：下面按「无连接」抛出明确错误 */
         }
       }
-      var ui = raw.ui !== null && typeof raw.ui === "object" ? raw.ui : {};
-      return {
-        version: CONFIG_VERSION,
-        commands: commands,
-        ui: { visible: ui.visible !== false }
-      };
+      return null;
     }
 
-    var configCache = null;
+    function rpcError(code, message, details) {
+      var error = new Error(message);
+      error.code = code;
+      error.details = details;
+      return error;
+    }
+
+    /**
+     * 调用 Host 半体注册的 RPC。
+     * 成功返回 value；失败 throw（err.code / err.details 来自 Host 结构化错误）；无连接直接 throw。
+     */
+    async function rpc(endpoint, payload) {
+      var connection = connectionOf();
+      if (connection === null || connection.rpc === undefined || connection.rpc === null
+        || typeof connection.rpc.call !== "function") {
+        throw rpcError("no-connection", "Host 项目运行器不可用（RPC 未连接）", undefined);
+      }
+      var result;
+      try {
+        result = await connection.rpc.call(RPC_CHANNEL, RPC_NAMESPACE + "/" + endpoint, payload === undefined ? {} : payload);
+      } catch (error) {
+        throw rpcError(
+          error !== null && error !== undefined && typeof error.code === "string" ? error.code : "rpc-failed",
+          messageOf(error) + "（" + endpoint + "）",
+          error !== null && error !== undefined ? error.details : undefined
+        );
+      }
+      if (result === null || result === undefined || typeof result !== "object") {
+        throw rpcError("rpc-failed", "Host RPC " + endpoint + " 没有返回结果", undefined);
+      }
+      if (result.ok !== true) {
+        var info = result.error !== null && result.error !== undefined && typeof result.error === "object" ? result.error : {};
+        throw rpcError(
+          typeof info.code === "string" ? info.code : "rpc-failed",
+          typeof info.message === "string" && info.message !== "" ? info.message : ("RPC 失败：" + endpoint),
+          info.details
+        );
+      }
+      return result.value;
+    }
+
+    // =====================================================================
+    // 六、配置 store（内存 + 订阅；唯一数据来源是 Host）
+    // =====================================================================
+    var configState = null;
+    var configLoaded = false;
     var configListeners = new Set();
 
-    function readConfigFromStorage() {
-      try {
-        if (typeof localStorage === "undefined") return defaultConfig();
-        var raw = localStorage.getItem(CONFIG_KEY);
-        if (raw === null) return defaultConfig();
-        return normalizeConfig(JSON.parse(raw));
-      } catch (_error) {
-        return defaultConfig();
-      }
-    }
-
     function getConfigSnapshot() {
-      if (configCache === null) configCache = readConfigFromStorage();
-      return configCache;
+      return configState;
     }
 
-    function saveConfig(next) {
-      var normalized = normalizeConfig(next);
-      configCache = normalized;
-      try {
-        if (typeof localStorage !== "undefined") localStorage.setItem(CONFIG_KEY, JSON.stringify(normalized));
-      } catch (_error) {
-        /* 存不下时本次会话内仍有效 */
-      }
+    function notifyConfig() {
       configListeners.forEach(function (listener) {
         try {
           listener();
-        } catch (_error) {
-          /* ignore */
-        }
-      });
-      // 同步到 Host 的 commands.json：AI Tool 和浏览器设置页共用同一份配置。
-      // 没有 Host（例如离线测试）时自动退化为纯 localStorage。
-      persistConfigToHost(normalized);
-      return normalized;
-    }
-
-    /**
-     * 调用 Host 半体注册的 RPC，返回结构化结果。
-     * 旧调用方只需要值（失败 = undefined），需要展示真实错误的调用方用这个版本。
-     */
-    async function hostRpcResult(endpoint, payload) {
-      if (hostConnection === null || hostConnection === undefined || hostConnection.rpc === undefined) {
-        return { ok: false, value: undefined, error: new Error("Host 项目运行器不可用（RPC 未连接）") };
-      }
-      try {
-        var result = await hostConnection.rpc.call("/api", "dsh-runner/" + endpoint, payload === undefined ? {} : payload);
-        if (result === null || result === undefined) {
-          return { ok: false, value: undefined, error: new Error("Host 没有返回结果") };
-        }
-        if (result.ok !== true) {
-          var message = result.error && result.error.message ? result.error.message : "RPC 失败";
-          return { ok: false, value: undefined, error: new Error(message) };
-        }
-        return { ok: true, value: result.value, error: undefined };
-      } catch (error) {
-        return { ok: false, value: undefined, error: error instanceof Error ? error : new Error(messageOf(error)) };
-      }
-    }
-
-    /** 兼容旧调用方：失败返回 undefined，不阻塞界面。 */
-    async function hostRpc(endpoint, payload) {
-      var result = await hostRpcResult(endpoint, payload);
-      return result.ok ? result.value : undefined;
-    }
-
-    /** 把还没落盘的配置立刻写给 Host；页面隐藏/关闭前尽力调用，避免丢失刚保存的修改。 */
-    function flushConfigToHost() {
-      if (hostSavePending === null || hostConnection === null || hostConnection === undefined) return;
-      var pending = hostSavePending;
-      hostSavePending = null;
-      if (hostSaveTimer !== null) {
-        clearTimeout(hostSaveTimer);
-        hostSaveTimer = null;
-      }
-      hostRpc("config/save", { config: pending });
-    }
-
-    /** 把 Host 的配置应用到浏览器 store（不反向写 Host，避免循环）。 */
-    function applyConfigFromHost(raw) {
-      var normalized = normalizeConfig(raw);
-      configCache = normalized;
-      try {
-        if (typeof localStorage !== "undefined") localStorage.setItem(CONFIG_KEY, JSON.stringify(normalized));
-      } catch (_error) {
-        /* ignore */
-      }
-      configListeners.forEach(function (listener) {
-        try {
-          listener();
-        } catch (_error) {
-          /* ignore */
+        } catch (error) {
+          logPluginError(runtimeCtx, "配置订阅回调异常", error);
         }
       });
     }
 
-    /** 防抖写入 Host，避免开关/排序连续点击时发很多次 RPC。 */
-    function persistConfigToHost(config) {
-      if (hostConnection === null || hostConnection === undefined) return;
-      hostSavePending = config;
-      if (hostSaveTimer !== null) clearTimeout(hostSaveTimer);
-      hostSaveTimer = setTimeout(function () {
-        hostSaveTimer = null;
-        var pending = hostSavePending;
-        hostSavePending = null;
-        if (pending !== null) hostRpc("config/save", { config: pending });
-      }, 300);
-    }
-
-    /**
-     * 从 Host 拉取最新配置（AI 可能刚通过 Tool 改过）。
-     * Host 文件还不存在时，把浏览器当前配置作为初始值写过去。
-     */
-    async function syncConfigFromHost() {
-      // 先把还没落盘的本地修改写掉，避免同步又把刚保存的命令覆盖回旧版本。
-      if (hostSavePending !== null) {
-        var pending = hostSavePending;
-        hostSavePending = null;
-        if (hostSaveTimer !== null) {
-          clearTimeout(hostSaveTimer);
-          hostSaveTimer = null;
-        }
-        await hostRpc("config/save", { config: pending });
-      }
-      var value = await hostRpc("config/get", {});
-      if (value === undefined) return false;
-      if (value.config === null || value.config === undefined) {
-        await hostRpc("config/save", { config: getConfigSnapshot() });
-        return true;
-      }
-      var incoming = normalizeConfig(value.config);
-      var current = getConfigSnapshot();
-      if (JSON.stringify(incoming) !== JSON.stringify(current)) applyConfigFromHost(incoming);
-      return true;
+    function setConfigState(next) {
+      configState = next;
+      configLoaded = true;
+      notifyConfig();
     }
 
     function subscribeConfig(listener) {
@@ -752,6 +579,43 @@ window.__ModuleLoader__.load({
       return useStoreFallback(subscribeConfig, getConfigSnapshot);
     }
 
+    /** 从 Host 读取最新配置并写入内存 store（返回 RPC 的整个 value）。 */
+    async function loadConfig() {
+      var value = await rpc("config/get", {});
+      setConfigState(value !== null && value !== undefined && value.config !== undefined ? value.config : null);
+      return value;
+    }
+
+    /**
+     * 调 config/* 写接口：Host 返回的 config 就是唯一事实，直接覆盖 store；返回整个 value。
+     * 失败由 rpc throw，调用方展示并保持 store 不变。
+     */
+    async function mutate(endpoint, payload) {
+      var value = await rpc(endpoint, payload);
+      if (value !== null && value !== undefined && value.config !== undefined) setConfigState(value.config);
+      return value;
+    }
+
+    function commandsOf(config) {
+      return config !== null && config !== undefined && Array.isArray(config.commands) ? config.commands : [];
+    }
+
+    function findCommandOf(config, commandId) {
+      var commands = commandsOf(config);
+      for (var i = 0; i < commands.length; i += 1) {
+        if (commands[i] !== null && commands[i] !== undefined && commands[i].id === commandId) return commands[i];
+      }
+      return undefined;
+    }
+
+    function uiVisibleOf(config) {
+      if (config === null || config === undefined || config.ui === null || config.ui === undefined) return true;
+      return config.ui.visible !== false;
+    }
+
+    // =====================================================================
+    // 七、纯函数（路径 / 状态 / 日志格式化）
+    // =====================================================================
     function normalizePath(path) {
       return String(path === undefined || path === null ? "" : path)
         .trim()
@@ -769,26 +633,96 @@ window.__ModuleLoader__.load({
       return current === root || current.indexOf(root + "\\") === 0;
     }
 
-    /** 当前会话应显示的命令：启用的全局命令 + 匹配当前项目的项目命令。 */
-    function visibleCommands(config, projectPath, hasSession) {
+    /** 当前项目应显示的命令：匹配项目的 project 命令 + 所有 global 命令。 */
+    function visibleCommandsForProject(config, projectPath) {
       var list = [];
-      var commands = config !== null && config !== undefined && Array.isArray(config.commands) ? config.commands : [];
+      var commands = commandsOf(config);
       for (var i = 0; i < commands.length; i += 1) {
         var command = commands[i];
-        if (command.enabled !== true) continue;
-        if (command.scope === "global") {
-          list.push(command);
-        } else if (hasSession && commandMatchesProject(command, projectPath)) {
-          list.push(command);
-        }
+        if (command === null || command === undefined) continue;
+        if (command.scope === "global" || commandMatchesProject(command, projectPath)) list.push(command);
       }
       return list;
     }
 
+    function runnerStatusText(status) {
+      if (status === "starting") return "启动中";
+      if (status === "running") return "运行中";
+      if (status === "stopping") return "停止中";
+      if (status === "stopped") return "已停止";
+      if (status === "exited") return "已退出";
+      if (status === "failed") return "启动失败";
+      return "未运行";
+    }
+
+    /** 去掉 ANSI 转义（CSI 颜色/光标、OSC 标题/超链接），日志展示用。 */
+    function stripAnsi(text) {
+      var value = String(text === undefined || text === null ? "" : text);
+      return value
+        .replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g, "")
+        .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
+        .replace(/\u001b[@-_]/g, "");
+    }
+
+    function pad2(value) {
+      return (value < 10 ? "0" : "") + String(value);
+    }
+
+    /** 运行时长：0s / 1m 05s / 1h 02m。 */
+    function formatUptime(ms) {
+      var number = Number(ms);
+      if (!Number.isFinite(number) || number < 0) return "—";
+      var total = Math.floor(number / 1000);
+      if (total >= 3600) return Math.floor(total / 3600) + "h " + pad2(Math.floor((total % 3600) / 60)) + "m";
+      if (total >= 60) return Math.floor(total / 60) + "m " + pad2(total % 60) + "s";
+      return total + "s";
+    }
+
+    /** 字节数：0 B / 512 B / 64.0 KB / 1.0 MB。 */
+    function formatBytes(bytes) {
+      var value = Number(bytes);
+      if (!Number.isFinite(value) || value < 0) return "0 B";
+      if (value < 1024) return Math.floor(value) + " B";
+      if (value < 1024 * 1024) return (value / 1024).toFixed(1) + " KB";
+      return (value / (1024 * 1024)).toFixed(1) + " MB";
+    }
+
+    /** 错误条里补充的结构化详情（端口冲突 / 依赖失败）。 */
+    function errorDetailText(error) {
+      if (error === null || error === undefined) return "";
+      var details = error.details;
+      if (error.code === "port-conflict" && details !== null && details !== undefined && typeof details === "object") {
+        var parts = [];
+        if (typeof details.port === "number") parts.push("端口 " + details.port + " 已被占用");
+        if (typeof details.pid === "number") parts.push("PID " + details.pid);
+        if (typeof details.processName === "string" && details.processName !== "") parts.push(details.processName);
+        if (typeof details.commandLine === "string" && details.commandLine !== "") parts.push(details.commandLine);
+        if (details.managed === true) parts.push("由本插件托管");
+        return parts.join(" · ");
+      }
+      if (error.code === "dependency-failed" && details !== null && details !== undefined && typeof details === "object") {
+        return "依赖命令 " + String(details.commandId) + " 启动失败：" + String(details.message);
+      }
+      if (error.code === "ready-timeout" && details !== null && details !== undefined && typeof details === "object") {
+        return "端口 " + String(details.port) + " 未在 " + String(details.timeoutMs) + "ms 内就绪";
+      }
+      if (details !== null && details !== undefined && typeof details === "object" && Object.keys(details).length > 0) {
+        return JSON.stringify(details);
+      }
+      return "";
+    }
+
+    // =====================================================================
+    // 八、会话 / 工作区 hooks
+    // =====================================================================
     /** 从壳层 slots 提供的 hooks 里解析「当前会话 + 当前工作区路径」。 */
     function useActiveSession(hooks) {
-      var sessions = typeof hooks.useSessions === "function" ? hooks.useSessions(function (state) { return state; }) : undefined;
-      var workspaces = typeof hooks.useWorkspaces === "function" ? hooks.useWorkspaces(function (state) { return state; }) : undefined;
+      var sessions = hooks !== undefined && hooks !== null && typeof hooks.useSessions === "function"
+        ? hooks.useSessions(function (state) { return state; })
+        : undefined;
+      var workspaces = hooks !== undefined && hooks !== null && typeof hooks.useWorkspaces === "function"
+        ? hooks.useWorkspaces(function (state) { return state; })
+        : undefined;
       var active = null;
       if (sessions !== undefined && sessions !== null && sessions.byId !== undefined && sessions.byId !== null) {
         var ids = Object.keys(sessions.byId);
@@ -824,259 +758,24 @@ window.__ModuleLoader__.load({
       };
     }
 
-    // =====================================================================
-    // 六、终端操作（DSH 内置终端）
-    // =====================================================================
-    async function listTerminals(remote, sessionId) {
-      var list = unwrapResult(await remote.list(sessionId));
-      return Array.isArray(list) ? list : [];
-    }
-
-    async function pickShellPath(remote, sessionId) {
-      var shells = [];
-      try {
-        shells = unwrapResult(await remote.shells(sessionId));
-      } catch (_error) {
+    /** 由工作区快照反查某个会话所属工作区路径（composer 按钮用）。 */
+    function useProjectPath(useWorkspaces, sessionId) {
+      var workspaces = typeof useWorkspaces === "function" ? useWorkspaces(function (state) { return state; }) : undefined;
+      if (sessionId === undefined || workspaces === undefined || workspaces === null || !Array.isArray(workspaces.items)) {
         return undefined;
       }
-      if (!Array.isArray(shells)) return undefined;
-      var pwsh = shells.find(function (shell) {
-        var path = String(shell.path || "");
-        var name = String(shell.name || "");
-        return /pwsh(\.exe)?$/i.test(path) || /^pwsh$/i.test(name);
-      });
-      if (pwsh !== undefined) return pwsh.path;
-      var powershell = shells.find(function (shell) {
-        var path = String(shell.path || "");
-        var name = String(shell.name || "");
-        return /powershell(\.exe)?$/i.test(path) || /powershell/i.test(name);
-      });
-      return powershell !== undefined ? powershell.path : undefined;
-    }
-
-    async function createTerminal(remote, sessionId, baseId, shellPath, title) {
-      var request = { id: baseId, cols: 120, rows: 30 };
-      if (shellPath !== undefined) request.shellPath = shellPath;
-      try {
-        var info = unwrapResult(await remote.create(sessionId, request));
-        return { id: baseId, info: info };
-      } catch (error) {
-        var code = error && error.code;
-        var text = messageOf(error);
-        var retryable = code === "terminal/unavailable" || /closed|unavailable/i.test(text);
-        if (!retryable) throw error;
-        var freshId = baseId + "-" + Date.now().toString(36);
-        var freshRequest = { id: freshId, cols: 120, rows: 30 };
-        if (shellPath !== undefined) freshRequest.shellPath = shellPath;
-        var freshInfo = unwrapResult(await remote.create(sessionId, freshRequest));
-        return { id: freshId, info: freshInfo };
-      }
-    }
-
-    async function safeRename(remote, sessionId, terminalId, title) {
-      try {
-        unwrapResult(await remote.rename(sessionId, terminalId, title));
-      } catch (_error) {
-        /* 标题只是展示信息 */
-      }
-    }
-
-    async function sendCommands(remote, sessionId, terminalId, commandLines) {
-      var controller = new AbortController();
-      var handle = remote.attach(sessionId, terminalId, controller.signal);
-      var iterator = null;
-      try {
-        if (typeof handle[Symbol.asyncIterator] !== "function") {
-          for (var directIndex = 0; directIndex < commandLines.length; directIndex += 1) {
-            handle.send({ type: "write", sequence: directIndex + 1, data: commandLines[directIndex] + "\r" });
-          }
-          return;
-        }
-        iterator = handle[Symbol.asyncIterator]();
-        for (var index = 0; index < commandLines.length; index += 1) {
-          var sequence = index + 1;
-          handle.send({ type: "write", sequence: sequence, data: commandLines[index] + "\r" });
-          var acknowledged = false;
-          while (!acknowledged) {
-            var next = await withTimeout(iterator.next(), 10000, "等待 DSH 终端确认输入超时（10 秒）");
-            if (next.done === true) throw new Error("DSH 终端连接在确认命令前结束");
-            var frame = next.value;
-            if (frame !== null && typeof frame === "object" && frame.type === "ack" && frame.sequence >= sequence) {
-              if (frame.refusal !== undefined) throw new Error("DSH 终端拒绝输入：" + String(frame.refusal));
-              acknowledged = true;
-            }
-          }
-        }
-      } finally {
-        try {
-          controller.abort();
-        } catch (_error) {
-          /* ignore */
-        }
-        if (handle !== null && typeof handle.dispose === "function") {
-          try {
-            handle.dispose();
-          } catch (_error) {
-            /* ignore */
-          }
-        }
-        if (iterator !== null && typeof iterator.return === "function") {
-          try {
-            await iterator.return();
-          } catch (_error) {
-            /* ignore */
-          }
-        }
-      }
-    }
-
-    async function refreshTerminalInventory(ctx, sessionId) {
-      var webTerminals = getService(ctx, "webTerminals");
-      if (webTerminals === undefined || webTerminals === null) return;
-      if (typeof webTerminals.recover !== "function") return;
-      try {
-        await webTerminals.recover(sessionId, true);
-      } catch (_error) {
-        /* ignore */
-      }
-    }
-
-    function findTerminalTab(ctx, sessionId, terminalId) {
-      var sidebarRight = getService(ctx, "sidebarRight");
-      var webTerminals = getService(ctx, "webTerminals");
-      if (sidebarRight === undefined || sidebarRight === null) return undefined;
-      if (sidebarRight.openTabs === undefined || typeof sidebarRight.openTabs.getSnapshot !== "function") return undefined;
-      var tabs = sidebarRight.openTabs.getSnapshot() || [];
-      for (var i = 0; i < tabs.length; i += 1) {
-        var tab = tabs[i];
-        if (tab.sessionId !== sessionId || tab.kind !== "terminal") continue;
-        if (webTerminals !== undefined && webTerminals !== null && webTerminals.views !== undefined) {
-          var views = webTerminals.views.get(sessionId);
-          var view = views !== undefined ? views.get(tab.tabId) : undefined;
-          if (view !== undefined && view.id === terminalId) return tab.tabId;
-        }
-        if (webTerminals !== undefined && webTerminals !== null && webTerminals.bindings !== undefined
-          && typeof webTerminals.bindings.get === "function") {
-          try {
-            if (webTerminals.bindings.get(sessionId, tab.contentId) === terminalId) return tab.tabId;
-          } catch (_error) {
-            /* ignore */
-          }
-        }
-        try {
-          if (sidebarRight.tabDomain !== undefined && typeof sidebarRight.tabDomain.occurrence === "function") {
-            var occurrence = sidebarRight.tabDomain.occurrence(sessionId, { id: tab.tabId });
-            var params = occurrence.navigation.getSnapshot().params;
-            if (params !== undefined && params !== null && params.terminalId === terminalId) return tab.tabId;
-          }
-        } catch (_error) {
-          /* ignore */
+      for (var i = 0; i < workspaces.items.length; i += 1) {
+        var workspace = workspaces.items[i];
+        if (workspace !== null && workspace !== undefined && Array.isArray(workspace.sessionIds)
+          && workspace.sessionIds.indexOf(sessionId) !== -1) {
+          return workspace.path;
         }
       }
       return undefined;
     }
 
-    /**
-     * 打开日志终端页签。
-     *   focus=true ：用户显式操作（点「运行」/点运行中的命令），展开右侧栏并聚焦；
-     *   focus=false：切会话时后台补开，打开后恢复用户原来的页签与展开状态，不改动当前视图。
-     */
-    async function openTerminalTab(ctx, sessionId, terminalId, options) {
-      var sidebarRight = getService(ctx, "sidebarRight");
-      if (sidebarRight === undefined || sidebarRight === null) {
-        throw new Error("DSH 右侧栏服务（sidebarRight）不可用，无法打开内置终端面板");
-      }
-      var focus = options !== undefined && options !== null && options.focus === true;
-      if (focus && typeof sidebarRight.isExpanded === "function") {
-        try {
-          if (!sidebarRight.isExpanded() && typeof sidebarRight.toggleExpanded === "function") sidebarRight.toggleExpanded();
-        } catch (_error) {
-          /* ignore */
-        }
-      }
-      var existingTabId = findTerminalTab(ctx, sessionId, terminalId);
-      if (existingTabId !== undefined) {
-        if (focus && typeof sidebarRight.focus === "function") {
-          try {
-            sidebarRight.focus(existingTabId);
-          } catch (_error) {
-            /* ignore */
-          }
-        }
-        return true;
-      }
-      var previousTabId;
-      var wasExpanded = true;
-      if (!focus) {
-        try {
-          if (typeof sidebarRight.isExpanded === "function") wasExpanded = sidebarRight.isExpanded() !== false;
-        } catch (_error) {
-          /* ignore */
-        }
-        try {
-          if (typeof sidebarRight.active === "function") {
-            var activeTab = sidebarRight.active();
-            if (activeTab !== null && activeTab !== undefined && typeof activeTab.id === "string") previousTabId = activeTab.id;
-          }
-        } catch (_error) {
-          /* ignore */
-        }
-      }
-      await refreshTerminalInventory(ctx, sessionId);
-      if (typeof sidebarRight.openTab === "function") {
-        sidebarRight.openTab("terminal", { params: { terminalId: terminalId } });
-      } else if (typeof sidebarRight.openTabIn === "function") {
-        sidebarRight.openTabIn(sessionId, "terminal", { params: { terminalId: terminalId } });
-      } else {
-        throw new Error("DSH 右侧栏不支持 openTab，无法打开内置终端面板");
-      }
-      if (focus) return true;
-      // 等这次布局变更提交后，把用户原来的页签和展开状态恢复回去。
-      await new Promise(function (resolve) {
-        setTimeout(resolve, 60);
-      });
-      try {
-        if (previousTabId !== undefined && typeof sidebarRight.focus === "function") sidebarRight.focus(previousTabId);
-      } catch (_error) {
-        /* ignore */
-      }
-      if (!wasExpanded && typeof sidebarRight.isExpanded === "function" && sidebarRight.isExpanded()
-        && typeof sidebarRight.toggleExpanded === "function") {
-        try {
-          sidebarRight.toggleExpanded();
-        } catch (_error) {
-          /* ignore */
-        }
-      }
-      return true;
-    }
-
-    /** 关闭终端：先尽量移除页签，再兜底把 Host 侧终端关掉（幂等）。 */
-    async function closeTerminal(ctx, sessionId, terminalId) {
-      var sidebarRight = getService(ctx, "sidebarRight");
-      var tabId = findTerminalTab(ctx, sessionId, terminalId);
-      var closed = false;
-      if (tabId !== undefined && sidebarRight !== undefined && sidebarRight !== null
-        && typeof sidebarRight.closeIn === "function") {
-        try {
-          sidebarRight.closeIn(sessionId, tabId);
-          closed = true;
-        } catch (_error) {
-          /* 回退到 remote.close */
-        }
-      }
-      var remote = getTerminalRemote(ctx);
-      if (remote === undefined || remote === null) return closed;
-      try {
-        unwrapResult(await remote.close(sessionId, terminalId));
-        return true;
-      } catch (_error) {
-        return closed;
-      }
-    }
-
     // =====================================================================
-    // 七、更新状态 hook
+    // 九、更新状态 hook 与插件详情页提示
     // =====================================================================
     function useUpdateStatus() {
       var pair = react.useState({ phase: "checking" });
@@ -1133,7 +832,7 @@ window.__ModuleLoader__.load({
         : (checking ? "检查中…" : "未知");
       var hint;
       if (update !== undefined && update !== null && update.phase === "error") {
-        hint = "检查失败：" + update.message + "（不影响终端功能）";
+        hint = "检查失败：" + update.message + "（不影响运行面板）";
       } else if (update !== undefined && update !== null && update.available) {
         hint = "发现新版本 v" + update.latestVersion + "，建议升级。";
       } else if (update !== undefined && update !== null && update.phase === "ready") {
@@ -1172,11 +871,8 @@ window.__ModuleLoader__.load({
     }
 
     // =====================================================================
-    // 八、配置编辑器（设置页与运行按钮的「管理命令…」弹窗共用）
+    // 十、工作区选项 / 小图标
     // =====================================================================
-    // 交互原则：列表尽量紧凑、少留白；编辑表单内联展开，作用域用分段按钮选择，
-    // 项目级命令直接从 DSH 已注册的工作区下拉选择，不需要手输路径（也允许自定义）。
-
     /** 从 useWorkspaces 快照里取出「项目选择器」选项（去重、保留标题）。 */
     function workspaceOptionsFrom(useWorkspaces) {
       var workspaces = typeof useWorkspaces === "function" ? useWorkspaces(function (state) { return state; }) : undefined;
@@ -1220,7 +916,142 @@ window.__ModuleLoader__.load({
       return null;
     }
 
-    function LimobConfigEditor(props) {
+    /** 左侧导航「运行」面板图标：播放三角（props.size）。 */
+    function RunnerPanelIcon(props) {
+      var size = props !== undefined && props !== null && typeof props.size === "number" ? props.size : 16;
+      return h("svg", {
+        width: size,
+        height: size,
+        viewBox: "0 0 16 16",
+        "aria-hidden": "true",
+        focusable: "false"
+      }, h("path", { d: "M5 3.2l8 4.8-8 4.8V3.2z", fill: "currentColor" }));
+    }
+
+    // =====================================================================
+    // 十一、配置编辑器（settings.section 与运行面板「管理命令」弹窗共用）
+    // =====================================================================
+    function emptyDraft(projectPath) {
+      var hasProject = typeof projectPath === "string" && projectPath !== "";
+      return {
+        id: "",
+        title: "",
+        command: "",
+        cwd: "",
+        scope: hasProject ? "project" : "global",
+        projectRoot: hasProject ? projectPath : "",
+        enabled: true,
+        envText: "",
+        portsText: "",
+        readyPortText: "",
+        readyTimeoutText: "120000",
+        dependsOn: []
+      };
+    }
+
+    function draftFromCommand(command) {
+      var env = command.env !== null && command.env !== undefined && typeof command.env === "object" ? command.env : {};
+      var envLines = [];
+      var envKeys = Object.keys(env);
+      for (var i = 0; i < envKeys.length; i += 1) envLines.push(envKeys[i] + "=" + String(env[envKeys[i]]));
+      var ports = Array.isArray(command.ports) ? command.ports : [];
+      return {
+        id: typeof command.id === "string" ? command.id : "",
+        title: typeof command.title === "string" ? command.title : "",
+        command: typeof command.command === "string" ? command.command : "",
+        cwd: typeof command.cwd === "string" ? command.cwd : "",
+        scope: command.scope === "project" ? "project" : "global",
+        projectRoot: typeof command.projectRoot === "string" ? command.projectRoot : "",
+        enabled: command.enabled !== false,
+        envText: envLines.join("\n"),
+        portsText: ports.join(", "),
+        readyPortText: command.readyPort === null || command.readyPort === undefined ? "" : String(command.readyPort),
+        readyTimeoutText: typeof command.readyTimeoutMs === "number" ? String(command.readyTimeoutMs) : "120000",
+        dependsOn: Array.isArray(command.dependsOn) ? command.dependsOn.slice() : []
+      };
+    }
+
+    /**
+     * 把表单草稿转成 RPC 的 command/patch。
+     * 只做「文本 → 结构」的输入解析（env 行、端口列表），语义校验交给 Host。
+     */
+    function parseDraft(draft) {
+      var title = String(draft.title === undefined || draft.title === null ? "" : draft.title).trim();
+      if (title === "") throw new Error("请填写命令名称");
+      var command = String(draft.command === undefined || draft.command === null ? "" : draft.command).trim();
+      if (command === "") throw new Error("请填写要执行的命令");
+      var scope = draft.scope === "project" ? "project" : "global";
+      var projectRoot = String(draft.projectRoot === undefined || draft.projectRoot === null ? "" : draft.projectRoot).trim();
+      if (scope === "project" && projectRoot === "") throw new Error("「指定项目」必须选择或填写项目根目录");
+
+      var env = {};
+      var envLines = String(draft.envText === undefined || draft.envText === null ? "" : draft.envText).split(/\r?\n/);
+      for (var i = 0; i < envLines.length; i += 1) {
+        var line = envLines[i].trim();
+        if (line === "" || line.charAt(0) === "#") continue;
+        var matched = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(line);
+        if (matched === null) throw new Error("环境变量第 " + (i + 1) + " 行格式错误，应为 KEY=VALUE：" + line);
+        env[matched[1]] = matched[2];
+      }
+
+      var ports = [];
+      var portTexts = String(draft.portsText === undefined || draft.portsText === null ? "" : draft.portsText).split(/[,\s]+/);
+      for (var j = 0; j < portTexts.length; j += 1) {
+        var portText = portTexts[j].trim();
+        if (portText === "") continue;
+        var port = Number(portText);
+        if (!Number.isInteger(port) || port < 0 || port > 65535) {
+          throw new Error("端口必须是 0-65535 的整数：" + portText);
+        }
+        if (ports.indexOf(port) === -1) ports.push(port);
+      }
+
+      var readyPortText = String(draft.readyPortText === undefined || draft.readyPortText === null ? "" : draft.readyPortText).trim();
+      var readyPort = null;
+      if (readyPortText !== "") {
+        var parsedReadyPort = Number(readyPortText);
+        if (!Number.isInteger(parsedReadyPort) || parsedReadyPort < 0 || parsedReadyPort > 65535) {
+          throw new Error("就绪端口必须是 0-65535 的整数：" + readyPortText);
+        }
+        readyPort = parsedReadyPort;
+      }
+
+      var readyTimeoutText = String(draft.readyTimeoutText === undefined || draft.readyTimeoutText === null ? "" : draft.readyTimeoutText).trim();
+      var readyTimeoutMs = 120000;
+      if (readyTimeoutText !== "") {
+        var parsedTimeout = Number(readyTimeoutText);
+        if (!Number.isInteger(parsedTimeout) || parsedTimeout < 1000 || parsedTimeout > 1800000) {
+          throw new Error("就绪超时必须是不小于 1000 的整数毫秒（上限 1800000）");
+        }
+        readyTimeoutMs = parsedTimeout;
+      }
+
+      var dependsOn = [];
+      if (Array.isArray(draft.dependsOn)) {
+        for (var k = 0; k < draft.dependsOn.length; k += 1) {
+          var dependency = draft.dependsOn[k];
+          if (typeof dependency === "string" && dependency !== "" && dependsOn.indexOf(dependency) === -1) {
+            dependsOn.push(dependency);
+          }
+        }
+      }
+
+      return {
+        title: title,
+        command: command,
+        cwd: String(draft.cwd === undefined || draft.cwd === null ? "" : draft.cwd).trim(),
+        scope: scope,
+        projectRoot: scope === "project" ? projectRoot : "",
+        enabled: draft.enabled !== false,
+        env: env,
+        ports: ports,
+        readyPort: readyPort,
+        readyTimeoutMs: readyTimeoutMs,
+        dependsOn: dependsOn
+      };
+    }
+
+    function ConfigEditor(props) {
       var config = useConfig();
       var currentProjectPath = props !== undefined ? props.currentProjectPath : undefined;
       var workspaces = props !== undefined && Array.isArray(props.workspaces) ? props.workspaces : [];
@@ -1228,6 +1059,9 @@ window.__ModuleLoader__.load({
       var editingPair = react.useState(null);
       var editing = editingPair[0];
       var setEditing = editingPair[1];
+      var busyPair = react.useState(false);
+      var busy = busyPair[0];
+      var setBusy = busyPair[1];
       var errorPair = react.useState("");
       var error = errorPair[0];
       var setError = errorPair[1];
@@ -1237,18 +1071,9 @@ window.__ModuleLoader__.load({
       var deletePair = react.useState(null);
       var pendingDelete = deletePair[0];
       var setPendingDelete = deletePair[1];
-      var importPair = react.useState(false);
-      var importOpen = importPair[0];
-      var setImportOpen = importPair[1];
-      var importTextPair = react.useState("");
-      var importText = importTextPair[0];
-      var setImportText = importTextPair[1];
-      var resetPair = react.useState(false);
-      var resetArmed = resetPair[0];
-      var setResetArmed = resetPair[1];
-      var customProjectPair = react.useState(false);
-      var projectCustom = customProjectPair[0];
-      var setProjectCustom = customProjectPair[1];
+      var projectCustomPair = react.useState(false);
+      var projectCustom = projectCustomPair[0];
+      var setProjectCustom = projectCustomPair[1];
 
       // 提示 3.5 秒后自动消失。
       react.useEffect(function () {
@@ -1261,15 +1086,21 @@ window.__ModuleLoader__.load({
         };
       }, [notice]);
 
-      // 打开设置页时从 Host 拉一次最新配置，避免 AI 刚改过而页面还是旧的。
+      // 打开时从 Host 读一次最新配置（AI 可能刚通过 Tool 改过）。
       react.useEffect(function () {
-        syncConfigFromHost();
+        var alive = true;
+        loadConfig().catch(function (loadError) {
+          if (alive) setError(messageOf(loadError));
+        });
+        return function () {
+          alive = false;
+        };
       }, []);
 
       /** 项目选择器的选项：已注册工作区 + 当前工作区（若尚未注册，当前工作区排在最前）。 */
       function projectOptions() {
         var list = workspaces.slice();
-        if (currentProjectPath !== undefined && currentProjectPath !== "") {
+        if (currentProjectPath !== undefined && currentProjectPath !== null && currentProjectPath !== "") {
           var exists = false;
           for (var i = 0; i < list.length; i += 1) {
             if (normalizePath(list[i].path) === normalizePath(currentProjectPath)) {
@@ -1300,182 +1131,202 @@ window.__ModuleLoader__.load({
       }
 
       function startCreate() {
-        setEditing({
-          id: "",
-          title: "",
-          terminalTitle: "",
-          cwd: currentProjectPath !== undefined ? currentProjectPath : "",
-          command: "",
-          scope: "global",
-          projectRoot: "",
-          enabled: true,
-          utf8CodePage: false,
-          longRunning: false
-        });
+        setEditing(emptyDraft(currentProjectPath));
         setProjectCustom(false);
         setError("");
       }
 
       function startEdit(command) {
-        setEditing(Object.assign({}, command, { terminalTitle: command.terminalTitle || "" }));
-        setProjectCustom(command.scope === "project" && workspaceFor(command.projectRoot) === undefined);
+        var draft = draftFromCommand(command);
+        setEditing(draft);
+        setProjectCustom(draft.scope === "project" && draft.projectRoot !== "" && workspaceFor(draft.projectRoot) === undefined);
         setError("");
       }
 
       function updateDraft(field, value) {
-        if (editing === null) return;
-        var next = Object.assign({}, editing);
-        next[field] = value;
-        if (field === "command" && /[^\x00-\x7f]/.test(String(value))) next.utf8CodePage = true;
-        setEditing(next);
+        setEditing(function (previous) {
+          if (previous === null || previous === undefined) return previous;
+          var next = Object.assign({}, previous);
+          next[field] = value;
+          return next;
+        });
       }
 
       function chooseScope(scope) {
-        if (editing === null) return;
-        if (scope === "project") {
-          var fallback = currentProjectPath !== undefined && currentProjectPath !== "" ? currentProjectPath : "";
-          var known = fallback !== "" && workspaceFor(fallback) !== undefined;
-          setEditing(Object.assign({}, editing, {
-            scope: "project",
-            projectRoot: editing.projectRoot !== "" ? editing.projectRoot : fallback,
-            cwd: editing.cwd !== "" ? editing.cwd : fallback
-          }));
-          setProjectCustom(editing.projectRoot === "" && !known);
-        } else {
-          setEditing(Object.assign({}, editing, { scope: "global" }));
-          setProjectCustom(false);
-        }
+        setEditing(function (previous) {
+          if (previous === null || previous === undefined) return previous;
+          var next = Object.assign({}, previous);
+          next.scope = scope;
+          if (scope === "project") {
+            if (next.projectRoot === "") next.projectRoot = currentProjectPath !== undefined && currentProjectPath !== null ? currentProjectPath : "";
+            if (next.cwd === "" && next.projectRoot !== "") next.cwd = next.projectRoot;
+          }
+          return next;
+        });
+        setProjectCustom(false);
       }
 
       function chooseProject(value) {
-        if (editing === null) return;
         if (value === "__custom__") {
           setProjectCustom(true);
-          setEditing(Object.assign({}, editing, { projectRoot: "" }));
+          updateDraft("projectRoot", "");
           return;
         }
         setProjectCustom(false);
-        setEditing(Object.assign({}, editing, {
-          projectRoot: value,
-          cwd: editing.cwd !== "" ? editing.cwd : value
-        }));
+        setEditing(function (previous) {
+          if (previous === null || previous === undefined) return previous;
+          var next = Object.assign({}, previous);
+          next.projectRoot = value;
+          if (next.cwd === "") next.cwd = value;
+          return next;
+        });
       }
 
       function useProjectAsCwd() {
-        if (editing === null || editing.projectRoot === "") return;
-        setEditing(Object.assign({}, editing, { cwd: editing.projectRoot }));
+        setEditing(function (previous) {
+          if (previous === null || previous === undefined || previous.projectRoot === "") return previous;
+          var next = Object.assign({}, previous);
+          next.cwd = next.projectRoot;
+          return next;
+        });
       }
 
-      function saveDraft() {
-        if (editing === null) return;
-        var normalized = normalizeCommand(editing);
-        if (normalized === null) {
-          setError("请填写名称、工作目录、命令；作用域为「指定项目」时还要选择或填写项目。");
-          return;
-        }
-        var next = Object.assign({}, config, { commands: config.commands.slice() });
-        var index = -1;
-        for (var i = 0; i < next.commands.length; i += 1) {
-          if (next.commands[i].id === normalized.id) {
-            index = i;
-            break;
-          }
-        }
-        if (index === -1) next.commands.push(normalized);
-        else next.commands[index] = normalized;
-        saveConfig(next);
-        setEditing(null);
+      function toggleDependency(id) {
+        setEditing(function (previous) {
+          if (previous === null || previous === undefined) return previous;
+          var next = Object.assign({}, previous);
+          var list = Array.isArray(previous.dependsOn) ? previous.dependsOn.slice() : [];
+          var index = list.indexOf(id);
+          if (index === -1) list.push(id);
+          else list.splice(index, 1);
+          next.dependsOn = list;
+          return next;
+        });
+      }
+
+      async function saveDraft() {
+        if (editing === null || editing === undefined || busy) return;
+        setBusy(true);
         setError("");
-        flash("已保存：" + normalized.title);
-      }
-
-      function removeCommand(id) {
-        saveConfig(Object.assign({}, config, {
-          commands: config.commands.filter(function (command) {
-            return command.id !== id;
-          })
-        }));
-        if (editing !== null && editing.id === id) setEditing(null);
-        setPendingDelete(null);
-        flash("已删除命令");
-      }
-
-      function moveCommand(index, delta) {
-        var target = index + delta;
-        if (target < 0 || target >= config.commands.length) return;
-        var commands = config.commands.slice();
-        var moved = commands[index];
-        commands[index] = commands[target];
-        commands[target] = moved;
-        saveConfig(Object.assign({}, config, { commands: commands }));
-      }
-
-      function toggleEnabled(command) {
-        saveConfig(Object.assign({}, config, {
-          commands: config.commands.map(function (item) {
-            if (item.id !== command.id) return item;
-            return Object.assign({}, item, { enabled: !item.enabled });
-          })
-        }));
-      }
-
-      function toggleVisible() {
-        saveConfig(Object.assign({}, config, {
-          ui: Object.assign({}, config.ui, { visible: !config.ui.visible })
-        }));
-        flash(config.ui.visible ? "已隐藏输入框下方的运行按钮" : "已显示输入框下方的运行按钮");
-      }
-
-      function resetDefaults() {
-        if (!resetArmed) {
-          setResetArmed(true);
-          flash("再点一次「确认恢复」：会清空自定义命令（运行按钮开关保留）。");
-          return;
-        }
-        var defaults = defaultConfig();
-        defaults.ui = config.ui;
-        saveConfig(defaults);
-        setEditing(null);
-        setResetArmed(false);
-        flash("已恢复内置的 4 条命令");
-      }
-
-      function exportConfig() {
-        var copied = copyTextToClipboard(JSON.stringify(config, null, 2));
-        flash(copied ? "配置 JSON 已复制到剪贴板" : "复制失败，请重试");
-      }
-
-      function applyImport() {
         try {
-          var normalized = normalizeConfig(JSON.parse(importText));
-          saveConfig(normalized);
-          setImportOpen(false);
-          setImportText("");
+          var payload = parseDraft(editing);
+          if (editing.id === "") {
+            var created = await mutate("config/create", { command: payload });
+            flash("已创建：" + (created !== null && created !== undefined && created.command !== null
+              && created.command !== undefined && typeof created.command.title === "string"
+              ? created.command.title : payload.title));
+          } else {
+            var updated = await mutate("config/update", { id: editing.id, patch: payload });
+            flash("已保存：" + (updated !== null && updated !== undefined && updated.command !== null
+              && updated.command !== undefined && typeof updated.command.title === "string"
+              ? updated.command.title : payload.title));
+          }
           setEditing(null);
-          setResetArmed(false);
-          flash("已导入配置（" + normalized.commands.length + " 条命令）");
-        } catch (importError) {
-          setError("导入失败：" + messageOf(importError));
+          setProjectCustom(false);
+        } catch (saveError) {
+          setError(messageOf(saveError));
+        } finally {
+          setBusy(false);
         }
       }
 
-      var projectCount = config.commands.filter(function (command) {
-        return command.scope === "project";
-      }).length;
-      var currentWorkspace = currentProjectPath !== undefined && currentProjectPath !== ""
+      async function removeCommand(id) {
+        setBusy(true);
+        setError("");
+        try {
+          await mutate("config/delete", { id: id });
+          if (editing !== null && editing !== undefined && editing.id === id) setEditing(null);
+          setPendingDelete(null);
+          flash("已删除命令");
+        } catch (deleteError) {
+          setError(messageOf(deleteError));
+        } finally {
+          setBusy(false);
+        }
+      }
+
+      async function moveCommand(index, delta) {
+        if (busy) return;
+        var commands = commandsOf(config);
+        var target = index + delta;
+        if (target < 0 || target >= commands.length) return;
+        var ids = [];
+        for (var i = 0; i < commands.length; i += 1) ids.push(commands[i].id);
+        var moved = ids[index];
+        ids[index] = ids[target];
+        ids[target] = moved;
+        setBusy(true);
+        setError("");
+        try {
+          await mutate("config/reorder", { ids: ids });
+        } catch (reorderError) {
+          setError(messageOf(reorderError));
+        } finally {
+          setBusy(false);
+        }
+      }
+
+      async function toggleEnabled(command) {
+        if (busy) return;
+        setBusy(true);
+        setError("");
+        try {
+          await mutate("config/update", { id: command.id, patch: { enabled: command.enabled === false } });
+        } catch (toggleError) {
+          setError(messageOf(toggleError));
+        } finally {
+          setBusy(false);
+        }
+      }
+
+      async function toggleVisible() {
+        if (busy) return;
+        var visible = !uiVisibleOf(config);
+        setBusy(true);
+        setError("");
+        try {
+          await mutate("config/ui", { visible: visible });
+          flash(visible ? "已显示输入框下方的运行按钮" : "已隐藏输入框下方的运行按钮");
+        } catch (visibleError) {
+          setError(messageOf(visibleError));
+        } finally {
+          setBusy(false);
+        }
+      }
+
+      var commands = commandsOf(config);
+      var options = projectOptions();
+      var projectCount = 0;
+      for (var countIndex = 0; countIndex < commands.length; countIndex += 1) {
+        if (commands[countIndex].scope === "project") projectCount += 1;
+      }
+      var currentWorkspace = currentProjectPath !== undefined && currentProjectPath !== null && currentProjectPath !== ""
         ? workspaceFor(currentProjectPath)
         : undefined;
-      var statText = config.commands.length + " 条命令"
+      var statText = (configLoaded ? commands.length + " 条命令" : "正在读取 Host 配置…")
         + (projectCount > 0 ? " · " + projectCount + " 条项目级" : "")
         + (currentWorkspace !== undefined ? " · 当前 " + currentWorkspace.title : "");
 
-      var options = projectOptions();
-      var selectedProject = editing !== null && editing.projectRoot !== "" ? workspaceFor(editing.projectRoot) : undefined;
+      var selectedProject = editing !== null && editing !== undefined && editing.projectRoot !== ""
+        ? workspaceFor(editing.projectRoot)
+        : undefined;
       var projectSelectValue = projectCustom
         ? "__custom__"
-        : (selectedProject !== undefined ? selectedProject.path : (editing !== null && editing.projectRoot !== "" ? "__custom__" : (options.length > 0 ? options[0].path : "__custom__")));
+        : (selectedProject !== undefined
+          ? selectedProject.path
+          : (editing !== null && editing !== undefined && editing.projectRoot !== ""
+            ? "__custom__"
+            : (options.length > 0 ? options[0].path : "__custom__")));
 
-      var form = editing === null ? null : h("div", { className: "dshLimobCfgForm" },
+      // dependsOn 候选：同一项目（或当前项目）里已启用的其它命令。
+      var depProjectPath = editing !== null && editing !== undefined && editing.scope === "project" && editing.projectRoot !== ""
+        ? editing.projectRoot
+        : currentProjectPath;
+      var depCandidates = editing === null || editing === undefined ? [] : visibleCommandsForProject(config, depProjectPath).filter(function (command) {
+        return command.id !== editing.id && command.enabled !== false;
+      });
+
+      var form = editing === null || editing === undefined ? null : h("div", { className: "dshLimobCfgForm" },
         h("div", { className: "dshLimobCfgFormTop" },
           h("span", { className: "dshLimobCfgFormTitle" }, editing.id === "" ? "新增命令" : "编辑命令"),
           h("button", {
@@ -1491,38 +1342,38 @@ window.__ModuleLoader__.load({
             h("input", {
               className: "dshLimobInput",
               value: editing.title,
-              placeholder: "例如：开发调试",
+              placeholder: "例如：调试后端",
               onChange: function (event) { updateDraft("title", event.target.value); }
             })),
           h("label", { className: "dshLimobFormField" },
-            h("span", null, "终端标题（可选）"),
+            h("span", null, "触发端口（逗号分隔）"),
             h("input", {
               className: "dshLimobInput",
-              value: editing.terminalTitle,
-              placeholder: "默认 Limob-<id>",
-              onChange: function (event) { updateDraft("terminalTitle", event.target.value); }
+              value: editing.portsText,
+              placeholder: "8001, 5173",
+              onChange: function (event) { updateDraft("portsText", event.target.value); }
             })),
           h("label", { className: "dshLimobFormField", "data-wide": "true" },
-            h("span", null, "工作目录 *"),
+            h("span", null, "命令（PowerShell 固定文本）*"),
+            h("textarea", {
+              className: "dshLimobTextarea",
+              value: editing.command,
+              placeholder: "python -m uvicorn main:app --port 8001 --reload",
+              onChange: function (event) { updateDraft("command", event.target.value); }
+            })),
+          h("label", { className: "dshLimobFormField", "data-wide": "true" },
+            h("span", null, "工作目录（空 = 项目目录）"),
             h("div", { className: "dshLimobFormRow" },
               h("input", {
                 className: "dshLimobInput",
                 style: { flex: "1 1 220px" },
                 value: editing.cwd,
-                placeholder: "H:\\Limob-windows",
+                placeholder: "H:\\项目\\后端",
                 onChange: function (event) { updateDraft("cwd", event.target.value); }
               }),
               editing.scope === "project" && editing.projectRoot !== ""
                 ? h("button", { type: "button", className: "dshLimobLinkBtn", onClick: useProjectAsCwd }, "使用项目目录")
                 : null)),
-          h("label", { className: "dshLimobFormField", "data-wide": "true" },
-            h("span", null, "命令（PowerShell，固定文本）*"),
-            h("textarea", {
-              className: "dshLimobTextarea",
-              value: editing.command,
-              placeholder: "pnpm 客户端-调试",
-              onChange: function (event) { updateDraft("command", event.target.value); }
-            })),
           h("div", { className: "dshLimobFormField", "data-wide": "true" },
             h("span", null, "作用域"),
             h("div", { className: "dshLimobFormRow" },
@@ -1553,22 +1404,52 @@ window.__ModuleLoader__.load({
                   className: "dshLimobInput",
                   style: { marginTop: "5px" },
                   value: editing.projectRoot,
-                  placeholder: "项目根目录，例如 H:\\Limob-windows",
+                  placeholder: "项目根目录，例如 H:\\项目",
                   onChange: function (event) { updateDraft("projectRoot", event.target.value); }
                 })
               : null,
             editing.scope === "project"
-              ? h("span", { className: "dshLimobFieldHint" }, "只在该工作区的会话里出现；下拉列表来自 DSH 已注册的工作区。")
+              ? h("span", { className: "dshLimobFieldHint" }, "只在该工作区的会话与运行面板里出现；下拉列表来自 DSH 已注册的工作区。")
               : null),
+          h("label", { className: "dshLimobFormField", "data-wide": "true" },
+            h("span", null, "环境变量（每行 KEY=VALUE）"),
+            h("textarea", {
+              className: "dshLimobTextarea",
+              value: editing.envText,
+              placeholder: "APP_ENV=dev\nAPP_PORT=8001",
+              onChange: function (event) { updateDraft("envText", event.target.value); }
+            })),
+          h("label", { className: "dshLimobFormField" },
+            h("span", null, "就绪端口（空 = 不等就绪）"),
+            h("input", {
+              className: "dshLimobInput",
+              value: editing.readyPortText,
+              placeholder: "8001",
+              onChange: function (event) { updateDraft("readyPortText", event.target.value); }
+            })),
+          h("label", { className: "dshLimobFormField" },
+            h("span", null, "就绪超时（毫秒，>=1000）"),
+            h("input", {
+              className: "dshLimobInput",
+              value: editing.readyTimeoutText,
+              placeholder: "120000",
+              onChange: function (event) { updateDraft("readyTimeoutText", event.target.value); }
+            })),
+          h("div", { className: "dshLimobFormField", "data-wide": "true" },
+            h("span", null, "依赖命令（先启动这些命令）"),
+            depCandidates.length === 0
+              ? h("span", { className: "dshLimobFieldHint" }, "当前项目没有可选的其它命令")
+              : h("div", { className: "dshLimobDepList" },
+                  depCandidates.map(function (command) {
+                    return h("label", { key: command.id, className: "dshLimobDepItem" },
+                      h("input", {
+                        type: "checkbox",
+                        checked: Array.isArray(editing.dependsOn) && editing.dependsOn.indexOf(command.id) !== -1,
+                        onChange: function () { toggleDependency(command.id); }
+                      }),
+                      h("span", null, command.title));
+                  }))),
           h("div", { className: "dshLimobFormRow", "data-wide": "true" },
-            h("label", { className: "dshLimobSwitch" },
-              h("input", {
-                type: "checkbox",
-                checked: editing.utf8CodePage,
-                onChange: function (event) { updateDraft("utf8CodePage", event.target.checked); }
-              }),
-              h("span", { className: "dshLimobSwitchTrack" }),
-              h("span", null, "中文命令先执行 chcp 65001")),
             h("label", { className: "dshLimobSwitch" },
               h("input", {
                 type: "checkbox",
@@ -1584,12 +1465,19 @@ window.__ModuleLoader__.load({
             className: "dshLimobCfgBtn",
             onClick: function () { setEditing(null); setError(""); }
           }, "取消"),
-          h("button", { type: "button", className: "dshLimobCfgBtn dshLimobCfgBtnPrimary", onClick: saveDraft }, "保存")));
+          h("button", {
+            type: "button",
+            className: "dshLimobCfgBtn dshLimobCfgBtnPrimary",
+            disabled: busy,
+            onClick: saveDraft
+          }, busy ? "保存中…" : "保存")));
 
-      var list = config.commands.length === 0
-        ? h("div", { className: "dshLimobCmdList" }, h("div", { className: "dshLimobCfgEmpty" }, "还没有命令，点右上角「+ 新增」添加一条。"))
+      var list = commands.length === 0
+        ? h("div", { className: "dshLimobCmdList" },
+            h("div", { className: "dshLimobCfgEmpty" },
+              configLoaded ? "还没有命令，点右上角「+ 新增」添加一条。" : "正在从 Host 读取命令配置…"))
         : h("div", { className: "dshLimobCmdList" },
-            config.commands.map(function (command, index) {
+            commands.map(function (command, index) {
               var projectLabel = command.scope === "project"
                 ? "项目 · " + projectTitleOf(command.projectRoot, options)
                 : "全局";
@@ -1599,6 +1487,7 @@ window.__ModuleLoader__.load({
                       key: "confirm",
                       type: "button",
                       className: "dshLimobCfgBtn dshLimobCfgBtnDanger",
+                      disabled: busy,
                       onClick: function () { removeCommand(command.id); }
                     }, "确认删除"),
                     h("button", {
@@ -1612,7 +1501,7 @@ window.__ModuleLoader__.load({
                     h("label", { key: "enabled", className: "dshLimobSwitch", title: command.enabled ? "停用" : "启用" },
                       h("input", {
                         type: "checkbox",
-                        checked: command.enabled,
+                        checked: command.enabled !== false,
                         onChange: function () { toggleEnabled(command); }
                       }),
                       h("span", { className: "dshLimobSwitchTrack" })),
@@ -1622,7 +1511,7 @@ window.__ModuleLoader__.load({
                       className: "dshLimobIconBtn",
                       title: "上移",
                       "aria-label": "上移",
-                      disabled: index === 0,
+                      disabled: index === 0 || busy,
                       onClick: function () { moveCommand(index, -1); }
                     }, limobIcon("up")),
                     h("button", {
@@ -1631,7 +1520,7 @@ window.__ModuleLoader__.load({
                       className: "dshLimobIconBtn",
                       title: "下移",
                       "aria-label": "下移",
-                      disabled: index === config.commands.length - 1,
+                      disabled: index === commands.length - 1 || busy,
                       onClick: function () { moveCommand(index, 1); }
                     }, limobIcon("down")),
                     h("button", {
@@ -1655,7 +1544,7 @@ window.__ModuleLoader__.load({
               return h("div", {
                 key: command.id,
                 className: "dshLimobCmdRow",
-                "data-disabled": command.enabled ? "false" : "true"
+                "data-disabled": command.enabled === false ? "true" : "false"
               },
                 h("div", {
                   className: "dshLimobCmdMain",
@@ -1666,10 +1555,10 @@ window.__ModuleLoader__.load({
                     h("span", {
                       className: "dshLimobTag",
                       "data-scope": command.scope,
-                      title: command.scope === "project" ? command.projectRoot : "所有项目"
+                      title: command.scope === "project" ? String(command.projectRoot) : "所有项目"
                     }, projectLabel),
-                    command.enabled ? null : h("span", { className: "dshLimobTag" }, "已停用")),
-                  h("div", { className: "dshLimobCmdPreview" }, command.command)),
+                    command.enabled === false ? h("span", { className: "dshLimobTag" }, "已停用") : null),
+                  h("div", { className: "dshLimobCmdPreview" }, String(command.command))),
                 h("div", { className: "dshLimobCmdActions" }, actions));
             }));
 
@@ -1677,75 +1566,23 @@ window.__ModuleLoader__.load({
         h("div", { className: "dshLimobCfgToolbar" },
           h("span", { className: "dshLimobCfgStat", title: statText }, statText),
           h("label", { className: "dshLimobSwitch", title: "在输入框下方显示「运行」按钮" },
-            h("input", { type: "checkbox", checked: config.ui.visible, onChange: toggleVisible }),
+            h("input", { type: "checkbox", checked: uiVisibleOf(config), onChange: toggleVisible }),
             h("span", { className: "dshLimobSwitchTrack" }),
             h("span", null, "运行按钮")),
           h("button", {
             type: "button",
             className: "dshLimobCfgBtn dshLimobCfgBtnPrimary",
+            disabled: busy,
             onClick: startCreate
           }, limobIcon("plus"), h("span", null, "新增"))),
-
         form,
         list,
-
-        h("div", { className: "dshLimobCfgFooter" },
-          h("button", {
-            type: "button",
-            className: "dshLimobCfgBtn dshLimobCfgBtnGhost",
-            title: "从宿主 commands.json 重新读取（AI 刚改过配置时用）",
-            onClick: function () {
-              syncConfigFromHost().then(function (ok) {
-                flash(ok ? "已从宿主同步最新配置" : "宿主配置暂不可用，已保留本地配置");
-              });
-            }
-          }, "同步宿主"),
-          h("button", { type: "button", className: "dshLimobCfgBtn dshLimobCfgBtnGhost", onClick: exportConfig }, "导出配置"),
-          h("button", {
-            type: "button",
-            className: "dshLimobCfgBtn dshLimobCfgBtnGhost",
-            onClick: function () { setImportOpen(!importOpen); setError(""); }
-          }, importOpen ? "收起导入" : "导入配置"),
-          h("button", {
-            type: "button",
-            className: "dshLimobCfgBtn dshLimobCfgBtnGhost",
-            style: resetArmed ? { color: "#f87171" } : undefined,
-            onClick: resetDefaults
-          }, resetArmed ? "确认恢复" : "恢复内置"),
-          h("span", { className: "dshLimobCfgFooterVersion" }, "v" + PLUGIN_VERSION)),
-
-        importOpen
-          ? h("div", { className: "dshLimobImportBox" },
-              h("textarea", {
-                className: "dshLimobTextarea",
-                value: importText,
-                placeholder: "粘贴导出的配置 JSON",
-                onChange: function (event) { setImportText(event.target.value); }
-              }),
-              h("div", { className: "dshLimobFormFoot" },
-                h("button", {
-                  type: "button",
-                  className: "dshLimobCfgBtn dshLimobCfgBtnGhost",
-                  onClick: function () { setImportOpen(false); setImportText(""); }
-                }, "取消"),
-                h("button", { type: "button", className: "dshLimobCfgBtn dshLimobCfgBtnPrimary", onClick: applyImport }, "导入")))
-          : null,
-
-        editing === null
-          ? h("div", { className: "dshLimobCfgTips" },
-              h("div", { className: "dshLimobCfgTipsTitle" }, "小提示"),
-              h("div", null, "全局命令在所有项目可见；项目命令只出现在绑定工作区的会话里。"),
-              h("div", null, "命令在 DSH 右侧栏终端运行，重复点击会复用同一个终端。"),
-              h("div", null, "修改立即生效；关闭「运行按钮」只是隐藏输入框下方的入口。"))
-          : null,
-
         error !== "" ? h("div", { className: "dshLimobCfgError" }, error) : null,
-        notice !== "" ? h("div", { className: "dshLimobCfgNotice" }, notice) : null
-      );
+        notice !== "" ? h("div", { className: "dshLimobCfgNotice" }, notice) : null);
     }
 
     // =====================================================================
-    // 九、设置页 section（Settings 弹窗左侧新增一个 Tab）
+    // 十二、设置页 section（Settings 弹窗左侧新增一个 Tab）
     // =====================================================================
     function LimobSettingsSection(props) {
       var active = useActiveSession(props);
@@ -1754,328 +1591,518 @@ window.__ModuleLoader__.load({
         h("div", { className: "dshLimobPageHead" },
           h("div", null,
             h("div", { className: "dshLimobPageTitle" }, "dsh-runner"),
-            h("div", { className: "dshLimobPageSub" }, "输入框下方「运行」按钮的命令配置")),
+            h("div", { className: "dshLimobPageSub" }, "项目运行命令：左侧「运行」面板负责启停与日志，这里编辑命令")),
           h("span", { className: "dshLimobPageVersion" }, "v" + PLUGIN_VERSION)),
-        h(LimobConfigEditor, {
+        h(ConfigEditor, {
           currentProjectPath: active.projectPath,
           workspaces: workspaces
         }));
     }
-    // =====================================================================
-    // 十、输入框下方的「运行」按钮（conversation.composer.dock）
-    // =====================================================================
-    // conversation.composer.dock 是 DSH 对话输入框卡片「正下方」的环境条目槽位，
-    // 官方用它放 ActivityPill / UsagePill。这里只放一个低调的小按钮 + 向上展开的菜单，
-    // 不再有浮动层、拖动和位置记忆。
-
-    /** 由工作区快照反查某个会话所属工作区路径（用于项目作用域过滤）。 */
-    function useProjectPath(useWorkspaces, sessionId) {
-      var workspaces = typeof useWorkspaces === "function" ? useWorkspaces(function (state) { return state; }) : undefined;
-      if (sessionId === undefined || workspaces === undefined || workspaces === null || !Array.isArray(workspaces.items)) {
-        return undefined;
-      }
-      for (var i = 0; i < workspaces.items.length; i += 1) {
-        var workspace = workspaces.items[i];
-        if (workspace !== null && workspace !== undefined && Array.isArray(workspace.sessionIds)
-          && workspace.sessionIds.indexOf(sessionId) !== -1) {
-          return workspace.path;
-        }
-      }
-      return undefined;
-    }
 
     // =====================================================================
-    // 十一、项目级日志终端（Host 进程与右侧日志终端）
+    // 十三、运行面板（左侧导航「运行」+ main 槽位）
     // =====================================================================
-    // 语义（第一性原理）：
-    //   * 进程与日志属于项目，由 Host 管理（host-runner.js）；
-    //   * 右侧终端只是某个会话里的「只读日志视图」，天然属于会话，不能当成"移动终端"。
-    //     切换会话只做两件事：
-    //       1) 清理本会话里已经失效（命令已停止/重启过）的 tail；
-    //       2) 右侧栏本来就展开时，在后台补开运行中命令的 tail：打开后立刻还原用户
-    //          原来的页签与展开状态，不抢焦点、不改变可见布局。
-    //     用户显式点「运行」/运行中的命令时，才展开并聚焦终端。
-    //   * 用户手动关掉的 tail 会记住（dismissedStartedAt），不会自己弹回来；
-    //     只有用户再次显式点击，或该命令重新启动（startedAt 变化）才重建。
-    var PROJECT_TABS_KEY = "dsh.runner.projectTabs.v1";
-    var PROJECT_TAIL_PREFIX = "dsh-runner-proj-";
-    var SESSION_TERMINAL_LIMIT = 8;
-    var TAIL_SYNC_INTERVAL_MS = 5000;
-    var projectTailOpening = {};
-
-    function loadProjectTabs() {
-      try {
-        if (typeof localStorage === "undefined") return { sessions: {} };
-        var raw = localStorage.getItem(PROJECT_TABS_KEY);
-        if (raw === null) return { sessions: {} };
-        var parsed = JSON.parse(raw);
-        if (parsed !== null && typeof parsed === "object" && parsed.sessions !== null && typeof parsed.sessions === "object") return parsed;
-      } catch (_error) {
-        /* ignore */
-      }
-      return { sessions: {} };
-    }
-
-    function saveProjectTabs(registry) {
-      try {
-        if (typeof localStorage !== "undefined") localStorage.setItem(PROJECT_TABS_KEY, JSON.stringify(registry));
-      } catch (_error) {
-        /* ignore */
-      }
-    }
-
-    function projectTabKey(projectPath, commandId) {
-      return normalizePath(projectPath) + "::" + String(commandId);
-    }
-
-    function sameProjectPath(left, right) {
-      return normalizePath(left) !== "" && normalizePath(left) === normalizePath(right);
-    }
-
-    /** 项目短 hash：拼进终端 id，避免同一会话切换项目后复用上一个项目的 tail。 */
-    function projectIdOf(value) {
-      var text = normalizePath(value);
-      var hash = 2166136261;
-      for (var i = 0; i < text.length; i += 1) {
-        hash ^= text.charCodeAt(i);
-        hash = Math.imul(hash, 16777619) >>> 0;
-      }
-      return hash.toString(16).padStart(8, "0");
-    }
-
-    function buildProjectTailCommand(runner) {
-      var logPath = String(runner.logPath || "").replace(/'/g, "''");
-      return "chcp 65001 | Out-Null; Get-Content -LiteralPath '" + logPath + "' -Encoding UTF8 -Tail 600 -Wait";
-    }
-
-    function projectTailTitle(runner) {
-      if (typeof runner.terminalTitle === "string" && runner.terminalTitle !== "") return runner.terminalTitle;
-      return "项目日志 · " + String(runner.title === undefined || runner.title === null ? "" : runner.title);
-    }
-
-    function sidebarExpanded(ctx) {
-      var sidebarRight = getService(ctx, "sidebarRight");
-      if (sidebarRight === undefined || sidebarRight === null || typeof sidebarRight.isExpanded !== "function") return true;
-      try {
-        return sidebarRight.isExpanded() !== false;
-      } catch (_error) {
-        return true;
-      }
-    }
-
-    /**
-     * 确保某会话里存在某个项目命令的 tail 终端。
-     * options.focus=true：用户动作触发，展开并聚焦；
-     * options.focus=false：切会话后台补开，右侧栏收起时直接跳过（不制造不可见终端）。
-     * 返回 { ok, action, terminalId?, error? }，不抛异常（终端失败不影响 Host 进程）。
-     */
-    async function ensureProjectTail(ctx, sessionId, runner, options) {
-      var focus = options !== undefined && options !== null && options.focus === true;
-      if (ctx === null || ctx === undefined || sessionId === undefined || runner === null || runner === undefined) {
-        return { ok: false, action: "skipped", error: "缺少会话或运行信息" };
-      }
-      if (typeof runner.projectPath !== "string" || typeof runner.logPath !== "string" || runner.logPath === "") {
-        return { ok: false, action: "skipped", error: "Host 运行信息不完整" };
-      }
-      if (!focus && !sidebarExpanded(ctx)) return { ok: true, action: "collapsed" };
-      var key = projectTabKey(runner.projectPath, runner.commandId);
-      var openKey = String(sessionId) + "||" + key;
-      if (projectTailOpening[openKey] === true) return { ok: true, action: "busy" };
-      projectTailOpening[openKey] = true;
-      try {
-        var remote = getTerminalRemote(ctx);
-        if (remote === undefined || remote === null) {
-          return { ok: false, action: "no-remote", error: "当前 DSH 没有暴露终端服务" };
-        }
-        var registry = loadProjectTabs();
-        if (registry.sessions[sessionId] === undefined || registry.sessions[sessionId] === null) registry.sessions[sessionId] = {};
-        var entry = registry.sessions[sessionId][key];
-        var startedAt = typeof runner.startedAt === "number" ? runner.startedAt : 0;
-        var list = await listTerminals(remote, sessionId);
-
-        if (entry !== undefined && entry !== null && typeof entry.terminalId === "string") {
-          var terminalId = entry.terminalId;
-          var live = list.find(function (info) {
-            return info !== null && info !== undefined && info.id === terminalId;
-          });
-          if (live !== undefined) {
-            if (focus) await openTerminalTab(ctx, sessionId, terminalId, { focus: true });
-            return { ok: true, action: "reused", terminalId: terminalId };
-          }
-          // 终端已不在：多半是用户关掉了页签（Host 重启后终端也会丢）。
-          if (entry.opened === true) {
-            entry.terminalId = undefined;
-            entry.opened = false;
-            entry.dismissedStartedAt = entry.startedAt;
-            saveProjectTabs(registry);
-            // 同一轮运行里用户关掉的，不自动重开；命令已重启（startedAt 变了）则继续重建。
-            if (!focus && entry.startedAt === startedAt) return { ok: true, action: "dismissed" };
-          } else {
-            delete registry.sessions[sessionId][key];
-            entry = undefined;
-          }
-        }
-        if (!focus && entry !== undefined && entry !== null
-          && typeof entry.dismissedStartedAt === "number" && entry.dismissedStartedAt === startedAt) {
-          return { ok: true, action: "dismissed" };
-        }
-        if (list.length >= SESSION_TERMINAL_LIMIT) {
-          return { ok: false, action: "limit", error: "本会话终端数量已达上限（" + SESSION_TERMINAL_LIMIT + "），请关闭一些终端后再试" };
-        }
-        var shellPath = await pickShellPath(remote, sessionId);
-        var baseId = (PROJECT_TAIL_PREFIX + projectIdOf(runner.projectPath) + "-" + String(runner.commandId === undefined || runner.commandId === null ? "" : runner.commandId))
-          .replace(/[^\w-]/g, "-")
-          .slice(0, 120);
-        var created = await createTerminal(remote, sessionId, baseId, shellPath);
-        var title = projectTailTitle(runner);
-        await safeRename(remote, sessionId, created.id, title);
-        await sendCommands(remote, sessionId, created.id, [buildProjectTailCommand(runner)]);
-        registry.sessions[sessionId][key] = {
-          terminalId: created.id,
-          title: title,
-          logPath: runner.logPath,
-          projectPath: runner.projectPath,
-          commandId: runner.commandId,
-          startedAt: startedAt,
-          opened: true,
-          savedAt: Date.now()
-        };
-        saveProjectTabs(registry);
-        await openTerminalTab(ctx, sessionId, created.id, { focus: focus });
-        return { ok: true, action: focus ? "opened" : "prepared", terminalId: created.id };
-      } catch (error) {
-        logPluginError(ctx, "打开项目日志终端失败", error);
-        return { ok: false, action: "error", error: messageOf(error) };
-      } finally {
-        delete projectTailOpening[openKey];
-      }
-    }
-
-    /** 停止项目时关闭该项目在所有会话里的日志终端，并清空注册表。 */
-    async function closeProjectTails(ctx, projectPath) {
-      var registry = loadProjectTabs();
-      var changed = false;
-      var sessionIds = Object.keys(registry.sessions || {});
-      for (var i = 0; i < sessionIds.length; i += 1) {
-        var sessionId = sessionIds[i];
-        var entries = registry.sessions[sessionId] || {};
-        var keys = Object.keys(entries);
-        for (var j = 0; j < keys.length; j += 1) {
-          var entry = entries[keys[j]];
-          if (entry === undefined || entry === null || !sameProjectPath(entry.projectPath, projectPath)) continue;
-          if (typeof entry.terminalId === "string") await closeTerminal(ctx, sessionId, entry.terminalId);
-          delete entries[keys[j]];
-          changed = true;
-        }
-        if (Object.keys(entries).length === 0) delete registry.sessions[sessionId];
-      }
-      if (changed) saveProjectTabs(registry);
-      return changed;
-    }
-
-    /**
-     * 本会话的 tail 对账：
-     *   1) 命令已停止/重启过 -> 关闭对应 tail；
-     *   2) 运行中的命令 -> 后台补开（收起状态跳过，用户关掉的不重开）。
-     */
-    async function reconcileSessionTails(ctx, sessionId, projectPath, runningRunners) {
-      if (ctx === null || ctx === undefined || sessionId === undefined) return;
-      var registry = loadProjectTabs();
-      var entries = registry.sessions[sessionId];
-      var changed = false;
-      if (entries !== undefined && entries !== null) {
-        var runningByCommand = {};
-        for (var i = 0; i < runningRunners.length; i += 1) {
-          runningByCommand[runningRunners[i].commandId] = runningRunners[i];
-        }
-        var keys = Object.keys(entries);
-        for (var j = 0; j < keys.length; j += 1) {
-          var entry = entries[keys[j]];
-          if (entry === undefined || entry === null) {
-            delete entries[keys[j]];
-            changed = true;
-            continue;
-          }
-          if (!sameProjectPath(entry.projectPath, projectPath)) continue;
-          var runner = runningByCommand[entry.commandId];
-          var runnerStartedAt = runner !== undefined && typeof runner.startedAt === "number" ? runner.startedAt : undefined;
-          if (runner !== undefined && entry.startedAt === runnerStartedAt) continue;
-          if (typeof entry.terminalId === "string") await closeTerminal(ctx, sessionId, entry.terminalId);
-          delete entries[keys[j]];
-          changed = true;
-        }
-        if (Object.keys(entries).length === 0) delete registry.sessions[sessionId];
-      }
-      if (changed) saveProjectTabs(registry);
-      for (var k = 0; k < runningRunners.length; k += 1) {
-        // ensureProjectTail 内部已经记录失败原因；这里不重复打印，避免每 5s 刷日志。
-        await ensureProjectTail(ctx, sessionId, runningRunners[k], { focus: false });
-      }
-    }
-
-    /** 切会话/定时对账：只清理与后台补开，绝不改变用户当前视图。 */
-    function ProjectTailKeeper(props) {
+    function RunnerPage(props) {
       var active = useActiveSession(props);
+      var config = useConfig();
+      var projectPath = active !== null && active !== undefined && typeof active.projectPath === "string"
+        ? active.projectPath
+        : undefined;
+      var hasProject = projectPath !== undefined && projectPath !== "";
+
+      var runnersPair = react.useState([]);
+      var runners = runnersPair[0];
+      var setRunners = runnersPair[1];
+      var diagnosePair = react.useState([]);
+      var diagnose = diagnosePair[0];
+      var setDiagnose = diagnosePair[1];
+      var selectedPair = react.useState(null);
+      var selectedId = selectedPair[0];
+      var setSelectedId = selectedPair[1];
+      var logPair = react.useState(null);
+      var logState = logPair[0];
+      var setLogState = logPair[1];
+      var errorPair = react.useState(null);
+      var error = errorPair[0];
+      var setError = errorPair[1];
+      var busyPair = react.useState(null);
+      var busy = busyPair[0];
+      var setBusy = busyPair[1];
+      var editorPair = react.useState(false);
+      var editorOpen = editorPair[0];
+      var setEditorOpen = editorPair[1];
+      var copiedPair = react.useState(false);
+      var copied = copiedPair[0];
+      var setCopied = copiedPair[1];
+      var logRef = react.useRef(null);
+      var stickRef = react.useRef(true);
+
+      // 日志自动滚到底部：只有用户停留在底部时才跟随，上滚后不强制。
       react.useEffect(function () {
-        if (active.sessionId === undefined || active.projectPath === undefined || active.projectPath === "") return undefined;
-        var cancelled = false;
-        var syncing = false;
-        async function syncTails() {
-          if (cancelled || syncing) return;
-          syncing = true;
-          try {
-            var result = await hostRpcResult("project/status", { projectPath: active.projectPath });
-            if (cancelled || result.ok !== true) return;
-            var value = result.value;
-            var runners = value !== null && value !== undefined && Array.isArray(value.runners) ? value.runners : [];
-            var running = runners.filter(function (runner) {
-              return runner !== null && runner !== undefined && runner.status === "running";
-            });
-            await reconcileSessionTails(runtimeCtx, active.sessionId, active.projectPath, running);
-          } catch (error) {
-            logPluginError(runtimeCtx, "同步项目日志终端失败", error);
-          } finally {
-            syncing = false;
-          }
-        }
-        function onChanged() {
-          syncTails();
-        }
-        function onVisibility() {
-          if (typeof document === "undefined" || document.visibilityState !== "hidden") syncTails();
-        }
-        var timer = setTimeout(syncTails, 400);
-        var interval = setInterval(function () {
-          if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
-          syncTails();
-        }, TAIL_SYNC_INTERVAL_MS);
-        window.addEventListener("dsh-runner:project-changed", onChanged);
-        if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
-          document.addEventListener("visibilitychange", onVisibility);
-        }
+        var pre = logRef.current;
+        if (pre === null || pre === undefined) return;
+        if (stickRef.current !== true) return;
+        pre.scrollTop = pre.scrollHeight;
+      }, [logState]);
+
+      // 命中项目后：读配置 + 做一次端口诊断。
+      react.useEffect(function () {
+        if (!hasProject) return undefined;
+        var alive = true;
+        loadConfig().catch(function (loadError) {
+          if (alive) setError(loadError);
+        });
+        rpc("project/diagnose", { projectPath: projectPath }).then(function (value) {
+          if (alive && value !== null && value !== undefined) setDiagnose(Array.isArray(value.entries) ? value.entries : []);
+        }, function (diagnoseError) {
+          if (alive) setError(diagnoseError);
+        });
         return function () {
-          cancelled = true;
-          clearTimeout(timer);
-          clearInterval(interval);
-          window.removeEventListener("dsh-runner:project-changed", onChanged);
-          if (typeof document !== "undefined" && typeof document.removeEventListener === "function") {
-            document.removeEventListener("visibilitychange", onVisibility);
-          }
+          alive = false;
         };
-      }, [active.sessionId, active.projectPath]);
-      return null;
+      }, [hasProject, projectPath]);
+
+      // 进程状态：每 2000ms 轮询 project/status（页面卸载清理）。
+      react.useEffect(function () {
+        if (!hasProject) {
+          setRunners([]);
+          return undefined;
+        }
+        var alive = true;
+        var timer = null;
+        function schedule() {
+          if (alive) timer = setTimeout(tick, STATUS_POLL_MS);
+        }
+        async function tick() {
+          try {
+            var value = await rpc("project/status", { projectPath: projectPath });
+            if (!alive) return;
+            setRunners(value !== null && value !== undefined && Array.isArray(value.runners) ? value.runners : []);
+          } catch (statusError) {
+            if (alive) setError(statusError);
+          }
+          schedule();
+        }
+        tick();
+        return function () {
+          alive = false;
+          clearTimeout(timer);
+        };
+      }, [hasProject, projectPath]);
+
+      // 选中命令后：每 1000ms 轮询 project/log（maxBytes 65536）。
+      react.useEffect(function () {
+        if (!hasProject || selectedId === null || selectedId === undefined) {
+          setLogState(null);
+          return undefined;
+        }
+        var alive = true;
+        var timer = null;
+        setLogState(null);
+        stickRef.current = true;
+        async function tick() {
+          try {
+            var value = await rpc("project/log", {
+              projectPath: projectPath,
+              commandId: selectedId,
+              maxBytes: LOG_MAX_BYTES
+            });
+            if (!alive) return;
+            setLogState(value !== null && value !== undefined ? value : { text: "", bytes: 0, truncated: false });
+          } catch (logError) {
+            if (alive) setError(logError);
+          }
+          if (alive) timer = setTimeout(tick, LOG_POLL_MS);
+        }
+        tick();
+        return function () {
+          alive = false;
+          clearTimeout(timer);
+        };
+      }, [hasProject, projectPath, selectedId]);
+
+      async function refreshDiagnose() {
+        if (!hasProject) return;
+        try {
+          var value = await rpc("project/diagnose", { projectPath: projectPath });
+          setDiagnose(value !== null && value !== undefined && Array.isArray(value.entries) ? value.entries : []);
+        } catch (diagnoseError) {
+          setError(diagnoseError);
+        }
+      }
+
+      async function refresh() {
+        if (!hasProject || busy !== null) return;
+        setBusy("__refresh__");
+        setError(null);
+        try {
+          await loadConfig();
+          var value = await rpc("project/status", { projectPath: projectPath });
+          setRunners(value !== null && value !== undefined && Array.isArray(value.runners) ? value.runners : []);
+          await refreshDiagnose();
+        } catch (refreshError) {
+          setError(refreshError);
+        } finally {
+          setBusy(null);
+        }
+      }
+
+      async function runAction(action, commandId) {
+        if (!hasProject || busy !== null) return;
+        setBusy(commandId);
+        setError(null);
+        try {
+          var endpoint = action === "start" ? "project/start" : action === "stop" ? "project/stop" : "project/restart";
+          var value = await rpc(endpoint, { projectPath: projectPath, commandId: commandId });
+          if (value !== null && value !== undefined && Array.isArray(value.runners)) setRunners(value.runners);
+          if (action !== "stop") setSelectedId(commandId);
+          await refreshDiagnose();
+        } catch (actionError) {
+          setError(actionError);
+          if (actionError !== null && actionError !== undefined && actionError.code === "port-conflict") {
+            refreshDiagnose();
+          }
+        } finally {
+          setBusy(null);
+        }
+      }
+
+      async function runStartAll() {
+        if (!hasProject || busy !== null) return;
+        setBusy("__startAll__");
+        setError(null);
+        try {
+          var value = await rpc("project/startAll", { projectPath: projectPath });
+          if (value !== null && value !== undefined && Array.isArray(value.runners)) setRunners(value.runners);
+          var failed = value !== null && value !== undefined && Array.isArray(value.failed) ? value.failed : [];
+          if (failed.length > 0) {
+            var first = failed[0] !== null && failed[0] !== undefined ? failed[0] : {};
+            var label = typeof first.title === "string" && first.title !== "" ? first.title : String(first.commandId);
+            var failure = rpcError(
+              typeof first.code === "string" ? first.code : "start-failed",
+              "启动失败：" + label + " — " + String(first.message === undefined || first.message === null ? "未知原因" : first.message)
+                + (failed.length > 1 ? "（共 " + failed.length + " 条命令启动失败）" : ""),
+              first.details
+            );
+            setError(failure);
+          }
+          await refreshDiagnose();
+        } catch (startAllError) {
+          setError(startAllError);
+        } finally {
+          setBusy(null);
+        }
+      }
+
+      async function runStopAll() {
+        if (!hasProject || busy !== null) return;
+        setBusy("__stopAll__");
+        setError(null);
+        try {
+          var value = await rpc("project/stopAll", { projectPath: projectPath });
+          if (value !== null && value !== undefined && Array.isArray(value.runners)) setRunners(value.runners);
+          await refreshDiagnose();
+        } catch (stopAllError) {
+          setError(stopAllError);
+        } finally {
+          setBusy(null);
+        }
+      }
+
+      async function handleKillPort(entry) {
+        if (!hasProject || busy !== null || entry === null || entry === undefined) return;
+        var port = entry.port;
+        var owner = "端口 " + String(port) + " 被 "
+          + (typeof entry.pid === "number" ? "PID " + entry.pid : "其它进程")
+          + (typeof entry.processName === "string" && entry.processName !== "" ? "（" + entry.processName + "）" : "")
+          + " 占用，确定结束该进程吗？";
+        if (!confirmAction(owner)) return;
+        setBusy("kill-" + String(port));
+        setError(null);
+        try {
+          await rpc("project/killPort", { projectPath: projectPath, port: port });
+          await refreshDiagnose();
+        } catch (killError) {
+          setError(killError);
+        } finally {
+          setBusy(null);
+        }
+      }
+
+      async function clearLog() {
+        if (!hasProject || selectedId === null || selectedId === undefined) return;
+        setBusy("__log_clear__");
+        setError(null);
+        try {
+          await rpc("project/log/clear", { projectPath: projectPath, commandId: selectedId });
+          setLogState({
+            text: "",
+            bytes: 0,
+            path: logState !== null && logState !== undefined && typeof logState.path === "string" ? logState.path : "",
+            truncated: false
+          });
+          stickRef.current = true;
+        } catch (clearError) {
+          setError(clearError);
+        } finally {
+          setBusy(null);
+        }
+      }
+
+      function copyLog() {
+        var text = logState !== null && logState !== undefined && typeof logState.text === "string" ? stripAnsi(logState.text) : "";
+        setCopied(copyTextToClipboard(text));
+      }
+
+      function handleLogScroll(event) {
+        var pre = event !== null && event !== undefined ? event.currentTarget : undefined;
+        if (pre === null || pre === undefined) return;
+        stickRef.current = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 32;
+      }
+
+      var commands = hasProject ? visibleCommandsForProject(config, projectPath) : [];
+      var runnerByCommand = {};
+      for (var runnerIndex = 0; runnerIndex < runners.length; runnerIndex += 1) {
+        var runner = runners[runnerIndex];
+        if (runner !== null && runner !== undefined && typeof runner.commandId === "string") {
+          runnerByCommand[runner.commandId] = runner;
+        }
+      }
+
+      function titleOfCommand(commandId) {
+        var command = findCommandOf(config, commandId);
+        return command !== undefined && typeof command.title === "string" ? command.title : commandId;
+      }
+
+      var errorBar = error === null || error === undefined ? null : h("div", {
+        className: "dshRunnerError",
+        "data-dsh-runner-error": "1",
+        role: "alert"
+      },
+        h("span", { className: "dshRunnerErrorText" }, "错误：" + messageOf(error)),
+        h("button", {
+          type: "button",
+          className: "dshLimobCfgBtnGhost dshLimobCfgBtn",
+          onClick: function () { setError(null); }
+        }, "关闭"),
+        errorDetailText(error) !== "" ? h("span", { className: "dshRunnerErrorDetail" }, errorDetailText(error)) : null);
+
+      function renderRow(command) {
+        var current = runnerByCommand[command.id];
+        var status = current !== null && current !== undefined && typeof current.status === "string" ? current.status : "idle";
+        var disabled = command.enabled === false;
+        var active = status === "starting" || status === "running" || status === "stopping";
+        var rowBusy = busy !== null;
+        var ports = current !== null && current !== undefined && Array.isArray(current.ports)
+          ? current.ports
+          : (Array.isArray(command.ports) ? command.ports : []);
+        var meta = [];
+        if (current !== null && current !== undefined && current.status === "running" && typeof current.startedAt === "number") {
+          meta.push(h("span", { key: "uptime", className: "dshRunnerStatusText" }, "运行 " + formatUptime(Date.now() - current.startedAt)));
+        }
+        if (current !== null && current !== undefined && (current.status === "exited" || current.status === "failed")
+          && typeof current.exitCode === "number") {
+          meta.push(h("span", { key: "exit", className: "dshRunnerStatusText" }, "退出码 " + current.exitCode));
+        }
+        return h("div", {
+          key: command.id,
+          className: "dshRunnerRow",
+          "data-command-id": command.id,
+          "data-status": status,
+          "data-selected": selectedId === command.id ? "true" : "false",
+          "data-disabled": disabled ? "true" : "false",
+          onClick: function () { setSelectedId(command.id); }
+        },
+          h("span", { className: "dshRunnerDot", "data-status": status, title: runnerStatusText(status) }),
+          h("div", { className: "dshRunnerRowMain" },
+            h("div", { className: "dshRunnerRowTitle" },
+              h("span", { className: "dshRunnerRowTitleText", title: String(command.title) }, String(command.title)),
+              command.scope === "global" ? h("span", { className: "dshLimobTag" }, "全局") : null,
+              disabled ? h("span", { className: "dshLimobTag" }, "已停用") : null,
+              h("span", { className: "dshRunnerStateText", "data-status": status }, runnerStatusText(status))),
+            h("div", { className: "dshRunnerRowCmd", title: String(command.command) }, String(command.command)),
+            h("div", { className: "dshRunnerRowMeta" },
+              ports.map(function (port) {
+                return h("span", { key: String(port), className: "dshRunnerPort", title: "端口 " + String(port) }, ":" + String(port));
+              }),
+              meta)),
+          h("div", { className: "dshRunnerRowActions" },
+            h("button", {
+              type: "button",
+              className: "dshRunnerMiniBtn",
+              "data-action": "start",
+              disabled: rowBusy || disabled || active,
+              onClick: function (event) {
+                event.stopPropagation();
+                runAction("start", command.id);
+              }
+            }, "启动"),
+            h("button", {
+              type: "button",
+              className: "dshRunnerMiniBtn",
+              "data-action": "stop",
+              disabled: rowBusy || current === null || current === undefined || !active,
+              onClick: function (event) {
+                event.stopPropagation();
+                runAction("stop", command.id);
+              }
+            }, "停止"),
+            h("button", {
+              type: "button",
+              className: "dshRunnerMiniBtn",
+              "data-action": "restart",
+              disabled: rowBusy || disabled,
+              onClick: function (event) {
+                event.stopPropagation();
+                runAction("restart", command.id);
+              }
+            }, "重启")));
+      }
+
+      var selectedCommand = selectedId === null || selectedId === undefined ? undefined : findCommandOf(config, selectedId);
+      var selectedTitle = selectedCommand !== undefined && typeof selectedCommand.title === "string"
+        ? selectedCommand.title
+        : (selectedId === null || selectedId === undefined ? "" : String(selectedId));
+      var logText = logState !== null && logState !== undefined && typeof logState.text === "string" ? stripAnsi(logState.text) : "";
+      var logBytes = logState !== null && logState !== undefined && typeof logState.bytes === "number" ? logState.bytes : 0;
+      var logTruncated = logState !== null && logState !== undefined && logState.truncated === true;
+      var logMeta = formatBytes(logBytes) + (logTruncated ? " · 仅显示末尾 " + formatBytes(LOG_MAX_BYTES) : "");
+
+      var logPane = h("div", { className: "dshRunnerLogPane" },
+        h("div", { className: "dshRunnerLogHead" },
+          h("span", { className: "dshRunnerLogTitle", title: selectedTitle },
+            selectedTitle === "" ? "日志" : selectedTitle + " · 日志"),
+          h("span", { className: "dshRunnerLogMeta" }, logMeta),
+          h("button", {
+            type: "button",
+            className: "dshRunnerMiniBtn",
+            disabled: selectedId === null || selectedId === undefined || busy !== null,
+            onClick: clearLog
+          }, "清空日志"),
+          h("button", {
+            type: "button",
+            className: "dshRunnerMiniBtn",
+            disabled: logText === "",
+            onClick: copyLog
+          }, copied ? "已复制" : "复制")),
+        h("pre", {
+          className: "dshRunnerPre",
+          "data-dsh-runner-log": "1",
+          ref: logRef,
+          onScroll: handleLogScroll
+        }, selectedId === null || selectedId === undefined
+          ? "点左侧命令行查看运行日志。"
+          : (logText === "" ? "（暂无日志）" : logText)));
+
+      var unmanaged = [];
+      for (var diagIndex = 0; diagIndex < diagnose.length; diagIndex += 1) {
+        var entry = diagnose[diagIndex];
+        if (entry !== null && entry !== undefined && entry.listening === true && entry.managed !== true) unmanaged.push(entry);
+      }
+
+      var diagnoseSection = unmanaged.length === 0 ? null : h("div", { className: "dshRunnerDiag" },
+        h("div", { className: "dshRunnerDiagTitle" }, "端口诊断：检测到未托管的端口占用"),
+        unmanaged.map(function (item) {
+          var ownerText = "端口 " + String(item.port) + " 被 "
+            + (typeof item.pid === "number" ? "PID " + item.pid : "其它进程")
+            + (typeof item.processName === "string" && item.processName !== "" ? "（" + item.processName + "）" : "")
+            + " 占用"
+            + (typeof item.title === "string" && item.title !== "" ? "，期望命令：" + item.title : "")
+            + (typeof item.commandLine === "string" && item.commandLine !== "" ? " · " + item.commandLine : "");
+          return h("div", { key: "diag-" + String(item.port), className: "dshRunnerDiagRow" },
+            h("span", { className: "dshRunnerDiagText" }, ownerText),
+            h("button", {
+              type: "button",
+              className: "dshRunnerMiniBtn",
+              "data-action": "kill-port",
+              "data-port": item.port,
+              disabled: busy !== null,
+              onClick: function () { handleKillPort(item); }
+            }, "结束占用进程"));
+        }));
+
+      var editorModal = !editorOpen ? null : h("div", {
+        className: "dshLimobCfgModalBackdrop",
+        onMouseDown: function (event) {
+          if (event.target === event.currentTarget) setEditorOpen(false);
+        }
+      },
+        h("div", { className: "dshLimobCfgModal" },
+          h("div", { className: "dshLimobCfgH", style: { marginBottom: "10px" } },
+            h("span", null, "dsh-runner · 命令配置"),
+            h("button", {
+              type: "button",
+              className: "dshLimobCfgBtn",
+              onClick: function () { setEditorOpen(false); }
+            }, "关闭")),
+          h(ConfigEditor, {
+            currentProjectPath: projectPath,
+            workspaces: workspaceOptionsFrom(props !== undefined ? props.useWorkspaces : undefined)
+          })));
+
+      if (!hasProject) {
+        return h("div", { className: "dshRunnerPage", "data-dsh-runner-page": "1" },
+          h("div", { className: "dshLimobPageHead" },
+            h("div", null,
+              h("div", { className: "dshLimobPageTitle" }, "运行"),
+              h("div", { className: "dshLimobPageSub" }, "项目运行面板：启停命令、查看日志、诊断端口")),
+            h("span", { className: "dshLimobPageVersion" }, "v" + PLUGIN_VERSION)),
+          h("div", { className: "dshRunnerEmpty" }, "请先进入一个项目会话"),
+          errorBar,
+          editorModal);
+      }
+
+      return h("div", { className: "dshRunnerPage", "data-dsh-runner-page": "1" },
+        h("div", { className: "dshRunnerHead" },
+          h("div", { className: "dshRunnerHeadMain" },
+            h("span", { className: "dshRunnerTitle" }, "运行"),
+            h("span", { className: "dshRunnerProject", title: projectPath }, projectPath)),
+          h("div", { className: "dshRunnerToolbar" },
+            h("button", {
+              type: "button",
+              className: "dshLimobCfgBtn",
+              disabled: busy !== null,
+              onClick: runStartAll
+            }, "启动全部"),
+            h("button", {
+              type: "button",
+              className: "dshLimobCfgBtn",
+              disabled: busy !== null,
+              onClick: runStopAll
+            }, "停止全部"),
+            h("button", {
+              type: "button",
+              className: "dshLimobCfgBtn",
+              disabled: busy !== null,
+              onClick: refresh
+            }, busy === "__refresh__" ? "刷新中…" : "刷新"),
+            h("button", {
+              type: "button",
+              className: "dshLimobCfgBtn dshLimobCfgBtnPrimary",
+              onClick: function () { setEditorOpen(true); }
+            }, "管理命令"))),
+        errorBar,
+        h("div", { className: "dshRunnerBody" },
+          commands.length === 0
+            ? h("div", { className: "dshRunnerList" },
+                h("div", { className: "dshRunnerEmpty" },
+                  "当前项目还没有命令。点右上角「管理命令」新增，或在「设置 → dsh-runner」里编辑。"))
+            : h("div", { className: "dshRunnerList" }, commands.map(renderRow)),
+          logPane),
+        diagnoseSection,
+        editorModal);
     }
 
+    // =====================================================================
+    // 十四、输入框下方的「运行」按钮（conversation.composer.dock）
+    // =====================================================================
     function LimobComposerButton(props) {
       var config = useConfig();
       var sessionId = props !== undefined && props.sessionId !== undefined
         ? props.sessionId
         : (props !== undefined && props.session !== undefined && props.session !== null ? props.session.sessionId : undefined);
       var projectPath = useProjectPath(props !== undefined ? props.useWorkspaces : undefined, sessionId);
-      var workspaces = workspaceOptionsFrom(props !== undefined ? props.useWorkspaces : undefined);
-      var updatePair = useUpdateStatus();
-      var updateStatus = updatePair[0];
-      var setUpdateStatus = updatePair[1];
+      var hasProject = projectPath !== undefined && projectPath !== null && projectPath !== "";
 
       var menuPair = react.useState(false);
       var menuOpen = menuPair[0];
@@ -2083,25 +2110,23 @@ window.__ModuleLoader__.load({
       var menuPosPair = react.useState(null);
       var menuPos = menuPosPair[0];
       var setMenuPos = menuPosPair[1];
-      var rootRef = react.useRef(null);
-      var buttonRef = react.useRef(null);
       var busyPair = react.useState(null);
       var busy = busyPair[0];
       var setBusy = busyPair[1];
       var statusPair = react.useState(null);
       var status = statusPair[0];
       var setStatus = statusPair[1];
-      var runningPair = react.useState({});
-      var running = runningPair[0];
-      var setRunning = runningPair[1];
-      var terminalCountPair = react.useState(0);
-      var terminalCount = terminalCountPair[0];
-      var setTerminalCount = terminalCountPair[1];
-      var configOpenPair = react.useState(false);
-      var configOpen = configOpenPair[0];
-      var setConfigOpen = configOpenPair[1];
+      var runnersPair = react.useState([]);
+      var runners = runnersPair[0];
+      var setRunners = runnersPair[1];
+      var rootRef = react.useRef(null);
+      var buttonRef = react.useRef(null);
 
-      var commands = visibleCommands(config, projectPath, sessionId !== undefined);
+      var commands = config !== null && config !== undefined && Array.isArray(config.commands)
+        ? visibleCommandsForProject(config, projectPath).filter(function (command) {
+            return command.enabled !== false;
+          })
+        : [];
 
       // 状态提示 6 秒后自动消失。
       react.useEffect(function () {
@@ -2122,7 +2147,7 @@ window.__ModuleLoader__.load({
           var target = event.target;
           var inMenu = target !== null && target !== undefined && typeof target.closest === "function"
             && target.closest(".dshLimobRunMenu") !== null;
-          if (!inMenu && root !== null && !root.contains(target)) setMenuOpen(false);
+          if (!inMenu && root !== null && root !== undefined && !root.contains(target)) setMenuOpen(false);
         }
         function onKeyDown(event) {
           if (event.key === "Escape") setMenuOpen(false);
@@ -2135,50 +2160,36 @@ window.__ModuleLoader__.load({
         };
       }, [menuOpen]);
 
-      async function refreshRunning() {
-        if (sessionId === undefined || projectPath === undefined || projectPath === "") {
-          setRunning({});
-          setTerminalCount(0);
+      async function refreshRunners() {
+        if (!hasProject) {
+          setRunners([]);
           return;
         }
-        var result = await hostRpcResult("project/status", { projectPath: projectPath });
-        if (result.ok !== true) return;
-        var value = result.value;
-        var list = value !== null && value !== undefined && Array.isArray(value.runners) ? value.runners : [];
-        var next = {};
-        var runningCount = 0;
-        for (var i = 0; i < list.length; i += 1) {
-          var runner = list[i];
-          if (runner !== null && runner !== undefined && runner.status === "running") {
-            next[runner.commandId] = true;
-            runningCount += 1;
-          }
+        try {
+          var value = await rpc("project/status", { projectPath: projectPath });
+          setRunners(value !== null && value !== undefined && Array.isArray(value.runners) ? value.runners : []);
+        } catch (statusError) {
+          setStatus({ phase: "error", text: "读取进程状态失败：" + messageOf(statusError) });
         }
-        setRunning(next);
-        setTerminalCount(runningCount);
       }
 
       function toggleMenu() {
         if (!menuOpen) {
-          // AI 可能刚通过 dsh_runner_config 改过配置；每次打开菜单先同步一次。
-          syncConfigFromHost();
-          // 更新检查也用 10 分钟缓存，频繁打开菜单不会刷爆 GitHub API。
-          checkForUpdateShared(false).then(function (result) {
-            if (result !== undefined && result !== null) setUpdateStatus(result);
+          // AI 可能刚改过配置，打开菜单先读一次 Host 配置。
+          loadConfig().catch(function (loadError) {
+            setStatus({ phase: "error", text: "读取配置失败：" + messageOf(loadError) });
           });
-          refreshRunning();
+          refreshRunners();
           try {
-            var rect = buttonRef.current !== null ? buttonRef.current.getBoundingClientRect() : null;
+            var rect = buttonRef.current !== null && buttonRef.current !== undefined
+              ? buttonRef.current.getBoundingClientRect()
+              : null;
             var width = typeof window !== "undefined" && typeof window.innerWidth === "number" ? window.innerWidth : 1280;
             var height = typeof window !== "undefined" && typeof window.innerHeight === "number" ? window.innerHeight : 800;
             if (rect !== null) {
               var menuWidth = Math.min(400, width - 16);
               var left = Math.min(Math.max(8, rect.left), Math.max(8, width - menuWidth - 8));
-              setMenuPos({
-                left: left,
-                bottom: height - rect.top + 8,
-                maxHeight: Math.max(160, rect.top - 24)
-              });
+              setMenuPos({ left: left, bottom: height - rect.top + 8, maxHeight: Math.max(160, rect.top - 24) });
             } else {
               setMenuPos(null);
             }
@@ -2189,92 +2200,70 @@ window.__ModuleLoader__.load({
         setMenuOpen(!menuOpen);
       }
 
-      async function handleRun(command) {
+      async function runAction(action, command) {
         if (busy !== null) return;
-        if (sessionId === undefined || projectPath === undefined || projectPath === "") {
-          setStatus({ phase: "error", text: "请先进入一个项目会话，再运行命令" });
+        if (!hasProject) {
+          setStatus({ phase: "error", text: "请先进入一个项目会话" });
           return;
         }
-        setMenuOpen(false);
+        var label = action === "start" ? "启动" : action === "stop" ? "停止" : "重启";
         setBusy(command.id);
-        setStatus({ phase: "starting", text: "正在启动：" + command.title });
+        setStatus({ phase: "starting", text: "正在" + label + "：" + command.title });
         try {
-          var result = await hostRpcResult("project/start", { commandId: command.id, projectPath: projectPath });
-          if (result.ok !== true) {
-            setStatus({ phase: "error", text: "启动失败：" + messageOf(result.error) });
-            return;
-          }
-          var value = result.value;
-          if (value === undefined || value === null || value.runner === undefined || value.runner === null) {
-            setStatus({ phase: "error", text: "启动失败：Host 没有返回运行信息" });
-            return;
-          }
-          setStatus({ phase: "running", text: "运行中 · " + value.runner.title + "（项目日志终端）" });
-          var tail = await ensureProjectTail(runtimeCtx, sessionId, value.runner, { focus: true });
-          if (tail.ok !== true && tail.action !== "collapsed" && tail.action !== "busy") {
-            setStatus({
-              phase: "running",
-              text: "运行中 · " + value.runner.title + "（日志终端打开失败：" + String(tail.error === undefined || tail.error === null ? "未知原因" : tail.error) + "）"
-            });
-          }
+          var endpoint = action === "start" ? "project/start" : action === "stop" ? "project/stop" : "project/restart";
+          var value = await rpc(endpoint, { projectPath: projectPath, commandId: command.id });
+          if (value !== null && value !== undefined && Array.isArray(value.runners)) setRunners(value.runners);
+          setStatus({ phase: action === "stop" ? "idle" : "running", text: "已" + label + "：" + command.title });
+        } catch (actionError) {
+          setStatus({ phase: "error", text: label + "失败：" + messageOf(actionError) });
         } finally {
-          window.dispatchEvent(new Event("dsh-runner:project-changed"));
-          refreshRunning();
           setBusy(null);
         }
       }
 
-      async function handleStopAll() {
-        if (busy !== null || projectPath === undefined || projectPath === "" || terminalCount === 0) return;
-        setMenuOpen(false);
-        setBusy("__stop__");
-        setStatus({ phase: "starting", text: "正在停止本项目的运行进程…" });
-        try {
-          var result = await hostRpcResult("project/stopAll", { projectPath: projectPath });
-          if (result.ok !== true) {
-            setStatus({ phase: "error", text: "停止失败：" + messageOf(result.error) });
-            return;
-          }
-          var value = result.value;
-          var count = value !== undefined && value !== null && typeof value.stopped === "number" ? value.stopped : 0;
-          // 先等终端真正关掉，再广播事件；否则 keeper 的补开逻辑会和关闭动作赛跑。
-          await closeProjectTails(runtimeCtx, projectPath);
-          setRunning({});
-          setTerminalCount(0);
-          setStatus({
-            phase: "idle",
-            text: count > 0 ? ("已停止 " + count + " 个本项目进程，并关闭日志终端") : "当前项目没有运行中的命令"
-          });
-        } finally {
-          window.dispatchEvent(new Event("dsh-runner:project-changed"));
-          refreshRunning();
-          setBusy(null);
+      if (!uiVisibleOf(config)) return null;
+
+      var runnerByCommand = {};
+      for (var runnerIndex = 0; runnerIndex < runners.length; runnerIndex += 1) {
+        var runner = runners[runnerIndex];
+        if (runner !== null && runner !== undefined && typeof runner.commandId === "string") {
+          runnerByCommand[runner.commandId] = runner;
         }
       }
 
-      function handleCheckUpdate() {
-        setStatus({ phase: "starting", text: "正在检查 GitHub 更新…" });
-        checkForUpdateShared(true).then(function (result) {
-          if (result.phase === "error") {
-            setStatus({ phase: "error", text: "检查更新失败：" + result.message });
-          } else if (result.available) {
-            setStatus({ phase: "idle", text: "发现新版本 v" + result.latestVersion });
-          } else {
-            setStatus({ phase: "idle", text: "已是最新版本 v" + PLUGIN_VERSION });
-          }
-        });
+      function renderMenuRow(command) {
+        var current = runnerByCommand[command.id];
+        var rowStatus = current !== null && current !== undefined && typeof current.status === "string" ? current.status : "idle";
+        var rowActive = rowStatus === "starting" || rowStatus === "running" || rowStatus === "stopping";
+        return h("div", { key: command.id, className: "dshLimobRunRow" },
+          h("span", { className: "dshLimobRunRowMain" },
+            h("span", { className: "dshLimobRunItemTitle" }, command.title),
+            h("span", { className: "dshLimobRunItemCmd" },
+              runnerStatusText(rowStatus) + " · " + String(command.command))),
+          h("span", { className: "dshLimobRunRowActions" },
+            h("button", {
+              type: "button",
+              className: "dshRunnerMiniBtn",
+              "data-action": "start",
+              disabled: busy !== null || rowActive,
+              onClick: function () { runAction("start", command); }
+            }, "启动"),
+            h("button", {
+              type: "button",
+              className: "dshRunnerMiniBtn",
+              "data-action": "stop",
+              disabled: busy !== null || !rowActive,
+              onClick: function () { runAction("stop", command); }
+            }, "停止"),
+            h("button", {
+              type: "button",
+              className: "dshRunnerMiniBtn",
+              "data-action": "restart",
+              disabled: busy !== null,
+              onClick: function () { runAction("restart", command); }
+            }, "重启")));
       }
 
-      function handleUpdateClick() {
-        setMenuOpen(false);
-        openPluginUpdatePage(runtimeCtx, updateStatus && updateStatus.releaseUrl, function (text) {
-          setStatus({ phase: "idle", text: text });
-        });
-      }
-
-      if (config.ui.visible === false) return null;
-
-      // 菜单用 fixed 定位（相对按钮的视口坐标），避免被输入框区域的 overflow 裁切。
       var menuStyle = menuPos !== null
         ? {
             position: "fixed",
@@ -2286,123 +2275,27 @@ window.__ModuleLoader__.load({
           }
         : { left: "0" };
 
-      // 菜单底部的小更新标志：只占很小一行，不单独占一个菜单项。
-      var updateDotState = "latest";
-      var updateLabel = "v" + PLUGIN_VERSION;
-      if (updateStatus !== null && updateStatus !== undefined) {
-        if (updateStatus.phase === "checking") {
-          updateDotState = "checking";
-          updateLabel = "检查中…";
-        } else if (updateStatus.available) {
-          updateDotState = "update";
-          updateLabel = "v" + updateStatus.latestVersion;
-        } else if (updateStatus.phase === "error") {
-          updateDotState = "error";
-          updateLabel = "检查更新";
-        }
-      }
-
       var menuElement = menuOpen
         ? h("div", { className: "dshLimobRunMenu", style: menuStyle, role: "menu" },
             h("div", { className: "dshLimobRunMenuTitle" },
               h("span", null, "运行命令"),
-              h("span", null, projectPath !== undefined ? String(projectPath) : "当前会话")),
+              h("span", null, hasProject ? String(projectPath) : "当前会话")),
             commands.length === 0
-              ? h("div", { className: "dshLimobRunMenuTitle" }, "当前项目没有可用命令：去「管理命令」里添加，或把命令作用域设为全局。")
-              : commands.map(function (command) {
-                  return h("button", {
-                    key: command.id,
-                    type: "button",
-                    className: "dshLimobRunItem",
-                    disabled: busy !== null || sessionId === undefined,
-                    onClick: function () { handleRun(command); }
-                  },
-                    running[command.id] ? h("span", { className: "dshLimobRunRunningDot", title: "运行中" }) : null,
-                    h("span", { className: "dshLimobRunItemMain" },
-                      h("span", { className: "dshLimobRunItemTitle" }, command.title),
-                      h("span", { className: "dshLimobRunItemCmd" }, command.command)),
-                    h("span", { className: "dshLimobRunTag" }, command.scope === "project" ? "项目" : "全局"));
-                }),
+              ? h("div", { className: "dshLimobRunEmpty" },
+                  hasProject
+                    ? "当前项目没有可用命令：到「设置 → dsh-runner」或左侧「运行 → 管理命令」里添加。"
+                    : "请先进入一个项目会话。")
+              : commands.map(renderMenuRow),
             h("div", { className: "dshLimobRunSep" }),
-            h("button", {
-              type: "button",
-              className: "dshLimobRunItem",
-              "data-danger": "true",
-              disabled: busy !== null || projectPath === undefined || projectPath === "" || terminalCount === 0,
-              title: terminalCount > 0 ? "停止当前项目正在运行的命令" : "当前项目没有运行中的命令",
-              onClick: handleStopAll
-            },
-              h("span", { className: "dshLimobRunItemMain" },
-                h("span", { className: "dshLimobRunItemTitle" }, "停止本项目的运行进程"),
-                h("span", { className: "dshLimobRunItemCmd" },
-                  projectPath === undefined || projectPath === ""
-                    ? "请先进入项目会话"
-                    : terminalCount > 0
-                      ? "结束当前项目 " + terminalCount + " 个运行进程，并关闭日志终端"
-                      : "当前项目没有运行中的命令"))),
-            h("button", {
-              type: "button",
-              className: "dshLimobRunItem",
-              onClick: function () { setMenuOpen(false); setConfigOpen(true); }
-            },
-              h("span", { className: "dshLimobRunItemMain" },
-                h("span", { className: "dshLimobRunItemTitle" }, "管理命令…"),
-                h("span", { className: "dshLimobRunItemCmd" }, "新增/编辑/删除/排序，设置全局或项目作用域"))),
-            h("div", { className: "dshLimobRunFoot" },
-              h("button", {
-                type: "button",
-                className: "dshLimobRunFootBtn",
-                disabled: updateStatus !== null && updateStatus.phase === "checking",
-                title: updateDotState === "update"
-                  ? ("发现新版本 v" + updateStatus.latestVersion + "，点击查看")
-                  : "检查 GitHub 更新（每 10 分钟最多请求一次）",
-                onClick: function () {
-                  if (updateStatus !== null && updateStatus !== undefined && updateStatus.available) handleUpdateClick();
-                  else handleCheckUpdate();
-                }
-              },
-                h("span", { className: "dshLimobRunFootDot", "data-state": updateDotState }),
-                h("span", null, updateLabel)),
-              h("a", {
-                className: "dshLimobRunFootGitHub",
-                href: GITHUB_REPO_PAGE,
-                target: "_blank",
-                rel: "noopener noreferrer",
-                title: "打开 GitHub 仓库",
-                onClick: function () { setMenuOpen(false); }
-              },
-                h("svg", { width: 12, height: 12, viewBox: "0 0 16 16", "aria-hidden": "true", focusable: "false" },
-                  h("path", {
-                    d: "M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z",
-                    fill: "currentColor"
-                  })),
-                h("span", null, "GitHub"))))
+            h("div", { className: "dshLimobRunHint" }, "完整面板见左侧「运行」"))
         : null;
 
-      // 菜单 portal 到 body：避免按钮所在容器/右侧栏的 stacking context 把菜单盖住。
+      // 菜单 portal 到 body：避免输入框容器的 overflow / stacking context 裁切。
       var menu = menuElement;
       if (menuElement !== null && reactDom !== null && typeof reactDom.createPortal === "function"
         && typeof document !== "undefined" && document.body !== null) {
         menu = reactDom.createPortal(menuElement, document.body);
       }
-
-      var configModal = configOpen
-        ? h("div", {
-            className: "dshLimobCfgModalBackdrop",
-            onMouseDown: function (event) {
-              if (event.target === event.currentTarget) setConfigOpen(false);
-            }
-          },
-            h("div", { className: "dshLimobCfgModal" },
-              h("div", { className: "dshLimobCfgH", style: { marginBottom: "10px" } },
-                h("span", null, "dsh-runner · 命令配置"),
-                h("button", {
-                  type: "button",
-                  className: "dshLimobCfgBtn",
-                  onClick: function () { setConfigOpen(false); }
-                }, "关闭")),
-              h(LimobConfigEditor, { currentProjectPath: projectPath, workspaces: workspaces })))
-        : null;
 
       return h("div", { ref: rootRef, className: "dshLimobRunDock" },
         h("button", {
@@ -2410,31 +2303,28 @@ window.__ModuleLoader__.load({
           type: "button",
           className: "dshLimobRunBtn",
           "data-busy": busy !== null ? "true" : "false",
-          title: "在 DSH 自带终端里运行命令（点击选择命令）",
-          "aria-label": "运行命令",
+          title: "项目运行：启动/停止/重启（完整面板见左侧「运行」）",
+          "aria-label": "运行",
           onClick: function () {
             if (busy !== null) return;
             toggleMenu();
           }
         },
           h("span", { "aria-hidden": "true" }, busy !== null ? "…" : "▶"),
-          h("span", null, "运行"),
-          updateStatus !== null && updateStatus.available ? h("span", { className: "dshLimobRunDot", title: "有新版本" }) : null),
-        status !== null
-          ? h("span", { className: "dshLimobRunStatus", "data-phase": status.phase || "idle", title: status.text }, status.text)
-          : null,
-        menu,
-        configModal);
+          h("span", null, "运行")),
+        status !== null ? h("span", {
+          className: "dshLimobRunStatus",
+          "data-phase": status.phase || "idle",
+          title: status.text
+        }, status.text) : null,
+        menu);
     }
 
     // =====================================================================
+    // 十五、注册
     // =====================================================================
-    // 十二、注册
-    // =====================================================================
-    function registerSlot(ctx, slotName, entryId, component, order, label) {
+    function registerSlot(ctx, slotName, options, component) {
       try {
-        var options = { name: slotName, id: entryId, order: order };
-        if (typeof label === "string" && label !== "") options.label = label;
         ctx.slots.inject(slotName, function () {
           return ctx.slots.register(options, component);
         });
@@ -2445,68 +2335,57 @@ window.__ModuleLoader__.load({
 
     function apply(ctx) {
       runtimeCtx = ctx;
-      // 连接 Host 的 RPC（配置由 commands.json 统一保存，AI Tool 与设置页共用）。
       try {
         hostConnection = typeof ctx.get === "function" ? ctx.get("connection") : undefined;
       } catch (_error) {
         hostConnection = undefined;
       }
-      syncConfigFromHost();
-      // 页面隐藏/关闭前把防抖中的配置写回 Host（尽力而为，避免刚保存的命令丢失）。
-      try {
-        if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
-          window.addEventListener("pagehide", flushConfigToHost);
-        }
-        if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
-          document.addEventListener("visibilitychange", function () {
-            if (document.visibilityState === "hidden") flushConfigToHost();
-          });
-        }
-      } catch (_error) {
-        /* ignore */
-      }
-      // 输入框卡片正下方的小按钮（conversation.composer.dock）。
-      registerSlot(ctx, "conversation.composer.dock", "dsh-runner-run", LimobComposerButton, 40);
-      // 切会话时只做「清理 + 后台补开」，不改变用户当前视图。
-      registerSlot(ctx, "shell.overlay", "dsh-runner-project-keeper", ProjectTailKeeper, 210);
-      // 设置弹窗左侧新增「dsh-runner」页（settings.section 的每个条目就是一页）。
-      registerSlot(ctx, "settings.section", "dsh-runner", LimobSettingsSection, 60, "dsh-runner");
-      // DSH 插件页的更新提示（沿用 0.2 的能力）。
-      registerSlot(ctx, "plugins.detail.badge", "dsh-runner-update", LimobUpdateBadge, 100);
-      registerSlot(ctx, "plugins.detail.section", "dsh-runner-update", LimobUpdateSection, 100);
+      // 左侧导航「运行」入口（图标）+ 完整运行面板。
+      registerSlot(ctx, "sidebar.panellist", {
+        name: "sidebar.panellist",
+        id: PANEL_ID,
+        order: 20,
+        label: PANEL_LABEL
+      }, RunnerPanelIcon);
+      registerSlot(ctx, "main", { name: "main", key: PANEL_ID }, RunnerPage);
+      // 输入框下方紧凑「▶ 运行」按钮（只做启停重启，不创建终端）。
+      registerSlot(ctx, "conversation.composer.dock", {
+        name: "conversation.composer.dock",
+        id: "dsh-runner-run",
+        order: 40
+      }, LimobComposerButton);
+      // 设置弹窗左侧新增「dsh-runner」页（命令编辑器）。
+      registerSlot(ctx, "settings.section", {
+        name: "settings.section",
+        id: PANEL_ID,
+        order: 60,
+        label: PLUGIN_NAME
+      }, LimobSettingsSection);
+      // 插件详情页更新提示。
+      registerSlot(ctx, "plugins.detail.badge", {
+        name: "plugins.detail.badge",
+        id: "dsh-runner-update",
+        order: 100
+      }, LimobUpdateBadge);
+      registerSlot(ctx, "plugins.detail.section", {
+        name: "plugins.detail.section",
+        id: "dsh-runner-update",
+        order: 100
+      }, LimobUpdateSection);
     }
 
-    exports.name = "dsh-runner";
+    exports.name = PLUGIN_NAME;
     exports.inject = ["slots", "connection"];
     exports.apply = apply;
 
-    // 仅给离线测试/CI 用的内部入口；DSH loader 只读 name/inject/apply。
-    exports.__limob = {
-      pluginName: PLUGIN_NAME,
-      pluginVersion: PLUGIN_VERSION,
-      repoSlug: REPO_SLUG,
-      installSpec: INSTALL_SPEC,
-      upgradeCommand: UPGRADE_COMMAND,
-      parseVersion: parseVersion,
-      compareVersions: compareVersions,
-      checkForUpdate: checkForUpdate,
-      config: {
-        defaults: defaultConfig,
-        normalize: normalizeConfig,
-        normalizeCommand: normalizeCommand,
-        visibleCommands: visibleCommands,
-        commandMatchesProject: commandMatchesProject,
-        normalizePath: normalizePath,
-        projectIdOf: projectIdOf
-      },
-      // 仅测试用：项目日志终端的生命周期（切会话不抢焦点 / 用户关掉不重开等）。
-      test: {
-        ensureProjectTail: ensureProjectTail,
-        closeProjectTails: closeProjectTails,
-        reconcileSessionTails: reconcileSessionTails,
-        projectTailTitle: projectTailTitle,
-        projectTabKey: projectTabKey
-      }
+    // 仅给离线测试/CI 用的纯函数入口；DSH loader 只读 name/inject/apply。
+    exports.__test = {
+      stripAnsi: stripAnsi,
+      formatUptime: formatUptime,
+      formatBytes: formatBytes,
+      commandMatchesProject: commandMatchesProject,
+      visibleCommandsForProject: visibleCommandsForProject,
+      runnerStatusText: runnerStatusText
     };
 
     return module.exports;
