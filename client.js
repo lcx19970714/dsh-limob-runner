@@ -1,16 +1,17 @@
-/* dsh-runner —— 客户端半体（浏览器侧）v0.7
+/* dsh-runner —— 客户端半体（浏览器侧）
  *
  * 功能总览：
  *   1) 在对话输入框「正下方」放一个低调的「▶ 运行」小按钮
  *      （conversation.composer.dock 槽位）：点击向上展开命令菜单；
  *   2) 命令配置页（settings.section）：在 DSH 设置弹窗里新增「dsh-runner」页，
  *      支持命令的增删改查、排序、启停、全局/项目作用域；
- *   3) 运行命令仍通过 DSH 自带终端（remote.terminal + 右侧栏 terminal 页签），
- *      输出实时滚动；重复点击复用已有终端，支持一键停止；
+ *   3) 命令由 Host 按「项目路径 + 命令」启动（host-runner.js）；右侧栏终端只是当前
+ *      会话里按需打开的只读日志视图（Get-Content -Wait），切会话不改变用户当前视图；
  *   4) GitHub Releases 更新检查（按钮/菜单/插件页提示），只提示不自动升级。
  *
  * 数据流：
- *   配置：localStorage(dsh.limob-runner.config.v1) <-> 设置页/按钮菜单共用同一个 store
+ *   配置：localStorage(dsh.limob-runner.config.v1) 为缓存，Host commands.json 为主数据
+ *   进程：project/start|stop|stopAll|status RPC
  *   终端：remote.terminal.create/list/attach/rename/close
  *   页签：webTerminals.recover + sidebarRight.openTab("terminal",{params:{terminalId}})
  *
@@ -40,7 +41,7 @@ window.__ModuleLoader__.load({
     // 一、常量与内置命令
     // =====================================================================
     var PLUGIN_NAME = "dsh-runner";
-    var PLUGIN_VERSION = "0.10.0";
+    var PLUGIN_VERSION = "0.11.0";
 
     // 更新检查（GitHub Releases）
     var REPO_SLUG = "lcx19970714/dsh-runner";
@@ -53,9 +54,8 @@ window.__ModuleLoader__.load({
     var UPDATE_CACHE_KEY = "dsh.limob-runner.update.v1";
     var UPDATE_TTL_MS = 10 * 60 * 1000; // 10 分钟：菜单打开时能较快看到 GitHub 新版本
 
-    // 配置与旧终端映射
+    // 配置（浏览器 localStorage 只作为缓存；Host 侧 commands.json 才是主数据）
     var CONFIG_KEY = "dsh.limob-runner.config.v1";
-    var TERMINAL_KEY = "dsh.limob-runner.v1";
     var CONFIG_VERSION = 1;
 
     // apply(ctx) 时保存客户端根 Context，组件里按需取 DSH 服务。
@@ -513,29 +513,39 @@ window.__ModuleLoader__.load({
       return "cmd-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 6);
     }
 
+    /** 存储用的项目路径形态：保留大小写，统一反斜杠，去掉非根目录的末尾斜杠。 */
+    function cleanProjectPath(value) {
+      var text = String(value === undefined || value === null ? "" : value).trim().replace(/\//g, "\\");
+      if (text === "") return "";
+      if (/^[a-zA-Z]:\\?$/.test(text)) return text.replace(/\\+$/g, "") + "\\";
+      return text.replace(/\\+$/g, "");
+    }
+
+    // 注意：这里的归一化必须与 host-config.js 的 normalizeCommand 保持一致，
+    // 否则浏览器保存的配置会被 Host 改写，下一次同步又反向覆盖，形成来回抖动。
     function normalizeCommand(raw) {
       if (raw === null || typeof raw !== "object") return null;
       var id = typeof raw.id === "string" && raw.id.trim() !== "" ? raw.id.trim() : makeId();
       var title = typeof raw.title === "string" ? raw.title.trim() : "";
       var command = typeof raw.command === "string" ? raw.command.trim() : "";
-      var cwd = typeof raw.cwd === "string" ? raw.cwd.trim() : "";
       if (title === "" || command === "") return null;
       var scope = raw.scope === "project" ? "project" : "global";
-      var projectRoot = typeof raw.projectRoot === "string" ? raw.projectRoot.trim() : "";
+      var projectRoot = cleanProjectPath(typeof raw.projectRoot === "string" ? raw.projectRoot : "");
       if (scope === "project" && projectRoot === "") {
         // 项目命令必须有项目根目录，否则无法判断何时显示。
         return null;
       }
+      var cwd = typeof raw.cwd === "string" ? cleanProjectPath(raw.cwd) : "";
       return {
         id: id,
         title: title,
         terminalTitle: typeof raw.terminalTitle === "string" ? raw.terminalTitle.trim() : "",
-        cwd: cwd,
+        cwd: cwd !== "" ? cwd : (scope === "project" ? projectRoot : ""),
         command: command,
         scope: scope,
-        projectRoot: projectRoot,
+        projectRoot: scope === "project" ? projectRoot : "",
         enabled: raw.enabled !== false,
-        utf8CodePage: raw.utf8CodePage === true,
+        utf8CodePage: raw.utf8CodePage === true || /[^\x00-\x7f]/.test(command),
         longRunning: raw.longRunning === true
       };
     }
@@ -619,17 +629,45 @@ window.__ModuleLoader__.load({
       return normalized;
     }
 
-    /** 调用 Host 半体注册的 RPC；失败返回 undefined，不阻塞界面。 */
-    async function hostRpc(endpoint, payload) {
-      if (hostConnection === null || hostConnection === undefined || hostConnection.rpc === undefined) return undefined;
+    /**
+     * 调用 Host 半体注册的 RPC，返回结构化结果。
+     * 旧调用方只需要值（失败 = undefined），需要展示真实错误的调用方用这个版本。
+     */
+    async function hostRpcResult(endpoint, payload) {
+      if (hostConnection === null || hostConnection === undefined || hostConnection.rpc === undefined) {
+        return { ok: false, value: undefined, error: new Error("Host 项目运行器不可用（RPC 未连接）") };
+      }
       try {
         var result = await hostConnection.rpc.call("/api", "dsh-runner/" + endpoint, payload === undefined ? {} : payload);
-        if (result === null || result === undefined) return undefined;
-        if (result.ok !== true) throw new Error(result.error && result.error.message ? result.error.message : "RPC 失败");
-        return result.value;
-      } catch (_error) {
-        return undefined;
+        if (result === null || result === undefined) {
+          return { ok: false, value: undefined, error: new Error("Host 没有返回结果") };
+        }
+        if (result.ok !== true) {
+          var message = result.error && result.error.message ? result.error.message : "RPC 失败";
+          return { ok: false, value: undefined, error: new Error(message) };
+        }
+        return { ok: true, value: result.value, error: undefined };
+      } catch (error) {
+        return { ok: false, value: undefined, error: error instanceof Error ? error : new Error(messageOf(error)) };
       }
+    }
+
+    /** 兼容旧调用方：失败返回 undefined，不阻塞界面。 */
+    async function hostRpc(endpoint, payload) {
+      var result = await hostRpcResult(endpoint, payload);
+      return result.ok ? result.value : undefined;
+    }
+
+    /** 把还没落盘的配置立刻写给 Host；页面隐藏/关闭前尽力调用，避免丢失刚保存的修改。 */
+    function flushConfigToHost() {
+      if (hostSavePending === null || hostConnection === null || hostConnection === undefined) return;
+      var pending = hostSavePending;
+      hostSavePending = null;
+      if (hostSaveTimer !== null) {
+        clearTimeout(hostSaveTimer);
+        hostSaveTimer = null;
+      }
+      hostRpc("config/save", { config: pending });
     }
 
     /** 把 Host 的配置应用到浏览器 store（不反向写 Host，避免循环）。 */
@@ -787,53 +825,7 @@ window.__ModuleLoader__.load({
     }
 
     // =====================================================================
-    // 六、旧终端映射（sessionId + commandId -> terminalId）
-    // =====================================================================
-    function loadRegistry() {
-      try {
-        if (typeof localStorage === "undefined") return { sessions: {} };
-        var raw = localStorage.getItem(TERMINAL_KEY);
-        if (raw === null) return { sessions: {} };
-        var parsed = JSON.parse(raw);
-        if (parsed !== null && typeof parsed === "object" && parsed.sessions !== null && typeof parsed.sessions === "object") {
-          return parsed;
-        }
-      } catch (_error) {
-        /* ignore */
-      }
-      return { sessions: {} };
-    }
-
-    function saveRegistry(registry) {
-      try {
-        if (typeof localStorage === "undefined") return;
-        localStorage.setItem(TERMINAL_KEY, JSON.stringify(registry));
-      } catch (_error) {
-        /* ignore */
-      }
-    }
-
-    function getSavedTerminalId(registry, sessionId, commandId) {
-      var session = registry.sessions[sessionId];
-      if (session === undefined || session === null) return undefined;
-      var entry = session[commandId];
-      if (entry === undefined || entry === null) return undefined;
-      return typeof entry.terminalId === "string" ? entry.terminalId : undefined;
-    }
-
-    function setSavedTerminalId(registry, sessionId, commandId, terminalId, title) {
-      if (registry.sessions[sessionId] === undefined || registry.sessions[sessionId] === null) {
-        registry.sessions[sessionId] = {};
-      }
-      registry.sessions[sessionId][commandId] = {
-        terminalId: terminalId,
-        title: title,
-        savedAt: Date.now()
-      };
-    }
-
-    // =====================================================================
-    // 七、终端操作（DSH 内置终端）
+    // 六、终端操作（DSH 内置终端）
     // =====================================================================
     async function listTerminals(remote, sessionId) {
       var list = unwrapResult(await remote.list(sessionId));
@@ -860,24 +852,6 @@ window.__ModuleLoader__.load({
         return /powershell(\.exe)?$/i.test(path) || /powershell/i.test(name);
       });
       return powershell !== undefined ? powershell.path : undefined;
-    }
-
-    /**
-     * 组装 PowerShell 命令序列。
-     * utf8CodePage：先单独发一条 chcp 65001，避免 Windows PowerShell 5.1 把中文命令按 GBK 解码。
-     */
-    function buildCommandLines(command) {
-      var lines = [];
-      if (command.utf8CodePage) lines.push("chcp 65001 | Out-Null");
-      var parts = [
-        "$env:PATH = (Join-Path $env:USERPROFILE '.cargo\\bin') + ';' + $env:PATH"
-      ];
-      if (typeof command.cwd === "string" && command.cwd.trim() !== "") {
-        parts.push("Set-Location -LiteralPath '" + command.cwd.trim().replace(/'/g, "''") + "'");
-      }
-      parts.push(command.command);
-      lines.push(parts.join("; "));
-      return lines;
     }
 
     async function createTerminal(remote, sessionId, baseId, shellPath, title) {
@@ -1002,158 +976,107 @@ window.__ModuleLoader__.load({
       return undefined;
     }
 
-    async function openOrFocusTab(ctx, sessionId, terminalId) {
+    /**
+     * 打开日志终端页签。
+     *   focus=true ：用户显式操作（点「运行」/点运行中的命令），展开右侧栏并聚焦；
+     *   focus=false：切会话时后台补开，打开后恢复用户原来的页签与展开状态，不改动当前视图。
+     */
+    async function openTerminalTab(ctx, sessionId, terminalId, options) {
       var sidebarRight = getService(ctx, "sidebarRight");
       if (sidebarRight === undefined || sidebarRight === null) {
         throw new Error("DSH 右侧栏服务（sidebarRight）不可用，无法打开内置终端面板");
       }
+      var focus = options !== undefined && options !== null && options.focus === true;
+      if (focus && typeof sidebarRight.isExpanded === "function") {
+        try {
+          if (!sidebarRight.isExpanded() && typeof sidebarRight.toggleExpanded === "function") sidebarRight.toggleExpanded();
+        } catch (_error) {
+          /* ignore */
+        }
+      }
       var existingTabId = findTerminalTab(ctx, sessionId, terminalId);
       if (existingTabId !== undefined) {
+        if (focus && typeof sidebarRight.focus === "function") {
+          try {
+            sidebarRight.focus(existingTabId);
+          } catch (_error) {
+            /* ignore */
+          }
+        }
+        return true;
+      }
+      var previousTabId;
+      var wasExpanded = true;
+      if (!focus) {
         try {
-          if (typeof sidebarRight.isExpanded === "function" && !sidebarRight.isExpanded()
-            && typeof sidebarRight.toggleExpanded === "function") {
-            sidebarRight.toggleExpanded();
+          if (typeof sidebarRight.isExpanded === "function") wasExpanded = sidebarRight.isExpanded() !== false;
+        } catch (_error) {
+          /* ignore */
+        }
+        try {
+          if (typeof sidebarRight.active === "function") {
+            var activeTab = sidebarRight.active();
+            if (activeTab !== null && activeTab !== undefined && typeof activeTab.id === "string") previousTabId = activeTab.id;
           }
         } catch (_error) {
           /* ignore */
         }
+      }
+      await refreshTerminalInventory(ctx, sessionId);
+      if (typeof sidebarRight.openTab === "function") {
+        sidebarRight.openTab("terminal", { params: { terminalId: terminalId } });
+      } else if (typeof sidebarRight.openTabIn === "function") {
+        sidebarRight.openTabIn(sessionId, "terminal", { params: { terminalId: terminalId } });
+      } else {
+        throw new Error("DSH 右侧栏不支持 openTab，无法打开内置终端面板");
+      }
+      if (focus) return true;
+      // 等这次布局变更提交后，把用户原来的页签和展开状态恢复回去。
+      await new Promise(function (resolve) {
+        setTimeout(resolve, 60);
+      });
+      try {
+        if (previousTabId !== undefined && typeof sidebarRight.focus === "function") sidebarRight.focus(previousTabId);
+      } catch (_error) {
+        /* ignore */
+      }
+      if (!wasExpanded && typeof sidebarRight.isExpanded === "function" && sidebarRight.isExpanded()
+        && typeof sidebarRight.toggleExpanded === "function") {
         try {
-          if (typeof sidebarRight.focus === "function") sidebarRight.focus(existingTabId);
+          sidebarRight.toggleExpanded();
         } catch (_error) {
           /* ignore */
         }
-        return;
       }
-      await refreshTerminalInventory(ctx, sessionId);
-      if (typeof sidebarRight.openTab !== "function") {
-        throw new Error("DSH 右侧栏不支持 openTab，无法打开内置终端面板");
-      }
-      sidebarRight.openTab("terminal", { params: { terminalId: terminalId } });
+      return true;
     }
 
+    /** 关闭终端：先尽量移除页签，再兜底把 Host 侧终端关掉（幂等）。 */
     async function closeTerminal(ctx, sessionId, terminalId) {
       var sidebarRight = getService(ctx, "sidebarRight");
       var tabId = findTerminalTab(ctx, sessionId, terminalId);
+      var closed = false;
       if (tabId !== undefined && sidebarRight !== undefined && sidebarRight !== null
         && typeof sidebarRight.closeIn === "function") {
         try {
           sidebarRight.closeIn(sessionId, tabId);
-          return;
+          closed = true;
         } catch (_error) {
-          /* 回退 */
+          /* 回退到 remote.close */
         }
       }
       var remote = getTerminalRemote(ctx);
-      if (remote === undefined || remote === null) return;
+      if (remote === undefined || remote === null) return closed;
       try {
         unwrapResult(await remote.close(sessionId, terminalId));
+        return true;
       } catch (_error) {
-        /* ignore */
+        return closed;
       }
-    }
-
-    async function stopAllTerminals(ctx, sessionId) {
-      var remote = getTerminalRemote(ctx);
-      var registry = loadRegistry();
-      var savedForSession = registry.sessions[sessionId] || {};
-      var targets = {};
-      Object.keys(savedForSession).forEach(function (commandId) {
-        var entry = savedForSession[commandId];
-        if (entry !== undefined && entry !== null && typeof entry.terminalId === "string") {
-          targets[entry.terminalId] = true;
-        }
-      });
-      if (remote !== undefined && remote !== null) {
-        try {
-          var list = await listTerminals(remote, sessionId);
-          for (var i = 0; i < list.length; i += 1) {
-            var info = list[i];
-            if (info !== null && typeof info === "object" && typeof info.id === "string"
-              && info.id.indexOf("limob-") === 0) {
-              targets[info.id] = true;
-            }
-          }
-        } catch (_error) {
-          /* ignore */
-        }
-      }
-      var closedCount = 0;
-      var ids = Object.keys(targets);
-      for (var j = 0; j < ids.length; j += 1) {
-        await closeTerminal(ctx, sessionId, ids[j]);
-        closedCount += 1;
-      }
-      registry.sessions[sessionId] = {};
-      saveRegistry(registry);
-      return closedCount;
-    }
-
-    /**
-     * 运行一条配置命令：
-     *   - 同一命令已有运行中的终端 -> 聚焦，不重复启动；
-     *   - 已有终端但已退出 -> 关闭后重建；
-     *   - 否则创建终端、写命令、打开内置终端页签。
-     */
-    async function runCommand(ctx, sessionId, command) {
-      var remote = getTerminalRemote(ctx);
-      if (remote === undefined || remote === null) {
-        throw new Error("当前 DSH 没有暴露终端服务（remote.terminal），无法创建内置终端。");
-      }
-      var registry = loadRegistry();
-      var savedId = getSavedTerminalId(registry, sessionId, command.id);
-      var list = await listTerminals(remote, sessionId);
-      var preferredIds = ["limob-" + command.id];
-      if (savedId !== undefined) preferredIds.unshift(savedId);
-      var terminalTitle = command.terminalTitle !== "" ? command.terminalTitle : ("Limob-" + command.id);
-      var matches = list.filter(function (info) {
-        if (info === null || info === undefined) return false;
-        if (preferredIds.indexOf(info.id) !== -1) return true;
-        return info.title === terminalTitle;
-      });
-      var existing = matches.find(function (info) {
-        return info.state === "running";
-      });
-      if (existing === undefined) existing = matches[0];
-      if (existing !== undefined && savedId !== existing.id) {
-        setSavedTerminalId(registry, sessionId, command.id, existing.id, command.title);
-        saveRegistry(registry);
-        savedId = existing.id;
-      }
-      if (existing !== undefined && existing.state === "running") {
-        await openOrFocusTab(ctx, sessionId, existing.id);
-        return { status: "reused", title: existing.title || terminalTitle };
-      }
-      if (existing !== undefined && existing.state !== "running") {
-        await closeTerminal(ctx, sessionId, existing.id);
-        if (registry.sessions[sessionId] !== undefined && registry.sessions[sessionId] !== null) {
-          delete registry.sessions[sessionId][command.id];
-        }
-        saveRegistry(registry);
-        savedId = undefined;
-      }
-      var shellPath = await pickShellPath(remote, sessionId);
-      var baseId = savedId !== undefined ? savedId : ("limob-" + command.id);
-      var created = await createTerminal(remote, sessionId, baseId, shellPath, terminalTitle);
-      await safeRename(remote, sessionId, created.id, terminalTitle);
-      setSavedTerminalId(registry, sessionId, command.id, created.id, command.title);
-      saveRegistry(registry);
-      await refreshTerminalInventory(ctx, sessionId);
-      try {
-        await sendCommands(remote, sessionId, created.id, buildCommandLines(command));
-      } catch (error) {
-        try {
-          await openOrFocusTab(ctx, sessionId, created.id);
-        } catch (_ignored) {
-          /* ignore */
-        }
-        throw error;
-      }
-      await openOrFocusTab(ctx, sessionId, created.id);
-      return { status: "created", title: terminalTitle };
     }
 
     // =====================================================================
-    // 八、更新状态 hook
+    // 七、更新状态 hook
     // =====================================================================
     function useUpdateStatus() {
       var pair = react.useState({ phase: "checking" });
@@ -1249,7 +1172,7 @@ window.__ModuleLoader__.load({
     }
 
     // =====================================================================
-    // 九、配置编辑器（设置页与运行按钮的「管理命令…」弹窗共用）
+    // 八、配置编辑器（设置页与运行按钮的「管理命令…」弹窗共用）
     // =====================================================================
     // 交互原则：列表尽量紧凑、少留白；编辑表单内联展开，作用域用分段按钮选择，
     // 项目级命令直接从 DSH 已注册的工作区下拉选择，不需要手输路径（也允许自定义）。
@@ -1822,7 +1745,7 @@ window.__ModuleLoader__.load({
     }
 
     // =====================================================================
-    // 十、设置页 section（Settings 弹窗左侧新增一个 Tab）
+    // 九、设置页 section（Settings 弹窗左侧新增一个 Tab）
     // =====================================================================
     function LimobSettingsSection(props) {
       var active = useActiveSession(props);
@@ -1839,7 +1762,7 @@ window.__ModuleLoader__.load({
         }));
     }
     // =====================================================================
-    // 十一、输入框下方的「运行」按钮（conversation.composer.dock）
+    // 十、输入框下方的「运行」按钮（conversation.composer.dock）
     // =====================================================================
     // conversation.composer.dock 是 DSH 对话输入框卡片「正下方」的环境条目槽位，
     // 官方用它放 ActivityPill / UsagePill。这里只放一个低调的小按钮 + 向上展开的菜单，
@@ -1862,12 +1785,22 @@ window.__ModuleLoader__.load({
     }
 
     // =====================================================================
-    // 十二、项目级日志终端（Host 进程与右侧日志终端）
+    // 十一、项目级日志终端（Host 进程与右侧日志终端）
     // =====================================================================
-    // 设计：Host 按「项目路径 + 命令」启动独立进程；每个会话右侧栏打开一个
-    // 原生 terminal，执行 Get-Content -Wait 跟随项目日志。切会话时由
-    // ProjectTailKeeper 自动补开，所以右侧终端是项目级的，而不是会话级的。
+    // 语义（第一性原理）：
+    //   * 进程与日志属于项目，由 Host 管理（host-runner.js）；
+    //   * 右侧终端只是某个会话里的「只读日志视图」，天然属于会话，不能当成"移动终端"。
+    //     切换会话只做两件事：
+    //       1) 清理本会话里已经失效（命令已停止/重启过）的 tail；
+    //       2) 右侧栏本来就展开时，在后台补开运行中命令的 tail：打开后立刻还原用户
+    //          原来的页签与展开状态，不抢焦点、不改变可见布局。
+    //     用户显式点「运行」/运行中的命令时，才展开并聚焦终端。
+    //   * 用户手动关掉的 tail 会记住（dismissedStartedAt），不会自己弹回来；
+    //     只有用户再次显式点击，或该命令重新启动（startedAt 变化）才重建。
     var PROJECT_TABS_KEY = "dsh.runner.projectTabs.v1";
+    var PROJECT_TAIL_PREFIX = "dsh-runner-proj-";
+    var SESSION_TERMINAL_LIMIT = 8;
+    var TAIL_SYNC_INTERVAL_MS = 5000;
     var projectTailOpening = {};
 
     function loadProjectTabs() {
@@ -1892,13 +1825,22 @@ window.__ModuleLoader__.load({
     }
 
     function projectTabKey(projectPath, commandId) {
-      return String(projectPath).toLowerCase() + "::" + String(commandId);
+      return normalizePath(projectPath) + "::" + String(commandId);
     }
 
     function sameProjectPath(left, right) {
-      var a = String(left === undefined || left === null ? "" : left).trim().replace(/\//g, "\\").replace(/\\+$/g, "").toLowerCase();
-      var b = String(right === undefined || right === null ? "" : right).trim().replace(/\//g, "\\").replace(/\\+$/g, "").toLowerCase();
-      return a !== "" && a === b;
+      return normalizePath(left) !== "" && normalizePath(left) === normalizePath(right);
+    }
+
+    /** 项目短 hash：拼进终端 id，避免同一会话切换项目后复用上一个项目的 tail。 */
+    function projectIdOf(value) {
+      var text = normalizePath(value);
+      var hash = 2166136261;
+      for (var i = 0; i < text.length; i += 1) {
+        hash ^= text.charCodeAt(i);
+        hash = Math.imul(hash, 16777619) >>> 0;
+      }
+      return hash.toString(16).padStart(8, "0");
     }
 
     function buildProjectTailCommand(runner) {
@@ -1906,35 +1848,86 @@ window.__ModuleLoader__.load({
       return "chcp 65001 | Out-Null; Get-Content -LiteralPath '" + logPath + "' -Encoding UTF8 -Tail 600 -Wait";
     }
 
-    /** 在当前会话打开/聚焦某个项目命令的日志终端。 */
-    async function ensureProjectTail(ctx, sessionId, runner, openIt) {
-      if (ctx === null || sessionId === undefined || runner === null || runner === undefined) return;
-      if (typeof runner.projectPath !== "string" || typeof runner.logPath !== "string" || runner.logPath === "") return;
+    function projectTailTitle(runner) {
+      if (typeof runner.terminalTitle === "string" && runner.terminalTitle !== "") return runner.terminalTitle;
+      return "项目日志 · " + String(runner.title === undefined || runner.title === null ? "" : runner.title);
+    }
+
+    function sidebarExpanded(ctx) {
+      var sidebarRight = getService(ctx, "sidebarRight");
+      if (sidebarRight === undefined || sidebarRight === null || typeof sidebarRight.isExpanded !== "function") return true;
+      try {
+        return sidebarRight.isExpanded() !== false;
+      } catch (_error) {
+        return true;
+      }
+    }
+
+    /**
+     * 确保某会话里存在某个项目命令的 tail 终端。
+     * options.focus=true：用户动作触发，展开并聚焦；
+     * options.focus=false：切会话后台补开，右侧栏收起时直接跳过（不制造不可见终端）。
+     * 返回 { ok, action, terminalId?, error? }，不抛异常（终端失败不影响 Host 进程）。
+     */
+    async function ensureProjectTail(ctx, sessionId, runner, options) {
+      var focus = options !== undefined && options !== null && options.focus === true;
+      if (ctx === null || ctx === undefined || sessionId === undefined || runner === null || runner === undefined) {
+        return { ok: false, action: "skipped", error: "缺少会话或运行信息" };
+      }
+      if (typeof runner.projectPath !== "string" || typeof runner.logPath !== "string" || runner.logPath === "") {
+        return { ok: false, action: "skipped", error: "Host 运行信息不完整" };
+      }
+      if (!focus && !sidebarExpanded(ctx)) return { ok: true, action: "collapsed" };
       var key = projectTabKey(runner.projectPath, runner.commandId);
-      if (projectTailOpening[key] === true) return;
-      projectTailOpening[key] = true;
+      var openKey = String(sessionId) + "||" + key;
+      if (projectTailOpening[openKey] === true) return { ok: true, action: "busy" };
+      projectTailOpening[openKey] = true;
       try {
         var remote = getTerminalRemote(ctx);
-        if (remote === undefined || remote === null) return;
+        if (remote === undefined || remote === null) {
+          return { ok: false, action: "no-remote", error: "当前 DSH 没有暴露终端服务" };
+        }
         var registry = loadProjectTabs();
         if (registry.sessions[sessionId] === undefined || registry.sessions[sessionId] === null) registry.sessions[sessionId] = {};
         var entry = registry.sessions[sessionId][key];
+        var startedAt = typeof runner.startedAt === "number" ? runner.startedAt : 0;
+        var list = await listTerminals(remote, sessionId);
+
         if (entry !== undefined && entry !== null && typeof entry.terminalId === "string") {
-          var list = await listTerminals(remote, sessionId);
+          var terminalId = entry.terminalId;
           var live = list.find(function (info) {
-            return info !== null && info !== undefined && info.id === entry.terminalId;
+            return info !== null && info !== undefined && info.id === terminalId;
           });
           if (live !== undefined) {
-            if (openIt) await openOrFocusTab(ctx, sessionId, entry.terminalId);
-            return;
+            if (focus) await openTerminalTab(ctx, sessionId, terminalId, { focus: true });
+            return { ok: true, action: "reused", terminalId: terminalId };
+          }
+          // 终端已不在：多半是用户关掉了页签（Host 重启后终端也会丢）。
+          if (entry.opened === true) {
+            entry.terminalId = undefined;
+            entry.opened = false;
+            entry.dismissedStartedAt = entry.startedAt;
+            saveProjectTabs(registry);
+            // 同一轮运行里用户关掉的，不自动重开；命令已重启（startedAt 变了）则继续重建。
+            if (!focus && entry.startedAt === startedAt) return { ok: true, action: "dismissed" };
+          } else {
+            delete registry.sessions[sessionId][key];
+            entry = undefined;
           }
         }
+        if (!focus && entry !== undefined && entry !== null
+          && typeof entry.dismissedStartedAt === "number" && entry.dismissedStartedAt === startedAt) {
+          return { ok: true, action: "dismissed" };
+        }
+        if (list.length >= SESSION_TERMINAL_LIMIT) {
+          return { ok: false, action: "limit", error: "本会话终端数量已达上限（" + SESSION_TERMINAL_LIMIT + "），请关闭一些终端后再试" };
+        }
         var shellPath = await pickShellPath(remote, sessionId);
-        var baseId = ("dsh-runner-proj-" + String(runner.commandId || "")).replace(/[^\w-]/g, "-").slice(0, 100);
+        var baseId = (PROJECT_TAIL_PREFIX + projectIdOf(runner.projectPath) + "-" + String(runner.commandId === undefined || runner.commandId === null ? "" : runner.commandId))
+          .replace(/[^\w-]/g, "-")
+          .slice(0, 120);
         var created = await createTerminal(remote, sessionId, baseId, shellPath);
-        var title = typeof runner.terminalTitle === "string" && runner.terminalTitle !== ""
-          ? runner.terminalTitle
-          : ("项目 · " + runner.title);
+        var title = projectTailTitle(runner);
         await safeRename(remote, sessionId, created.id, title);
         await sendCommands(remote, sessionId, created.id, [buildProjectTailCommand(runner)]);
         registry.sessions[sessionId][key] = {
@@ -1943,20 +1936,25 @@ window.__ModuleLoader__.load({
           logPath: runner.logPath,
           projectPath: runner.projectPath,
           commandId: runner.commandId,
+          startedAt: startedAt,
+          opened: true,
           savedAt: Date.now()
         };
         saveProjectTabs(registry);
-        if (openIt) await openOrFocusTab(ctx, sessionId, created.id);
-      } catch (_error) {
-        /* 终端失败不影响 Host 进程 */
+        await openTerminalTab(ctx, sessionId, created.id, { focus: focus });
+        return { ok: true, action: focus ? "opened" : "prepared", terminalId: created.id };
+      } catch (error) {
+        logPluginError(ctx, "打开项目日志终端失败", error);
+        return { ok: false, action: "error", error: messageOf(error) };
       } finally {
-        delete projectTailOpening[key];
+        delete projectTailOpening[openKey];
       }
     }
 
-    /** 停止项目时关闭该项目在所有会话里的日志终端。 */
+    /** 停止项目时关闭该项目在所有会话里的日志终端，并清空注册表。 */
     async function closeProjectTails(ctx, projectPath) {
       var registry = loadProjectTabs();
+      var changed = false;
       var sessionIds = Object.keys(registry.sessions || {});
       for (var i = 0; i < sessionIds.length; i += 1) {
         var sessionId = sessionIds[i];
@@ -1965,43 +1963,109 @@ window.__ModuleLoader__.load({
         for (var j = 0; j < keys.length; j += 1) {
           var entry = entries[keys[j]];
           if (entry === undefined || entry === null || !sameProjectPath(entry.projectPath, projectPath)) continue;
-          await closeTerminal(ctx, sessionId, entry.terminalId);
+          if (typeof entry.terminalId === "string") await closeTerminal(ctx, sessionId, entry.terminalId);
           delete entries[keys[j]];
+          changed = true;
         }
         if (Object.keys(entries).length === 0) delete registry.sessions[sessionId];
       }
-      saveProjectTabs(registry);
+      if (changed) saveProjectTabs(registry);
+      return changed;
     }
 
-    /** 切会话/项目时补开当前项目正在运行的日志终端。 */
+    /**
+     * 本会话的 tail 对账：
+     *   1) 命令已停止/重启过 -> 关闭对应 tail；
+     *   2) 运行中的命令 -> 后台补开（收起状态跳过，用户关掉的不重开）。
+     */
+    async function reconcileSessionTails(ctx, sessionId, projectPath, runningRunners) {
+      if (ctx === null || ctx === undefined || sessionId === undefined) return;
+      var registry = loadProjectTabs();
+      var entries = registry.sessions[sessionId];
+      var changed = false;
+      if (entries !== undefined && entries !== null) {
+        var runningByCommand = {};
+        for (var i = 0; i < runningRunners.length; i += 1) {
+          runningByCommand[runningRunners[i].commandId] = runningRunners[i];
+        }
+        var keys = Object.keys(entries);
+        for (var j = 0; j < keys.length; j += 1) {
+          var entry = entries[keys[j]];
+          if (entry === undefined || entry === null) {
+            delete entries[keys[j]];
+            changed = true;
+            continue;
+          }
+          if (!sameProjectPath(entry.projectPath, projectPath)) continue;
+          var runner = runningByCommand[entry.commandId];
+          var runnerStartedAt = runner !== undefined && typeof runner.startedAt === "number" ? runner.startedAt : undefined;
+          if (runner !== undefined && entry.startedAt === runnerStartedAt) continue;
+          if (typeof entry.terminalId === "string") await closeTerminal(ctx, sessionId, entry.terminalId);
+          delete entries[keys[j]];
+          changed = true;
+        }
+        if (Object.keys(entries).length === 0) delete registry.sessions[sessionId];
+      }
+      if (changed) saveProjectTabs(registry);
+      for (var k = 0; k < runningRunners.length; k += 1) {
+        // ensureProjectTail 内部已经记录失败原因；这里不重复打印，避免每 5s 刷日志。
+        await ensureProjectTail(ctx, sessionId, runningRunners[k], { focus: false });
+      }
+    }
+
+    /** 切会话/定时对账：只清理与后台补开，绝不改变用户当前视图。 */
     function ProjectTailKeeper(props) {
       var active = useActiveSession(props);
       react.useEffect(function () {
         if (active.sessionId === undefined || active.projectPath === undefined || active.projectPath === "") return undefined;
         var cancelled = false;
+        var syncing = false;
         async function syncTails() {
-          var value = await hostRpc("project/status", { projectPath: active.projectPath });
-          if (cancelled || value === undefined) return;
-          var runners = Array.isArray(value.runners) ? value.runners : [];
-          for (var i = 0; i < runners.length; i += 1) {
-            if (cancelled) return;
-            if (runners[i].status !== "running") continue;
-            await ensureProjectTail(runtimeCtx, active.sessionId, runners[i], true);
+          if (cancelled || syncing) return;
+          syncing = true;
+          try {
+            var result = await hostRpcResult("project/status", { projectPath: active.projectPath });
+            if (cancelled || result.ok !== true) return;
+            var value = result.value;
+            var runners = value !== null && value !== undefined && Array.isArray(value.runners) ? value.runners : [];
+            var running = runners.filter(function (runner) {
+              return runner !== null && runner !== undefined && runner.status === "running";
+            });
+            await reconcileSessionTails(runtimeCtx, active.sessionId, active.projectPath, running);
+          } catch (error) {
+            logPluginError(runtimeCtx, "同步项目日志终端失败", error);
+          } finally {
+            syncing = false;
           }
         }
         function onChanged() {
           syncTails();
         }
-        var timer = setTimeout(syncTails, 500);
+        function onVisibility() {
+          if (typeof document === "undefined" || document.visibilityState !== "hidden") syncTails();
+        }
+        var timer = setTimeout(syncTails, 400);
+        var interval = setInterval(function () {
+          if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+          syncTails();
+        }, TAIL_SYNC_INTERVAL_MS);
         window.addEventListener("dsh-runner:project-changed", onChanged);
+        if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
+          document.addEventListener("visibilitychange", onVisibility);
+        }
         return function () {
           cancelled = true;
           clearTimeout(timer);
+          clearInterval(interval);
           window.removeEventListener("dsh-runner:project-changed", onChanged);
+          if (typeof document !== "undefined" && typeof document.removeEventListener === "function") {
+            document.removeEventListener("visibilitychange", onVisibility);
+          }
         };
       }, [active.sessionId, active.projectPath]);
       return null;
     }
+
     function LimobComposerButton(props) {
       var config = useConfig();
       var sessionId = props !== undefined && props.sessionId !== undefined
@@ -2077,9 +2141,10 @@ window.__ModuleLoader__.load({
           setTerminalCount(0);
           return;
         }
-        var value = await hostRpc("project/status", { projectPath: projectPath });
-        if (value === undefined) return;
-        var list = Array.isArray(value.runners) ? value.runners : [];
+        var result = await hostRpcResult("project/status", { projectPath: projectPath });
+        if (result.ok !== true) return;
+        var value = result.value;
+        var list = value !== null && value !== undefined && Array.isArray(value.runners) ? value.runners : [];
         var next = {};
         var runningCount = 0;
         for (var i = 0; i < list.length; i += 1) {
@@ -2124,7 +2189,7 @@ window.__ModuleLoader__.load({
         setMenuOpen(!menuOpen);
       }
 
-      function handleRun(command) {
+      async function handleRun(command) {
         if (busy !== null) return;
         if (sessionId === undefined || projectPath === undefined || projectPath === "") {
           setStatus({ phase: "error", text: "请先进入一个项目会话，再运行命令" });
@@ -2133,49 +2198,58 @@ window.__ModuleLoader__.load({
         setMenuOpen(false);
         setBusy(command.id);
         setStatus({ phase: "starting", text: "正在启动：" + command.title });
-        hostRpc("project/start", { commandId: command.id, projectPath: projectPath }).then(
-          function (value) {
-            if (value === undefined || value.runner === undefined) {
-              setStatus({ phase: "error", text: "启动失败：Host 项目运行器不可用" });
-              return;
-            }
-            setStatus({ phase: "running", text: "运行中 · " + value.runner.title + "（项目日志终端）" });
-            if (sessionId !== undefined) ensureProjectTail(runtimeCtx, sessionId, value.runner, true);
-            window.dispatchEvent(new Event("dsh-runner:project-changed"));
-            refreshRunning();
-          },
-          function (error) {
-            setStatus({ phase: "error", text: "启动失败：" + messageOf(error) });
+        try {
+          var result = await hostRpcResult("project/start", { commandId: command.id, projectPath: projectPath });
+          if (result.ok !== true) {
+            setStatus({ phase: "error", text: "启动失败：" + messageOf(result.error) });
+            return;
           }
-        ).then(function () {
+          var value = result.value;
+          if (value === undefined || value === null || value.runner === undefined || value.runner === null) {
+            setStatus({ phase: "error", text: "启动失败：Host 没有返回运行信息" });
+            return;
+          }
+          setStatus({ phase: "running", text: "运行中 · " + value.runner.title + "（项目日志终端）" });
+          var tail = await ensureProjectTail(runtimeCtx, sessionId, value.runner, { focus: true });
+          if (tail.ok !== true && tail.action !== "collapsed" && tail.action !== "busy") {
+            setStatus({
+              phase: "running",
+              text: "运行中 · " + value.runner.title + "（日志终端打开失败：" + String(tail.error === undefined || tail.error === null ? "未知原因" : tail.error) + "）"
+            });
+          }
+        } finally {
+          window.dispatchEvent(new Event("dsh-runner:project-changed"));
+          refreshRunning();
           setBusy(null);
-        });
+        }
       }
 
-      function handleStopAll() {
+      async function handleStopAll() {
         if (busy !== null || projectPath === undefined || projectPath === "" || terminalCount === 0) return;
         setMenuOpen(false);
         setBusy("__stop__");
         setStatus({ phase: "starting", text: "正在停止本项目的运行进程…" });
-        hostRpc("project/stopAll", { projectPath: projectPath }).then(
-          function (value) {
-            var count = value !== undefined && typeof value.stopped === "number" ? value.stopped : 0;
-            setStatus({
-              phase: "idle",
-              text: count > 0 ? ("已停止 " + count + " 个本项目进程，并关闭日志终端") : "当前项目没有运行中的命令"
-            });
-            closeProjectTails(runtimeCtx, projectPath);
-            setRunning({});
-            setTerminalCount(0);
-            window.dispatchEvent(new Event("dsh-runner:project-changed"));
-          },
-          function (error) {
-            setStatus({ phase: "error", text: "停止失败：" + messageOf(error) });
-            refreshRunning();
+        try {
+          var result = await hostRpcResult("project/stopAll", { projectPath: projectPath });
+          if (result.ok !== true) {
+            setStatus({ phase: "error", text: "停止失败：" + messageOf(result.error) });
+            return;
           }
-        ).then(function () {
+          var value = result.value;
+          var count = value !== undefined && value !== null && typeof value.stopped === "number" ? value.stopped : 0;
+          // 先等终端真正关掉，再广播事件；否则 keeper 的补开逻辑会和关闭动作赛跑。
+          await closeProjectTails(runtimeCtx, projectPath);
+          setRunning({});
+          setTerminalCount(0);
+          setStatus({
+            phase: "idle",
+            text: count > 0 ? ("已停止 " + count + " 个本项目进程，并关闭日志终端") : "当前项目没有运行中的命令"
+          });
+        } finally {
+          window.dispatchEvent(new Event("dsh-runner:project-changed"));
+          refreshRunning();
           setBusy(null);
-        });
+        }
       }
 
       function handleCheckUpdate() {
@@ -2378,9 +2452,22 @@ window.__ModuleLoader__.load({
         hostConnection = undefined;
       }
       syncConfigFromHost();
+      // 页面隐藏/关闭前把防抖中的配置写回 Host（尽力而为，避免刚保存的命令丢失）。
+      try {
+        if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+          window.addEventListener("pagehide", flushConfigToHost);
+        }
+        if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
+          document.addEventListener("visibilitychange", function () {
+            if (document.visibilityState === "hidden") flushConfigToHost();
+          });
+        }
+      } catch (_error) {
+        /* ignore */
+      }
       // 输入框卡片正下方的小按钮（conversation.composer.dock）。
       registerSlot(ctx, "conversation.composer.dock", "dsh-runner-run", LimobComposerButton, 40);
-      // 切会话时自动补开项目日志终端。
+      // 切会话时只做「清理 + 后台补开」，不改变用户当前视图。
       registerSlot(ctx, "shell.overlay", "dsh-runner-project-keeper", ProjectTailKeeper, 210);
       // 设置弹窗左侧新增「dsh-runner」页（settings.section 的每个条目就是一页）。
       registerSlot(ctx, "settings.section", "dsh-runner", LimobSettingsSection, 60, "dsh-runner");
@@ -2409,7 +2496,16 @@ window.__ModuleLoader__.load({
         normalizeCommand: normalizeCommand,
         visibleCommands: visibleCommands,
         commandMatchesProject: commandMatchesProject,
-        normalizePath: normalizePath
+        normalizePath: normalizePath,
+        projectIdOf: projectIdOf
+      },
+      // 仅测试用：项目日志终端的生命周期（切会话不抢焦点 / 用户关掉不重开等）。
+      test: {
+        ensureProjectTail: ensureProjectTail,
+        closeProjectTails: closeProjectTails,
+        reconcileSessionTails: reconcileSessionTails,
+        projectTailTitle: projectTailTitle,
+        projectTabKey: projectTabKey
       }
     };
 

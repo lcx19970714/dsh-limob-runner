@@ -59,6 +59,26 @@ try {
   }, "H:\\Limob-windows");
   assert.equal(chinese.command.utf8CodePage, true);
 
+  // 项目路径归一化：尾斜杠/正斜杠收敛成稳定形态；项目命令 cwd 默认 projectRoot
+  const trailing = createCommand(created.config, {
+    title: "尾斜杠",
+    command: "npm run dev",
+    scope: "project",
+    projectRoot: "H:/Limob-windows/"
+  }, undefined);
+  assert.equal(trailing.command.projectRoot, "H:\\Limob-windows");
+  assert.equal(trailing.command.cwd, "H:\\Limob-windows");
+
+  // 全局命令不能偷偷保留 projectRoot
+  const globalRoot = createCommand(created.config, {
+    title: "全局带根",
+    command: "echo hi",
+    scope: "global",
+    projectRoot: "H:\\Limob-windows"
+  }, undefined);
+  assert.equal(globalRoot.command.projectRoot, "");
+  assert.equal(globalRoot.command.cwd, "");
+
   // 更新：按标题找到并改名
   const updated = updateCommand(chinese.config, "启动开发服务器", { title: "启动开发服务器-改" });
   assert.equal(updated.command.id, created.command.id);

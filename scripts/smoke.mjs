@@ -189,6 +189,32 @@ assert.equal(internals.config.normalizeCommand({ title: "t", command: "x", scope
 assert.equal(internals.config.normalize(null).commands.length, 4);
 assert.equal(internals.config.normalize({ commands: "bad" }).commands.length, 0);
 
+// 归一化规则必须与 Host 端保持一致（否则每次同步都会互相改写）：
+// 项目命令 cwd 默认 projectRoot、projectRoot 去尾斜杠、非 ASCII 自动 chcp、
+// 全局命令不保留 projectRoot。
+const normalizedProject = internals.config.normalizeCommand({
+  id: "p2",
+  title: "项目",
+  command: "pnpm 开发",
+  scope: "project",
+  projectRoot: "H:\\Limob-windows\\"
+});
+assert.equal(normalizedProject.projectRoot, "H:\\Limob-windows");
+assert.equal(normalizedProject.cwd, "H:\\Limob-windows");
+assert.equal(normalizedProject.utf8CodePage, true);
+const normalizedGlobal = internals.config.normalizeCommand({
+  id: "g2",
+  title: "全局",
+  command: "echo hi",
+  scope: "global",
+  projectRoot: "H:\\Limob-windows"
+});
+assert.equal(normalizedGlobal.projectRoot, "");
+assert.equal(normalizedGlobal.cwd, "");
+// 终端 id 里的项目短 hash：路径写法不同必须得到同一个 id，不同项目不能碰撞。
+assert.equal(internals.config.projectIdOf("H:\\Limob-windows\\"), internals.config.projectIdOf("h:/limob-windows"));
+assert.notEqual(internals.config.projectIdOf("H:\\Limob-windows"), internals.config.projectIdOf("H:\\Other"));
+
 // ---- 7. apply 注册 ----
 const registered = [];
 const ctx = {

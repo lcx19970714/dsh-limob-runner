@@ -1,8 +1,8 @@
 {
   "name": "dsh-runner",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "private": false,
-  "description": "DSH 客户端插件 dsh-runner：输入框下方「运行」小按钮；Host 按项目运行命令，右侧栏日志终端跨会话保持，并提供 dsh_runner_config AI 工具。",
+  "description": "DSH 客户端插件 dsh-runner：输入框下方「运行」小按钮；Host 按项目运行命令，日志终端按会话按需打开，并提供 dsh_runner_config AI 工具。",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -21,7 +21,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "harness:check": "node --check index.js && node --check client.js && node --check host-config.js && node --check host-runner.js && node scripts/host-smoke.mjs && node scripts/runner-smoke.mjs && node scripts/smoke.mjs"
+    "harness:check": "node --check index.js && node --check client.js && node --check host-config.js && node --check host-runner.js && node scripts/host-smoke.mjs && node scripts/runner-smoke.mjs && node scripts/tail-smoke.mjs && node scripts/smoke.mjs"
   },
   "keywords": [
     "dsh",

@@ -44,7 +44,8 @@ dsh plugin --profile desktop add file:<仓库绝对路径>
 - 位置：对话输入框卡片**正下方**（DSH 的 `conversation.composer.dock` 槽位，和输入框下方的状态胶囊同一行）；
 - 样式：按钮只有「▶」图标 + 「运行」两个字，**无外边框、无胶囊底色**（默认透明，悬停才显示淡背景），不占额外高度、不遮挡对话和输入框；
 - 点击：向上展开命令菜单（按当前项目过滤、显示运行中绿点、停止本项目进程、管理命令、更新状态与 GitHub 入口）；
-- 命令由 **Host 按项目路径** 启动，右侧栏显示项目日志终端；切换同一项目的其他会话时会自动补开，**切会话仍能看到终端内容**；
+- 命令由 **Host 按项目路径** 启动，与会话无关；右侧栏的日志终端是**按需打开**的只读视图，
+  切会话不会自动弹出/移动终端，也不会抢走你正在看的页签；
 - 右侧终端是只读日志（`Get-Content -Wait`），不是交互式 shell；
 - 运行结果（启动中/运行中/失败）以小字显示在按钮右侧，6 秒后自动消失。
 
@@ -135,16 +136,34 @@ C:\Users\main\.dsh\dsh-runner\commands.json
 
 1. **Host 按「项目路径 + 命令」启动独立进程**，不绑定会话；
 2. 进程优先用 `pwsh`（退回 Windows PowerShell），把 `%USERPROFILE%\.cargo\bin` 拼到 PATH 最前；
-3. 输出写入 `C:\Users\main\.dsh\dsh-runner\logs\<项目hash>\<命令id>.log`；
+3. 输出**直接写入** `C:\Users\main\.dsh\dsh-runner\logs\<项目hash>\<命令id>.log`（子进程继承文件句柄，Host 不中转）；
 4. 当前会话右侧栏打开一个原生终端，执行 `Get-Content -Wait` 跟随该日志；
-5. 切换到同一项目的其他会话时，插件自动在新会话右侧栏补开日志终端；切到别的项目只显示那个项目正在运行的命令。
+5. 运行时状态由 Host 维护：进程状态、日志路径、pid、启动时间写入 `runner-state.json`。
+
+切换会话时：
+
+- 进程和日志**不受影响**（它们属于项目，不属于会话）；
+- 右侧终端是**会话级视图**，切会话时只做两件事：清理本会话里已失效的 tail，
+  以及——如果右侧栏本来就展开——在后台补开运行中命令的 tail，打开后立刻还原你原来的页签，
+  **不展开、不抢焦点**；
+- 你手动关掉的日志终端会被记住，不会自己弹回来；再点一次运行中的命令即可重新打开。
 
 重复点击同一命令：
 
 - 该项目下该命令已在 Host 运行 → 复用进程并聚焦日志终端；
-- 进程已退出 → 重新启动（日志会追加本次运行内容）。
+- 进程已退出 → 重新启动（日志追加本次运行内容）。
 
-「停止本项目的运行进程」会结束当前项目由本插件启动的所有 Host 进程，并关闭各会话里的日志终端；菜单里会显示当前项目正在运行的进程数，没有时禁用。
+「停止本项目的运行进程」会结束当前项目由本插件启动的所有 Host 进程，等状态落定后关闭各会话里的日志终端；
+菜单里会显示当前项目正在运行的进程数，没有时禁用。
+
+### 生命周期（Host 重启 / 插件重载）
+
+- 后台进程的生命周期 = Host 生命周期：**DSH 退出/重启后进程继续运行**；
+  下次 Host 启动时用「pid + 命令行标记」双重校验接管它们，菜单里照常显示运行中，可以停止；
+- 插件重载/升级**不会杀死**正在运行的进程，重载后自动接管；
+- 校验不通过的记录（进程已退出 / pid 被系统复用）会被丢弃，**不会误杀别的进程**；
+- 如果你确实想清理孤儿进程：停止按钮即可；卸载插件前建议先停止。
+- 日志文件只追加不轮转，长期使用可手动删除 `~\.dsh\dsh-runner\logs` 下的旧日志。
 
 > 该终端是**只读日志视图**，不能在终端里输入命令；真正进程在 Host。适合 `pnpm dev`、构建、`cargo check` 这类看输出的任务。
 
@@ -173,11 +192,12 @@ C:\Users\main\.dsh\dsh-runner\commands.json
 
 - 配置：Host 侧 `C:\Users\main\.dsh\dsh-runner\commands.json`（主数据）；浏览器 `localStorage["dsh.limob-runner.config.v1"]` 作为缓存/离线兜底
 - 项目运行日志：`C:\Users\main\.dsh\dsh-runner\logs\<项目hash>\<命令id>.log`（右侧日志终端读取它）
+- 运行状态（用于 Host 重启接管）：`C:\Users\main\.dsh\dsh-runner\runner-state.json`
 - 项目日志终端映射：`localStorage["dsh.runner.projectTabs.v1"]`
-- 终端复用记录：`localStorage["dsh.limob-runner.v1"]`（旧版兼容）
 - 更新缓存：`localStorage["dsh.limob-runner.update.v1"]`
 
-以上都是本机本地数据，删掉只会丢失自定义命令/按钮开关，不会影响 DSH 其它功能。卸载插件后如需彻底清理，删除 `commands.json` 和这三个 localStorage 键即可。
+以上都是本机本地数据，删掉只会丢失自定义命令/按钮开关/终端映射，不会影响 DSH 其它功能。
+卸载插件后如需彻底清理：先停止运行中的命令，再删除 `commands.json`、`runner-state.json` 和上述 localStorage 键。
 
 ---
 
@@ -185,8 +205,8 @@ C:\Users\main\.dsh\dsh-runner\commands.json
 
 - 客户端插件与 DSH 内置 UI 插件在同一个 Cordis 根 Context 中运行，可访问 `remote.terminal`、`webTerminals`、`sidebarRight` 等客户端服务。
 - 运行按钮：`conversation.composer.dock`（输入框卡片下方的环境条目槽位）。
-- 项目进程：Host 侧 `host-runner.js`（child_process，按项目+命令管理，日志文件）；浏览器通过 `project/start|stop|status` RPC 控制。
-- 右侧日志终端：DSH 原生 terminal + `Get-Content -Wait`；`shell.overlay` 里的 `ProjectTailKeeper` 负责切会话补开。
+- 项目进程：Host 侧 `host-runner.js`（child_process + 直接落盘日志 + state 文件 + 启动对账）；浏览器通过 `project/start|stop|stopAll|status` RPC 控制。
+- 右侧日志终端：DSH 原生 terminal + `Get-Content -Wait`；`shell.overlay` 里的 `ProjectTailKeeper` 只做「清理 + 后台补开（还原用户页签）」，不抢焦点。
 - 配置页：`settings.section`（设置弹窗的页面列表，每个条目一页）。
 - 更新提示：`plugins.detail.badge` / `plugins.detail.section`（插件页详情扩展点）。
 - 终端：`remote.terminal.create/list/attach/rename/close` + `sidebarRight.openTab("terminal",{params:{terminalId}})`。
@@ -206,7 +226,7 @@ node scripts/smoke.mjs
 
 `scripts/smoke.mjs` 在 Node 里用假的 `window.__ModuleLoader__` / react / ctx 执行 `client.js`，并测试：5 个 slot 注册、配置默认值与作用域匹配、GitHub 更新检查（mock fetch/localStorage）、最小 props 下的组件首次渲染。
 `scripts/host-smoke.mjs` 用临时目录测试 Host 侧 `commands.json` 的读写和 AI Tool 的 create/update/delete 核心逻辑。
-`scripts/runner-smoke.mjs` 验证 Host 项目运行器按项目启动命令、写日志、按项目过滤并停止。
+`scripts/runner-smoke.mjs` 验证 Host 项目运行器：启动/写日志/按项目过滤、停止时序、路径写法归一化、Host 重启接管、缺失工作目录报错。
 
 ## License
 

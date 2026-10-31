@@ -89,6 +89,14 @@ export function normalizePath(value) {
     .toLowerCase();
 }
 
+/** 存储用的项目路径形态：保留大小写，统一反斜杠，去掉非根目录的末尾斜杠。 */
+export function cleanProjectPath(value) {
+  const text = String(value === undefined || value === null ? "" : value).trim().replace(/\//g, "\\");
+  if (text === "") return "";
+  if (/^[a-zA-Z]:\\?$/.test(text)) return text.replace(/\\+$/g, "") + "\\";
+  return text.replace(/\\+$/g, "");
+}
+
 /**
  * 把任意来源（AI 参数、旧 JSON、浏览器配置）的命令对象收敛成稳定结构。
  * 返回 null 表示这条命令不合法（缺名称/命令，或者项目作用域缺项目路径）。
@@ -100,17 +108,15 @@ export function normalizeCommand(raw) {
   if (title === "" || command === "") return null;
   const id = typeof raw.id === "string" && raw.id !== "" ? raw.id : makeId();
   const scope = raw.scope === "project" ? "project" : "global";
-  const projectRoot = typeof raw.projectRoot === "string" ? raw.projectRoot.trim() : "";
+  const projectRoot = cleanProjectPath(typeof raw.projectRoot === "string" ? raw.projectRoot : "");
   if (scope === "project" && projectRoot === "") return null;
   const cwd = typeof raw.cwd === "string" && raw.cwd.trim() !== ""
-    ? raw.cwd.trim()
-    : projectRoot;
+    ? cleanProjectPath(raw.cwd)
+    : (scope === "project" ? projectRoot : "");
   return {
     id: id,
     title: title,
-    terminalTitle: typeof raw.terminalTitle === "string" && raw.terminalTitle.trim() !== ""
-      ? raw.terminalTitle.trim()
-      : "Limob-" + id,
+    terminalTitle: typeof raw.terminalTitle === "string" ? raw.terminalTitle.trim() : "",
     cwd: cwd,
     command: command,
     scope: scope,

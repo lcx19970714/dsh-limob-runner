@@ -46,12 +46,60 @@ async function ensureConfigFile() {
   return { exists: true, config: legacy.config };
 }
 
-/** 当前 AI 调用所在会话的工作区目录（用于项目作用域的默认值）。 */
-function sessionWorkspacePath(exec) {
-  const cwd = exec && exec.agent && exec.agent.session && exec.agent.session.header
-    ? exec.agent.session.header.cwd
-    : undefined;
-  return typeof cwd === "string" && cwd.trim() !== "" ? cwd.trim() : undefined;
+/** 容错读 Host 服务：插件上下文与会话上下文不一定都暴露同一个服务。 */
+function getHostService(source, key) {
+  try {
+    if (source === null || source === undefined || typeof source.get !== "function") return undefined;
+    const value = source.get(key);
+    return value === undefined ? undefined : value;
+  } catch (_error) {
+    return undefined;
+  }
+}
+
+/**
+ * 当前 AI 调用所在会话的「项目根路径」（用于项目作用域的默认值）。
+ *
+ * 第一性原理：项目作用域要匹配的是会话所属的 DSH 工作区（workspace），
+ * 不是会话当前 cwd。两者可能不同（会话可能在子目录里），用 cwd 当 projectRoot
+ * 会让命令只在那个子目录会话里出现。因此优先从 workspaceRegistry 反查
+ * 包含该 session 的工作区，取不到再回退 cwd。
+ */
+function sessionWorkspacePath(exec, ctx) {
+  const header = exec && exec.agent && exec.agent.session ? exec.agent.session.header : undefined;
+  const cwd = header !== undefined && header !== null && typeof header.cwd === "string" ? header.cwd.trim() : "";
+  const sessionId = header !== undefined && header !== null ? header.id : undefined;
+  const sources = [
+    exec !== undefined && exec !== null && exec.agent !== undefined && exec.agent !== null ? exec.agent.ctx : undefined,
+    ctx
+  ];
+  for (const source of sources) {
+    const registry = getHostService(source, "workspaceRegistry");
+    if (registry === undefined || registry === null || typeof registry.list !== "function") continue;
+    let workspaces;
+    try {
+      workspaces = registry.list();
+    } catch (_error) {
+      continue;
+    }
+    if (!Array.isArray(workspaces)) continue;
+    if (sessionId !== undefined) {
+      const owner = workspaces.find((workspace) => {
+        return workspace !== null && workspace !== undefined && Array.isArray(workspace.sessionIds)
+          && workspace.sessionIds.indexOf(sessionId) !== -1
+          && typeof workspace.path === "string" && workspace.path !== "";
+      });
+      if (owner !== undefined) return owner.path;
+    }
+    if (cwd !== "") {
+      const byPath = workspaces.find((workspace) => {
+        return workspace !== null && workspace !== undefined && typeof workspace.path === "string"
+          && normalizePath(workspace.path) === normalizePath(cwd);
+      });
+      if (byPath !== undefined) return byPath.path;
+    }
+  }
+  return cwd !== "" ? cwd : undefined;
 }
 
 /** 把 Tool 参数里出现的字段收集成 patch，避免 undefined 覆盖已有值。 */
@@ -72,7 +120,7 @@ function registerConfigTool(ctx) {
       "Manage the dsh-runner launch commands (the commands shown under the composer's Run button). "
       + "Use action=list to inspect existing commands; action=create to add one; action=update to edit; action=delete to remove. "
       + "When the user asks to add a startup/launch/run command for the current project, call create with command (and optional title); "
-      + "the Tool defaults to project scope and uses the current session workspace as projectRoot, so it only appears in that project. "
+      + "the Tool defaults to project scope and uses the workspace that owns the current session as projectRoot, so it only appears in that project. "
       + "Use scope=global only when the user explicitly wants the command in every project. "
       + "The command runs in DSH's built-in terminal; this Tool only saves configuration, it does not execute the command.",
     parameters: {
@@ -108,7 +156,7 @@ function registerConfigTool(ctx) {
         };
       }
       if (args.action === "create") {
-        const created = createCommand(loaded.config, args, sessionWorkspacePath(exec));
+        const created = createCommand(loaded.config, args, sessionWorkspacePath(exec, ctx));
         const saved = await saveConfigFile(CONFIG_PATH, created.config);
         return {
           ok: true,
@@ -165,6 +213,9 @@ function fail(code, message) {
 }
 
 async function dispatch(runner, endpoint, payload) {
+  // 进程相关端点必须等启动对账完成，否则会漏掉「上次 Host 留下的运行中进程」；
+  // 配置端点不需要等（避免设置页被 powershell 进程校验收阻塞）。
+  if (endpoint.indexOf("project/") === 0) await runner.init();
   if (endpoint === "config/get") {
     const loaded = await ensureConfigFile();
     return {
@@ -184,6 +235,7 @@ async function dispatch(runner, endpoint, payload) {
     const projectPath = payload !== null && payload !== undefined && typeof payload === "object" && typeof payload.projectPath === "string"
       ? payload.projectPath
       : undefined;
+    await runner.refresh();
     return { runners: runner.list(projectPath) };
   }
   if (endpoint === "project/start") {
@@ -202,6 +254,7 @@ async function dispatch(runner, endpoint, payload) {
         throw new Error("当前项目不匹配这条项目级命令");
       }
     }
+    await runner.refresh();
     return { runner: await runner.start(command, payload.projectPath), runners: runner.list(payload.projectPath) };
   }
   if (endpoint === "project/stop") {
@@ -209,12 +262,15 @@ async function dispatch(runner, endpoint, payload) {
       || typeof payload.commandId !== "string" || typeof payload.projectPath !== "string") {
       throw new Error("project/stop 需要 {commandId, projectPath}");
     }
-    return { stopped: await runner.stop(payload.projectPath, payload.commandId), runners: runner.list(payload.projectPath) };
+    await runner.refresh();
+    const stopped = await runner.stop(payload.projectPath, payload.commandId);
+    return { stopped: stopped, runners: runner.list(payload.projectPath) };
   }
   if (endpoint === "project/stopAll") {
     if (payload === null || payload === undefined || typeof payload !== "object" || typeof payload.projectPath !== "string") {
       throw new Error("project/stopAll 需要 {projectPath}");
     }
+    await runner.refresh();
     const count = await runner.stopProject(payload.projectPath);
     return { stopped: count, runners: runner.list(payload.projectPath) };
   }
@@ -266,8 +322,23 @@ function registerRpc(ctx, runner) {
 }
 
 export function apply(ctx) {
-  const runner = new ProjectRunnerService();
-  ctx.effect(() => () => runner.disposeAll(), "dsh-runner: project runner cleanup");
+  const runner = new ProjectRunnerService({
+    logger: ctx !== undefined && ctx !== null ? ctx.logger : undefined
+  });
+  // 启动对账：接管上次 Host 留下的运行中进程（pid + 命令行标记双重校验）。
+  const ready = runner.init().catch((error) => {
+    try {
+      if (ctx !== undefined && ctx !== null && ctx.logger !== undefined) ctx.logger.error("dsh-runner: 启动对账失败", error);
+      else console.error("dsh-runner: 启动对账失败", error);
+    } catch (_ignored) {
+      /* ignore */
+    }
+  });
+  ctx.effect(() => () => {
+    // 只落盘，不杀进程：项目级后台任务不因插件卸载/重载而中断。
+    void ready;
+    runner.shutdown();
+  }, "dsh-runner: project runner state flush");
   registerConfigTool(ctx);
   ctx.inject(["connection"], (connectionCtx) => {
     registerRpc(connectionCtx, runner);
