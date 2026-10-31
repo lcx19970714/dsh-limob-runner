@@ -1,12 +1,13 @@
-// dsh-runner 0.12.0 的离线冒烟测试（CI 与本地都用它）。
+// dsh-runner 0.13.0 的离线冒烟测试（CI 与本地都用它）。
 //
 // 覆盖（SPEC 第 5 节 smoke 要求）：
 // 1. 用假的 window.__ModuleLoader__ / react / localStorage 执行 client.js，确认模块 id 与注入；
-// 2. client.js 的 PLUGIN_VERSION 与 package.json version 一致（0.12.0）；
+// 2. client.js 的 PLUGIN_VERSION 与 package.json version 一致（0.13.0）；
 // 3. slot 注册集合恰为 6 个：conversation.composer.dock / main / sidebar.panellist /
 //    settings.section / plugins.detail.badge / plugins.detail.section；
 // 4. __test 纯函数断言：stripAnsi / formatUptime / formatBytes / commandMatchesProject /
-//    visibleCommandsForProject / runnerStatusText；
+//    visibleCommandsForProject / runnerStatusText / occupantSummary / formatProcessChain /
+//    formatProcessChildren；
 // 5. 用最小 props 渲染 RunnerPage（无会话 → 提示）、composer 按钮、settings 页、导航图标，
 //    不报错且关键 data-* 属性存在。
 import fs from "node:fs";
@@ -58,15 +59,25 @@ const __test = moduleExports.__test;
 assert.notEqual(__test, undefined, "client.js 必须导出 __test 纯函数入口");
 assert.deepEqual(
   Object.keys(__test).sort(),
-  ["commandMatchesProject", "formatBytes", "formatUptime", "runnerStatusText", "stripAnsi", "visibleCommandsForProject"],
-  "__test 只应包含契约要求的 6 个纯函数"
+  [
+    "commandMatchesProject",
+    "formatBytes",
+    "formatProcessChain",
+    "formatProcessChildren",
+    "formatUptime",
+    "occupantSummary",
+    "runnerStatusText",
+    "stripAnsi",
+    "visibleCommandsForProject"
+  ],
+  "__test 只应包含契约要求的纯函数"
 );
 
 // ---- 3. 版本一致性（source 里的 PLUGIN_VERSION 必须与 package.json 一致）----
 const versionMatch = /var PLUGIN_VERSION = "([^"]+)";/.exec(source);
 assert.ok(versionMatch !== null, "client.js 必须有 PLUGIN_VERSION 常量");
 assert.equal(versionMatch[1], manifest.version, "PLUGIN_VERSION 必须与 package.json version 一致");
-assert.equal(manifest.version, "0.12.0", "目标版本是 0.12.0");
+assert.equal(manifest.version, "0.13.0", "目标版本是 0.13.0");
 
 // ---- 4. 纯函数断言 ----
 assert.equal(__test.stripAnsi("\u001b[31mred\u001b[0m"), "red");
@@ -126,6 +137,21 @@ assert.equal(__test.runnerStatusText("running"), "运行中");
 assert.equal(__test.runnerStatusText("stopping"), "停止中");
 assert.equal(__test.runnerStatusText("stopped"), "已停止");
 assert.equal(__test.runnerStatusText("exited"), "已退出");
+
+const occupantFixture = {
+  pid: 4321,
+  name: "node.exe",
+  commandLine: "node vite.js --port 5174",
+  windowTitle: "",
+  ancestors: [{ pid: 1234, name: "cmd.exe" }, { pid: 100, name: "Code.exe", windowTitle: "项目 - Visual Studio Code" }],
+  children: [{ pid: 5555, name: "esbuild.exe" }]
+};
+assert.equal(__test.occupantSummary(occupantFixture), "node.exe（PID 4321）");
+assert.equal(__test.occupantSummary(undefined), "未知进程");
+assert.equal(__test.formatProcessChain(occupantFixture), "cmd.exe（1234） ← Code.exe（100，窗口：项目 - Visual Studio Code）");
+assert.equal(__test.formatProcessChain(undefined), "");
+assert.equal(__test.formatProcessChildren(occupantFixture), "esbuild.exe（5555）");
+assert.equal(__test.formatProcessChildren(undefined), "");
 assert.equal(__test.runnerStatusText("failed"), "启动失败");
 assert.equal(__test.runnerStatusText("idle"), "未运行");
 

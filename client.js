@@ -42,7 +42,7 @@ window.__ModuleLoader__.load({
     // 一、常量
     // =====================================================================
     var PLUGIN_NAME = "dsh-runner";
-    var PLUGIN_VERSION = "0.12.0";
+    var PLUGIN_VERSION = "0.13.0";
 
     // 左侧导航面板 / main 面板的稳定 id。
     var PANEL_ID = "dsh-runner";
@@ -215,6 +215,20 @@ window.__ModuleLoader__.load({
       ".dshRunnerError{display:flex;align-items:flex-start;gap:8px;flex-wrap:wrap;border:.5px solid rgba(239,68,68,.45);background:rgba(239,68,68,.08);color:#f87171;border-radius:8px;padding:7px 9px;font-size:11px;line-height:16px;flex:none}",
       ".dshRunnerErrorText{flex:1 1 220px;min-width:0;word-break:break-word}",
       ".dshRunnerErrorDetail{flex:0 0 100%;opacity:.85;font-family:ui-monospace,Consolas,'Courier New',monospace;font-size:10px;line-height:15px;word-break:break-word}",
+      // ---- 端口冲突对话框 ----
+      ".dshRunnerDialogBackdrop{position:fixed;inset:0;z-index:60;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.45);padding:24px}",
+      ".dshRunnerDialog{width:min(740px,100%);max-height:min(80vh,760px);overflow:auto;display:flex;flex-direction:column;gap:9px;padding:14px 16px;border-radius:12px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.4));background:var(--dsw-alias-bg-layer-1,#1f1f22);box-shadow:0 18px 48px rgba(0,0,0,.45)}",
+      ".dshRunnerDialogHead{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600}",
+      ".dshRunnerDialogSub{font-size:11px;line-height:17px;opacity:.75}",
+      ".dshRunnerConflictEntry{display:flex;flex-direction:column;gap:3px;padding:9px 10px;border-radius:9px;border:.5px solid rgba(245,158,11,.38);background:rgba(245,158,11,.07);font-size:11px;line-height:16px}",
+      ".dshRunnerConflictHead{display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-weight:600}",
+      ".dshRunnerConflictPort{font-family:ui-monospace,Consolas,'Courier New',monospace;color:#f59e0b}",
+      ".dshRunnerConflictMeta{opacity:.8;word-break:break-word}",
+      ".dshRunnerConflictCode{font-family:ui-monospace,Consolas,'Courier New',monospace;font-size:10px;line-height:15px;opacity:.72;word-break:break-all;max-height:52px;overflow:auto;user-select:text}",
+      ".dshRunnerConflictTag{flex:none;padding:0 6px;border-radius:999px;font-size:9px;line-height:15px;border:.5px solid rgba(245,158,11,.6);color:#f59e0b}",
+      ".dshRunnerDialogActions{display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap;padding-top:2px}",
+      ".dshRunnerDialogError{font-size:11px;line-height:16px;color:#f87171;background:rgba(239,68,68,.08);border-radius:8px;padding:6px 9px;word-break:break-word}",
+      ".dshRunnerDialogBusy{font-size:11px;opacity:.75}",
       // ---- 插件详情页更新区 ----
       ".dshLimobUpdateBadge{display:inline-flex;align-items:center;height:20px;padding:0 8px;border-radius:999px;border:.5px solid rgba(245,158,11,.5);background:rgba(245,158,11,.12);color:#f59e0b;font-size:11px;line-height:18px;white-space:nowrap}",
       ".dshLimobDetailSection{display:flex;flex-direction:column;gap:8px;padding:14px 16px;border:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));border-radius:10px;background:var(--dsw-alias-bg-layer-1,rgba(128,128,128,.06));font-size:12px;line-height:18px}",
@@ -691,14 +705,16 @@ window.__ModuleLoader__.load({
     function errorDetailText(error) {
       if (error === null || error === undefined) return "";
       var details = error.details;
-      if (error.code === "port-conflict" && details !== null && details !== undefined && typeof details === "object") {
-        var parts = [];
-        if (typeof details.port === "number") parts.push("端口 " + details.port + " 已被占用");
-        if (typeof details.pid === "number") parts.push("PID " + details.pid);
-        if (typeof details.processName === "string" && details.processName !== "") parts.push(details.processName);
-        if (typeof details.commandLine === "string" && details.commandLine !== "") parts.push(details.commandLine);
-        if (details.managed === true) parts.push("由本插件托管");
-        return parts.join(" · ");
+      if (error.code === "port-conflict" && details !== null && details !== undefined && Array.isArray(details.ports)) {
+        return details.ports.map(function (item) {
+          return "端口 " + String(item.port) + " · " + occupantSummary(item.occupant);
+        }).join("；");
+      }
+      if (error.code === "managed-port" && details !== null && details !== undefined && details.occupant !== undefined) {
+        return "端口 " + String(details.port) + " 由托管命令占用：" + occupantSummary(details.occupant);
+      }
+      if (error.code === "port-changed" && details !== null && details !== undefined && details.occupant !== undefined) {
+        return "端口 " + String(details.port) + " 已换成 " + occupantSummary(details.occupant);
       }
       if (error.code === "dependency-failed" && details !== null && details !== undefined && typeof details === "object") {
         return "依赖命令 " + String(details.commandId) + " 启动失败：" + String(details.message);
@@ -710,6 +726,49 @@ window.__ModuleLoader__.load({
         return JSON.stringify(details);
       }
       return "";
+    }
+
+    /** 占用者的简短描述：name（PID 1234）。 */
+    function occupantSummary(occupant) {
+      if (occupant === null || occupant === undefined) return "未知进程";
+      var name = typeof occupant.name === "string" && occupant.name !== "" ? occupant.name : "进程";
+      var suffix = typeof occupant.pid === "number" ? "（PID " + String(occupant.pid) + "）" : "";
+      return name + suffix;
+    }
+
+    /** 父进程链：cmd.exe（123）← Code.exe（45，窗口：项目 - Visual Studio Code）；没有祖先时返回空串。 */
+    function formatProcessChain(occupant) {
+      if (occupant === null || occupant === undefined || !Array.isArray(occupant.ancestors)) return "";
+      var parts = [];
+      for (var i = 0; i < occupant.ancestors.length; i += 1) {
+        var item = occupant.ancestors[i];
+        if (item === null || item === undefined) continue;
+        var name = typeof item.name === "string" && item.name !== "" ? item.name : "进程";
+        var title = typeof item.windowTitle === "string" && item.windowTitle !== "" ? "，窗口：" + item.windowTitle : "";
+        var pidText = typeof item.pid === "number" ? String(item.pid) : "?";
+        parts.push(name + "（" + pidText + title + "）");
+      }
+      return parts.join(" ← ");
+    }
+
+    /** 子进程摘要：a.exe（12）、b.exe（34），最多 6 个；没有返回空串。 */
+    function formatProcessChildren(occupant) {
+      if (occupant === null || occupant === undefined || !Array.isArray(occupant.children)) return "";
+      var parts = [];
+      for (var i = 0; i < occupant.children.length && i < 6; i += 1) {
+        var item = occupant.children[i];
+        if (item === null || item === undefined) continue;
+        var name = typeof item.name === "string" && item.name !== "" ? item.name : "进程";
+        parts.push(name + (typeof item.pid === "number" ? "（" + String(item.pid) + "）" : ""));
+      }
+      if (occupant.children.length > 6) parts.push("…");
+      return parts.join("、");
+    }
+
+    /** 是否是端口冲突错误（带完整占用者列表）。 */
+    function isPortConflictError(error) {
+      return error !== null && error !== undefined && error.code === "port-conflict"
+        && error.details !== null && error.details !== undefined && Array.isArray(error.details.ports);
     }
 
     // =====================================================================
@@ -1628,6 +1687,15 @@ window.__ModuleLoader__.load({
       var busyPair = react.useState(null);
       var busy = busyPair[0];
       var setBusy = busyPair[1];
+      var conflictPair = react.useState(null);
+      var conflict = conflictPair[0];
+      var setConflict = conflictPair[1];
+      var conflictBusyPair = react.useState(false);
+      var conflictBusy = conflictBusyPair[0];
+      var setConflictBusy = conflictBusyPair[1];
+      var conflictErrorPair = react.useState(null);
+      var conflictError = conflictErrorPair[0];
+      var setConflictError = conflictErrorPair[1];
       var editorPair = react.useState(false);
       var editorOpen = editorPair[0];
       var setEditorOpen = editorPair[1];
@@ -1758,9 +1826,12 @@ window.__ModuleLoader__.load({
           if (action !== "stop") setSelectedId(commandId);
           await refreshDiagnose();
         } catch (actionError) {
-          setError(actionError);
-          if (actionError !== null && actionError !== undefined && actionError.code === "port-conflict") {
+          if (isPortConflictError(actionError)) {
+            setError(null);
+            setConflict({ commandId: commandId, action: action, ports: actionError.details.ports });
             refreshDiagnose();
+          } else {
+            setError(actionError);
           }
         } finally {
           setBusy(null);
@@ -1775,7 +1846,19 @@ window.__ModuleLoader__.load({
           var value = await rpc("project/startAll", { projectPath: projectPath });
           if (value !== null && value !== undefined && Array.isArray(value.runners)) setRunners(value.runners);
           var failed = value !== null && value !== undefined && Array.isArray(value.failed) ? value.failed : [];
-          if (failed.length > 0) {
+          var conflictFailure = null;
+          for (var failedIndex = 0; failedIndex < failed.length; failedIndex += 1) {
+            var failedItem = failed[failedIndex];
+            if (failedItem !== null && failedItem !== undefined && failedItem.code === "port-conflict"
+              && failedItem.details !== null && failedItem.details !== undefined && Array.isArray(failedItem.details.ports)) {
+              conflictFailure = failedItem;
+              break;
+            }
+          }
+          if (conflictFailure !== null) {
+            setError(null);
+            setConflict({ commandId: conflictFailure.commandId, action: "startAll", ports: conflictFailure.details.ports });
+          } else if (failed.length > 0) {
             var first = failed[0] !== null && failed[0] !== undefined ? failed[0] : {};
             var label = typeof first.title === "string" && first.title !== "" ? first.title : String(first.commandId);
             var failure = rpcError(
@@ -1812,15 +1895,21 @@ window.__ModuleLoader__.load({
       async function handleKillPort(entry) {
         if (!hasProject || busy !== null || entry === null || entry === undefined) return;
         var port = entry.port;
-        var owner = "端口 " + String(port) + " 被 "
-          + (typeof entry.pid === "number" ? "PID " + entry.pid : "其它进程")
-          + (typeof entry.processName === "string" && entry.processName !== "" ? "（" + entry.processName + "）" : "")
-          + " 占用，确定结束该进程吗？";
+        var occupant = entry.occupant === null || entry.occupant === undefined ? undefined : entry.occupant;
+        var windowText = occupant !== undefined && typeof occupant.windowTitle === "string" && occupant.windowTitle !== ""
+          ? "（窗口：" + occupant.windowTitle + "）"
+          : "";
+        var owner = "端口 " + String(port) + " 被 " + occupantSummary(occupant) + windowText + " 占用，确定结束该进程吗？"
+          + (occupant !== undefined && typeof occupant.commandLine === "string" && occupant.commandLine !== "" ? "\n\n" + occupant.commandLine : "");
         if (!confirmAction(owner)) return;
         setBusy("kill-" + String(port));
         setError(null);
         try {
-          await rpc("project/killPort", { projectPath: projectPath, port: port });
+          await rpc("project/killPort", {
+            projectPath: projectPath,
+            port: port,
+            pid: occupant !== undefined && typeof occupant.pid === "number" ? occupant.pid : undefined
+          });
           await refreshDiagnose();
         } catch (killError) {
           setError(killError);
@@ -1858,6 +1947,75 @@ window.__ModuleLoader__.load({
         var pre = event !== null && event !== undefined ? event.currentTarget : undefined;
         if (pre === null || pre === undefined) return;
         stickRef.current = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 32;
+      }
+
+      /**
+       * 端口冲突确认后的处理：结束未托管进程 / 停止托管命令，然后自动重试启动。
+       * killPort 带 expected pid：若这期间端口换了主人，Host 会拒绝并返回 port-changed，避免误杀。
+       */
+      async function resolveConflict() {
+        if (conflict === null || conflict === undefined || conflictBusy) return;
+        setConflictBusy(true);
+        setConflictError(null);
+        try {
+          var items = Array.isArray(conflict.ports) ? conflict.ports : [];
+          for (var i = 0; i < items.length; i += 1) {
+            var item = items[i];
+            if (item === null || item === undefined) continue;
+            var occupant = item.occupant === null || item.occupant === undefined ? undefined : item.occupant;
+            if (occupant !== undefined && occupant.managed === true && typeof occupant.runnerCommandId === "string") {
+              await rpc("project/stop", { projectPath: projectPath, commandId: occupant.runnerCommandId });
+            } else {
+              await rpc("project/killPort", {
+                projectPath: projectPath,
+                port: item.port,
+                pid: occupant !== undefined && typeof occupant.pid === "number" ? occupant.pid : undefined
+              });
+            }
+          }
+          if (conflict.action === "startAll") {
+            var all = await rpc("project/startAll", { projectPath: projectPath });
+            if (all !== null && all !== undefined && Array.isArray(all.runners)) setRunners(all.runners);
+            var failed = all !== null && all !== undefined && Array.isArray(all.failed) ? all.failed : [];
+            var nextConflict = null;
+            for (var failedIndex = 0; failedIndex < failed.length; failedIndex += 1) {
+              var failedItem = failed[failedIndex];
+              if (failedItem !== null && failedItem !== undefined && failedItem.code === "port-conflict"
+                && failedItem.details !== null && failedItem.details !== undefined && Array.isArray(failedItem.details.ports)) {
+                nextConflict = failedItem;
+                break;
+              }
+            }
+            await refreshDiagnose();
+            if (nextConflict !== null) {
+              setConflict({ commandId: nextConflict.commandId, action: "startAll", ports: nextConflict.details.ports });
+              setConflictError(rpcError("port-conflict", String(nextConflict.message), nextConflict.details));
+              return;
+            }
+            if (failed.length > 0) {
+              var first = failed[0];
+              setError(rpcError("start-failed", "启动失败：" + String(first.message), first.details));
+            }
+            setConflict(null);
+            return;
+          }
+          var endpoint = conflict.action === "restart" ? "project/restart" : "project/start";
+          var value = await rpc(endpoint, { projectPath: projectPath, commandId: conflict.commandId });
+          if (value !== null && value !== undefined && Array.isArray(value.runners)) setRunners(value.runners);
+          setSelectedId(conflict.commandId);
+          await refreshDiagnose();
+          setConflict(null);
+        } catch (actionError) {
+          if (isPortConflictError(actionError)) {
+            setConflict({ commandId: conflict.commandId, action: conflict.action, ports: actionError.details.ports });
+            setConflictError(actionError);
+          } else {
+            setConflictError(actionError);
+          }
+          refreshDiagnose();
+        } finally {
+          setConflictBusy(false);
+        }
       }
 
       var commands = hasProject ? visibleCommandsForProject(config, projectPath) : [];
@@ -1997,18 +2155,25 @@ window.__ModuleLoader__.load({
       var unmanaged = [];
       for (var diagIndex = 0; diagIndex < diagnose.length; diagIndex += 1) {
         var entry = diagnose[diagIndex];
-        if (entry !== null && entry !== undefined && entry.listening === true && entry.managed !== true) unmanaged.push(entry);
+        if (entry !== null && entry !== undefined && entry.listening === true
+          && entry.occupant !== null && entry.occupant !== undefined && entry.occupant.managed !== true) {
+          unmanaged.push(entry);
+        }
       }
 
       var diagnoseSection = unmanaged.length === 0 ? null : h("div", { className: "dshRunnerDiag" },
         h("div", { className: "dshRunnerDiagTitle" }, "端口诊断：检测到未托管的端口占用"),
         unmanaged.map(function (item) {
-          var ownerText = "端口 " + String(item.port) + " 被 "
-            + (typeof item.pid === "number" ? "PID " + item.pid : "其它进程")
-            + (typeof item.processName === "string" && item.processName !== "" ? "（" + item.processName + "）" : "")
-            + " 占用"
-            + (typeof item.title === "string" && item.title !== "" ? "，期望命令：" + item.title : "")
-            + (typeof item.commandLine === "string" && item.commandLine !== "" ? " · " + item.commandLine : "");
+          var occupant = item.occupant;
+          var windowText = occupant !== undefined && typeof occupant.windowTitle === "string" && occupant.windowTitle !== ""
+            ? " · 窗口：" + occupant.windowTitle
+            : "";
+          var chain = formatProcessChain(occupant);
+          var ownerText = "端口 " + String(item.port) + " 被 " + occupantSummary(occupant) + " 占用"
+            + (typeof item.title === "string" && item.title !== "" ? "（期望命令：" + item.title + "）" : "")
+            + windowText
+            + (chain !== "" ? " · 父进程：" + chain : "")
+            + (occupant !== undefined && typeof occupant.commandLine === "string" && occupant.commandLine !== "" ? " · " + occupant.commandLine : "");
           return h("div", { key: "diag-" + String(item.port), className: "dshRunnerDiagRow" },
             h("span", { className: "dshRunnerDiagText" }, ownerText),
             h("button", {
@@ -2020,6 +2185,60 @@ window.__ModuleLoader__.load({
               onClick: function () { handleKillPort(item); }
             }, "结束占用进程"));
         }));
+
+      function renderConflictEntry(item, index) {
+        var occupant = item !== null && item !== undefined && item.occupant !== null && item.occupant !== undefined
+          ? item.occupant
+          : undefined;
+        var windowTitle = occupant !== undefined && typeof occupant.windowTitle === "string" ? occupant.windowTitle : "";
+        var commandLine = occupant !== undefined && typeof occupant.commandLine === "string" ? occupant.commandLine : "";
+        var chain = formatProcessChain(occupant);
+        var children = formatProcessChildren(occupant);
+        var managed = occupant !== undefined && occupant.managed === true;
+        return h("div", { key: "conflict-" + String(index), className: "dshRunnerConflictEntry", "data-port": item.port },
+          h("div", { className: "dshRunnerConflictHead" },
+            h("span", { className: "dshRunnerConflictPort" }, "端口 " + String(item.port)),
+            h("span", null, occupantSummary(occupant)),
+            h("span", { className: "dshRunnerConflictTag" }, managed ? "本插件托管" : "外部进程"),
+            windowTitle !== "" ? h("span", { className: "dshRunnerConflictTag", title: windowTitle }, "窗口：" + windowTitle) : null),
+          managed && occupant !== undefined
+            ? h("div", { className: "dshRunnerConflictMeta" },
+                "该端口由已托管命令「" + String(occupant.runnerTitle === undefined ? occupant.runnerCommandId : occupant.runnerTitle) + "」占用，确认后将先停止该命令")
+            : null,
+          commandLine !== "" ? h("div", { className: "dshRunnerConflictCode", title: commandLine }, commandLine) : null,
+          chain !== "" ? h("div", { className: "dshRunnerConflictMeta" }, "父进程链：" + chain) : null,
+          children !== "" ? h("div", { className: "dshRunnerConflictMeta" }, "子进程：" + children) : null);
+      }
+
+      var conflictDialog = conflict === null || conflict === undefined ? null : h("div", {
+        className: "dshRunnerDialogBackdrop",
+        onMouseDown: function (event) {
+          if (event.target === event.currentTarget && !conflictBusy) setConflict(null);
+        }
+      },
+        h("div", { className: "dshRunnerDialog", "data-dsh-runner-conflict": "1" },
+          h("div", { className: "dshRunnerDialogHead" }, "端口被占用"),
+          h("div", { className: "dshRunnerDialogSub" },
+            "启动「" + titleOfCommand(conflict.commandId) + "」需要先处理以下端口占用。确认后会结束外部占用进程 / 停止对应托管命令，并自动重试启动。"),
+          (Array.isArray(conflict.ports) ? conflict.ports : []).map(renderConflictEntry),
+          conflictError !== null ? h("div", { className: "dshRunnerDialogError", "data-dsh-runner-error": "1" },
+            messageOf(conflictError) + (errorDetailText(conflictError) !== "" ? " · " + errorDetailText(conflictError) : "")) : null,
+          conflictBusy ? h("div", { className: "dshRunnerDialogBusy" }, "正在处理端口占用并重试启动…") : null,
+          h("div", { className: "dshRunnerDialogActions" },
+            h("button", {
+              type: "button",
+              className: "dshLimobCfgBtn",
+              "data-action": "cancel-conflict",
+              disabled: conflictBusy,
+              onClick: function () { if (!conflictBusy) setConflict(null); }
+            }, "取消"),
+            h("button", {
+              type: "button",
+              className: "dshLimobCfgBtn dshLimobCfgBtnPrimary",
+              "data-action": "kill-and-start",
+              disabled: conflictBusy,
+              onClick: resolveConflict
+            }, conflictBusy ? "处理中…" : "结束占用进程并启动"))));
 
       var editorModal = !editorOpen ? null : h("div", {
         className: "dshLimobCfgModalBackdrop",
@@ -2090,6 +2309,7 @@ window.__ModuleLoader__.load({
             : h("div", { className: "dshRunnerList" }, commands.map(renderRow)),
           logPane),
         diagnoseSection,
+        conflictDialog,
         editorModal);
     }
 
@@ -2385,7 +2605,10 @@ window.__ModuleLoader__.load({
       formatBytes: formatBytes,
       commandMatchesProject: commandMatchesProject,
       visibleCommandsForProject: visibleCommandsForProject,
-      runnerStatusText: runnerStatusText
+      runnerStatusText: runnerStatusText,
+      occupantSummary: occupantSummary,
+      formatProcessChain: formatProcessChain,
+      formatProcessChildren: formatProcessChildren
     };
 
     return module.exports;

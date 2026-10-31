@@ -244,14 +244,24 @@ try {
     (error) => {
       assert.ok(error instanceof RunnerError, "端口冲突应抛 RunnerError");
       assert.equal(error.code, "port-conflict");
-      assert.equal(error.details.port, occupantPort);
-      assert.equal(error.details.pid, occupant.pid, "details 应带占用者 pid");
-      assert.equal(error.details.managed, false, "外部进程不应标记为托管");
-      assert.ok(typeof error.details.processName === "string" && error.details.processName !== "", "details 应带进程名");
+      assert.ok(Array.isArray(error.details.ports), "port-conflict 应带 ports 列表");
+      assert.equal(error.details.ports.length, 1);
+      const conflict = error.details.ports[0];
+      assert.equal(conflict.port, occupantPort);
+      const occupantInfo = conflict.occupant;
+      assert.ok(occupantInfo !== null && typeof occupantInfo === "object");
+      assert.equal(occupantInfo.pid, occupant.pid, "occupant 应带占用者 pid");
+      assert.equal(occupantInfo.managed, false, "外部进程不应标记为托管");
+      assert.ok(typeof occupantInfo.name === "string" && occupantInfo.name !== "", "occupant 应带进程名");
       assert.ok(
-        typeof error.details.commandLine === "string" && error.details.commandLine.includes("listen.cjs"),
-        "details 应带命令行"
+        typeof occupantInfo.commandLine === "string" && occupantInfo.commandLine.includes("listen.cjs"),
+        "occupant 应带命令行"
       );
+      assert.ok(Array.isArray(occupantInfo.ancestors), "occupant 应带父进程链");
+      assert.ok(occupantInfo.ancestors.length > 0, "外部 node 进程应有父进程");
+      assert.ok(Array.isArray(occupantInfo.children), "occupant 应带子进程列表");
+      assert.ok(typeof occupantInfo.windowTitle === "string", "occupant 应带窗口标题字段");
+      assert.ok(String(error.message).includes(occupantInfo.name), "错误消息应带进程名");
       return true;
     }
   );
@@ -260,20 +270,32 @@ try {
   const occupiedEntry = diagnoseEntries.find((entry) => entry.port === occupantPort);
   assert.ok(occupiedEntry !== undefined, "diagnose 应包含该端口");
   assert.equal(occupiedEntry.listening, true);
-  assert.equal(occupiedEntry.managed, false);
-  assert.equal(occupiedEntry.pid, occupant.pid);
+  assert.equal(occupiedEntry.occupant.pid, occupant.pid);
+  assert.equal(occupiedEntry.occupant.managed, false);
   assert.equal(occupiedEntry.commandId, "conflict");
   assert.equal(occupiedEntry.title, "冲突命令");
 
-  const killedResult = await runner.killPort(projectRoot, occupantPort);
+  // 确认后端口换了主人：expected pid 不一致时必须拒绝，避免误杀
+  await assert.rejects(
+    () => runner.killPort(projectRoot, occupantPort, occupant.pid + 1),
+    (error) => {
+      assert.equal(error.code, "port-changed");
+      assert.equal(error.details.pid, occupant.pid);
+      assert.equal(error.details.expectedPid, occupant.pid + 1);
+      return true;
+    }
+  );
+
+  const killedResult = await runner.killPort(projectRoot, occupantPort, occupant.pid);
   assert.equal(killedResult.killed, true);
   assert.equal(killedResult.pid, occupant.pid);
+  assert.equal(killedResult.occupant.pid, occupant.pid);
   await waitFor(async () => !(await canConnect(occupantPort)), 8000, "killPort 后端口释放");
   const afterKillDiagnose = await runner.diagnose(conflictCommands, projectRoot);
   const releasedEntry = afterKillDiagnose.find((entry) => entry.port === occupantPort);
   assert.ok(releasedEntry !== undefined);
   assert.equal(releasedEntry.listening, false, "killPort 后 diagnose 应显示端口未监听");
-  assert.equal(releasedEntry.managed, false);
+  assert.equal(releasedEntry.occupant, undefined);
 
   const conflictStarted = await runner.start(conflictCommand, projectRoot, { commands: conflictCommands });
   assert.equal(conflictStarted.status, "running");
@@ -300,15 +322,17 @@ try {
   const readyEntry = readyDiagnose.find((entry) => entry.port === readyPort);
   assert.ok(readyEntry !== undefined);
   assert.equal(readyEntry.listening, true);
-  assert.equal(readyEntry.managed, true, "监听进程应属于运行中 runner 的进程树");
-  assert.equal(readyEntry.runnerCommandId, "ready");
+  assert.equal(readyEntry.occupant.managed, true, "监听进程应属于运行中 runner 的进程树");
+  assert.equal(readyEntry.occupant.runnerCommandId, "ready");
+  assert.equal(readyEntry.occupant.runnerTitle, "就绪服务");
 
   await assert.rejects(
-    () => runner.killPort(projectRoot, readyPort),
+    () => runner.killPort(projectRoot, readyPort, readyEntry.occupant.pid),
     (error) => {
       assert.ok(error instanceof RunnerError);
       assert.equal(error.code, "managed-port", "托管 runner 的端口不允许 killPort");
       assert.equal(error.details.runnerCommandId, "ready");
+      assert.equal(error.details.occupant.managed, true);
       return true;
     }
   );

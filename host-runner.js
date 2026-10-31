@@ -219,8 +219,10 @@ function queryProcessTable(pids) {
 }
 
 /**
- * 一次查询整张进程表：pid -> {parentPid, name, commandLine}。
- * 用于端口诊断/端口冲突的「进程树归属」判定，避免对每个祖先进程单独起 PowerShell。
+ * 一次查询整张进程表：pid -> {parentPid, name, commandLine, executablePath, createdAt, windowTitle}。
+ * 用于端口诊断/端口冲突的「进程树归属」判定与占用者展示。
+ * 窗口标题取自主窗口（MainWindowTitle）：Electron/IDE 这类应用足以让用户认出是哪个程序；
+ * 纯控制台进程通常没有主窗口，windowTitle 为空。
  */
 function queryProcessSnapshot() {
   if (process.platform !== "win32") {
@@ -230,36 +232,114 @@ function queryProcessSnapshot() {
     for (const line of String(result.stdout === undefined || result.stdout === null ? "" : result.stdout).split(/\r?\n/)) {
       const match = /^\s*(\d+)\s+(\d+)\s+(\S+)\s*(.*)$/.exec(line);
       if (match === null) continue;
-      map.set(Number(match[1]), { parentPid: Number(match[2]), name: match[3], commandLine: match[4] });
+      map.set(Number(match[1]), {
+        parentPid: Number(match[2]),
+        name: match[3],
+        commandLine: match[4],
+        executablePath: "",
+        createdAt: "",
+        windowTitle: ""
+      });
     }
     return map;
   }
-  const script = "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId)|$($_.ParentProcessId)|$($_.Name)|$($_.CommandLine)\" }";
+  const script = [
+    "$procs = Get-CimInstance Win32_Process",
+    "if ($null -eq $procs) { throw 'Get-CimInstance Win32_Process 返回空' }",
+    "$wins = @{}",
+    "foreach ($item in (Get-Process -ErrorAction SilentlyContinue)) {",
+    "  try { $title = $item.MainWindowTitle; if ($title) { $wins[[int]$item.Id] = [string]$title } } catch { }",
+    "}",
+    "$rows = foreach ($p in $procs) {",
+    "  $procId = [int]$p.ProcessId",
+    "  [pscustomobject]@{",
+    "    pid = $procId",
+    "    ppid = [int]$p.ParentProcessId",
+    "    name = [string]$p.Name",
+    "    exe = [string]$p.ExecutablePath",
+    "    created = if ($p.CreationDate) { $p.CreationDate.ToString('o') } else { '' }",
+    "    cmd = [string]$p.CommandLine",
+    "    win = if ($wins.ContainsKey($procId)) { [string]$wins[$procId] } else { '' }",
+    "  }",
+    "}",
+    "ConvertTo-Json -InputObject @($rows) -Depth 3 -Compress"
+  ].join("\n");
   const result = spawnSync(resolvePowerShell(), ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], {
     encoding: "utf8",
     windowsHide: true,
-    timeout: 20000
+    timeout: 20000,
+    maxBuffer: 8 * 1024 * 1024
   });
   if (result.error !== undefined && result.error !== null) throw result.error;
   if (typeof result.stdout !== "string") throw new Error("无法读取 Windows 进程表");
+  const text = result.stdout.trim();
+  if (text === "") throw new Error("Windows 进程表为空");
+  let rows;
+  try {
+    rows = JSON.parse(text);
+  } catch (error) {
+    throw new Error("解析 Windows 进程表失败：" + messageOf(error));
+  }
   const map = new Map();
-  for (const line of result.stdout.split(/\r?\n/)) {
-    const first = line.indexOf("|");
-    if (first <= 0) continue;
-    const second = line.indexOf("|", first + 1);
-    if (second === -1) continue;
-    const third = line.indexOf("|", second + 1);
-    if (third === -1) continue;
-    const pid = Number(line.slice(0, first).trim());
+  for (const row of Array.isArray(rows) ? rows : [rows]) {
+    if (row === null || typeof row !== "object") continue;
+    const pid = Number(row.pid);
     if (!Number.isFinite(pid)) continue;
     map.set(pid, {
-      parentPid: Number(line.slice(first + 1, second).trim()),
-      name: line.slice(second + 1, third),
-      commandLine: line.slice(third + 1)
+      parentPid: Number.isFinite(Number(row.ppid)) ? Number(row.ppid) : 0,
+      name: typeof row.name === "string" ? row.name : "",
+      commandLine: typeof row.cmd === "string" ? row.cmd : "",
+      executablePath: typeof row.exe === "string" ? row.exe : "",
+      createdAt: typeof row.created === "string" ? row.created : "",
+      windowTitle: typeof row.win === "string" ? row.win : ""
     });
   }
   return map;
 }
+
+/**
+ * 把一个 pid 描述成用户可读的占用者：
+ * 基础信息 + 主窗口标题 + 父进程链（最多 6 层）+ 直接子进程（最多 10 个）。
+ */
+function describeOccupant(pid, snapshot) {
+  const info = snapshot.get(pid);
+  const occupant = {
+    pid: pid,
+    name: info !== undefined && typeof info.name === "string" ? info.name : "",
+    executablePath: info !== undefined && typeof info.executablePath === "string" ? info.executablePath : "",
+    commandLine: info !== undefined && typeof info.commandLine === "string" ? info.commandLine : "",
+    startedAt: info !== undefined && typeof info.createdAt === "string" ? info.createdAt : "",
+    windowTitle: info !== undefined && typeof info.windowTitle === "string" ? info.windowTitle : "",
+    ancestors: [],
+    children: []
+  };
+  const seen = new Set([pid]);
+  let current = info !== undefined ? info.parentPid : undefined;
+  for (let depth = 0; depth < 6 && Number.isInteger(current) && current > 0 && !seen.has(current); depth += 1) {
+    const parent = snapshot.get(current);
+    if (parent === undefined) break;
+    occupant.ancestors.push({
+      pid: current,
+      name: parent.name,
+      commandLine: parent.commandLine,
+      windowTitle: parent.windowTitle
+    });
+    seen.add(current);
+    current = parent.parentPid;
+  }
+  for (const entry of snapshot.values()) {
+    if (entry.parentPid !== pid) continue;
+    if (occupant.children.length >= 10) break;
+    occupant.children.push({
+      pid: entry.pid,
+      name: entry.name,
+      commandLine: entry.commandLine,
+      windowTitle: entry.windowTitle
+    });
+  }
+  return occupant;
+}
+
 
 /**
  * 查询一组端口的监听进程：port -> pid。
@@ -673,35 +753,44 @@ export class ProjectRunnerService {
     return projectPath;
   }
 
-  /** 启动前端口预检：端口被占时抛 port-conflict（含占用者信息）。 */
+  /** 启动前端口预检：任何声明端口被占时抛 port-conflict（附带占用者完整信息）。 */
   async assertPortsFree(command) {
     const ports = Array.isArray(command.ports) ? command.ports.filter((port) => Number.isInteger(port)) : [];
     if (ports.length === 0) return;
     const listeners = queryListeners(ports);
-    if (listeners.size === 0) return;
-    const occupied = ports.find((port) => listeners.has(port));
-    if (occupied === undefined) return;
-    const pid = listeners.get(occupied);
+    const occupiedPorts = ports.filter((port) => listeners.has(port));
+    if (occupiedPorts.length === 0) return;
     let snapshot;
     try {
       snapshot = queryProcessSnapshot();
     } catch (error) {
-      throw new RunnerError("internal", "无法识别占用端口 " + String(occupied) + " 的进程：" + messageOf(error), { port: occupied, pid: pid });
+      throw new RunnerError(
+        "internal",
+        "无法识别占用端口 " + occupiedPorts.join("、") + " 的进程：" + messageOf(error),
+        { ports: occupiedPorts }
+      );
     }
-    const info = snapshot.get(pid);
-    const managed = this.findManagedRunner(pid, snapshot);
-    const details = {
-      port: occupied,
-      pid: pid,
-      processName: info === undefined ? undefined : info.name,
-      commandLine: info === undefined ? undefined : info.commandLine,
-      managed: managed.managed
-    };
-    if (managed.runnerCommandId !== undefined) details.runnerCommandId = managed.runnerCommandId;
+    const conflicts = occupiedPorts.map((port) => {
+      const pid = listeners.get(port);
+      const occupant = describeOccupant(pid, snapshot);
+      const managed = this.findManagedRunner(pid, snapshot);
+      occupant.managed = managed.managed;
+      if (managed.runnerCommandId !== undefined) {
+        occupant.runnerCommandId = managed.runnerCommandId;
+        const record = [...this.records.values()].find((item) => item.commandId === managed.runnerCommandId);
+        if (record !== undefined) occupant.runnerTitle = record.title;
+      }
+      return { port: port, occupant: occupant };
+    });
+    const first = conflicts[0];
+    const owner = first.occupant.name === ""
+      ? "PID " + String(first.occupant.pid)
+      : first.occupant.name + "（PID " + String(first.occupant.pid) + "）";
     throw new RunnerError(
       "port-conflict",
-      "端口 " + String(occupied) + " 已被进程 " + String(pid) + (info !== undefined && info.name !== "" ? "（" + info.name + "）" : "") + " 占用",
-      details
+      "端口 " + String(first.port) + " 已被 " + owner + " 占用"
+        + (conflicts.length > 1 ? "（共 " + String(conflicts.length) + " 个端口被占用）" : ""),
+      { ports: conflicts }
     );
   }
 
@@ -761,15 +850,17 @@ export class ProjectRunnerService {
       } catch (error) {
         failed.push({
           commandId: command.id,
+          title: command.title,
           code: error instanceof RunnerError ? error.code : "internal",
-          message: messageOf(error)
+          message: messageOf(error),
+          details: error instanceof RunnerError ? error.details : undefined
         });
       }
     }
     return { started: started, failed: failed, runners: this.list(workspace) };
   }
 
-  /** 端口诊断：项目内每条命令的每个 ports 端口一项，标记监听者与是否归属托管进程树。 */
+  /** 端口诊断：项目内每条命令的每个 ports 端口一项，附带占用者完整信息与托管归属。 */
   async diagnose(commands, projectPath) {
     await this.init();
     if (!Array.isArray(commands)) throw new RunnerError("bad-request", "diagnose 需要命令列表", {});
@@ -803,18 +894,19 @@ export class ProjectRunnerService {
         const entry = {
           port: port,
           listening: listening,
-          managed: false,
           commandId: command.id,
           title: command.title
         };
         if (listening) {
-          const info = snapshot.get(pid);
-          entry.pid = pid;
-          entry.processName = info === undefined ? undefined : info.name;
-          entry.commandLine = info === undefined ? undefined : info.commandLine;
+          const occupant = describeOccupant(pid, snapshot);
           const managed = this.findManagedRunner(pid, snapshot);
-          entry.managed = managed.managed;
-          if (managed.runnerCommandId !== undefined) entry.runnerCommandId = managed.runnerCommandId;
+          occupant.managed = managed.managed;
+          if (managed.runnerCommandId !== undefined) {
+            occupant.runnerCommandId = managed.runnerCommandId;
+            const record = [...this.records.values()].find((item) => item.commandId === managed.runnerCommandId);
+            if (record !== undefined) occupant.runnerTitle = record.title;
+          }
+          entry.occupant = occupant;
         }
         entries.push(entry);
       }
@@ -822,11 +914,18 @@ export class ProjectRunnerService {
     return entries;
   }
 
-  /** 结束端口占用进程；托管 runner 的端口不杀（managed-port）。 */
-  async killPort(projectPath, port) {
+  /**
+   * 结束端口占用进程。
+   * - expectedPid：调用方看到并确认过的 pid；若端口已换成另一个进程则抛 port-changed，避免误杀。
+   * - 托管 runner 的端口不杀（managed-port），让用户去停止对应命令。
+   */
+  async killPort(projectPath, port, expectedPid) {
     await this.init();
     if (!Number.isInteger(port) || port < 0 || port > MAX_PORT) {
       throw new RunnerError("bad-request", "port 必须是 0–" + MAX_PORT + " 的整数", { port: port });
+    }
+    if (expectedPid !== undefined && expectedPid !== null && (!Number.isInteger(expectedPid) || expectedPid <= 0)) {
+      throw new RunnerError("bad-request", "pid 必须是正整数", { pid: expectedPid });
     }
     const listeners = queryListeners([port]);
     const pid = listeners.get(port);
@@ -837,21 +936,35 @@ export class ProjectRunnerService {
     } catch (error) {
       throw new RunnerError("internal", "无法读取进程表：" + messageOf(error), { port: port });
     }
+    const occupant = describeOccupant(pid, snapshot);
+    if (Number.isInteger(expectedPid) && expectedPid !== pid) {
+      throw new RunnerError(
+        "port-changed",
+        "端口 " + String(port) + " 现在被另一个进程占用（PID " + String(pid) + "），请重新确认",
+        { port: port, pid: pid, expectedPid: expectedPid, occupant: occupant }
+      );
+    }
     const managed = this.findManagedRunner(pid, snapshot);
+    occupant.managed = managed.managed;
+    if (managed.runnerCommandId !== undefined) {
+      occupant.runnerCommandId = managed.runnerCommandId;
+      const record = [...this.records.values()].find((item) => item.commandId === managed.runnerCommandId);
+      if (record !== undefined) occupant.runnerTitle = record.title;
+    }
     if (managed.managed) {
       throw new RunnerError(
         "managed-port",
-        "端口 " + String(port) + " 由托管命令「" + String(managed.runnerCommandId) + "」占用，不能结束",
-        { runnerCommandId: managed.runnerCommandId }
+        "端口 " + String(port) + " 由托管命令「" + String(occupant.runnerTitle === undefined ? managed.runnerCommandId : occupant.runnerTitle) + "」占用，不能从端口入口结束；请先停止该命令",
+        { port: port, occupant: occupant, runnerCommandId: managed.runnerCommandId }
       );
     }
     this.killProcess(pid, true);
     const deadline = Date.now() + 3000;
     while (Date.now() < deadline) {
-      if (!queryListeners([port]).has(port)) return { killed: true, pid: pid };
+      if (!queryListeners([port]).has(port)) return { killed: true, pid: pid, occupant: occupant };
       await sleep(150);
     }
-    throw new RunnerError("kill-failed", "无法结束占用端口 " + String(port) + " 的进程 " + String(pid), { port: port, pid: pid });
+    throw new RunnerError("kill-failed", "无法结束占用端口 " + String(port) + " 的进程 " + String(pid), { port: port, pid: pid, occupant: occupant });
   }
 
   /** 监听进程 pid 是否等于某个运行中 runner 的 pid，或属于其进程树（向上找祖先）。 */

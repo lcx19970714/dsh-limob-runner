@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.13.0
+
+### Added（端口占用交互）
+
+- **启动冲突对话框**：启动命令前如果 `ports` 被占用，面板不再只丢一条错误，而是弹出确认框，逐端口展示：
+  进程名 / PID / 主窗口标题 / 完整命令行 / 父进程链（含祖先窗口标题，如「Code.exe（100，窗口：项目 - Visual Studio Code）」）/
+  直接子进程 / 是否由本插件托管。
+- **一键处理并重试**：确认后对**外部进程**逐个 `project/killPort`（带 expected pid 校验，端口期间换主人会拒绝并提示，
+  不误杀），对**托管进程**改为先停止对应命令，然后自动重试启动；失败会保留对话框并显示原因。
+- **端口诊断升级**：`project/diagnose` 返回统一的 `occupant` 结构（同样包含窗口/父进程链/子进程），
+  面板诊断区展示更完整信息；「结束占用进程」同样带 PID 校验。
+- **AI 工具**：`dsh_runner_run` 新增 `killPort` action（`port` + 可选 `pid`），AI 可先 `diagnose` 再按需清理。
+
+### Changed
+
+- `port-conflict` 错误 details 改为 `{ ports: [{ port, occupant }] }`（不再保留旧的扁平 `pid/processName` 字段）；
+  `project/killPort` 新增可选 `pid` 参数，用于确认后校验。旧的错误字段形状不保留。
+
 ## 0.12.0
 
 ### Added（VS Code 式「运行」面板）

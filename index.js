@@ -331,8 +331,11 @@ async function dispatch(runner, endpoint, payload, logger) {
   if (endpoint === "project/killPort") {
     const projectPath = requireProjectPath(data);
     if (!Number.isInteger(data.port)) throw new RpcError("bad-request", "project/killPort 需要 {projectPath, port}", { port: data.port });
-    const result = await runner.killPort(projectPath, data.port);
-    return { killed: result.killed, pid: result.pid };
+    if (data.pid !== undefined && data.pid !== null && (!Number.isInteger(data.pid) || data.pid <= 0)) {
+      throw new RpcError("bad-request", "project/killPort 的 pid 必须是正整数", { pid: data.pid });
+    }
+    const result = await runner.killPort(projectPath, data.port, data.pid === undefined || data.pid === null ? undefined : data.pid);
+    return { killed: result.killed, pid: result.pid, occupant: result.occupant };
   }
   if (endpoint === "project/log") {
     const projectPath = requireProjectPath(data);
@@ -513,7 +516,8 @@ function registerRunTool(ctx, runner, logger) {
       "Start/stop/inspect long-running project services managed by dsh-runner. "
       + "action=status shows the project's runners; start/stop/restart operate one command; "
       + "startAll starts every enabled project-scope command in dependency order; stopAll stops them all; "
-      + "diagnose reports TCP ports occupied by non-managed processes; log returns the tail of a command's log. "
+      + "diagnose reports TCP ports occupied by non-managed processes (process name/PID/window title/parent chain); "
+      + "killPort ends a confirmed non-managed port occupant (optionally verifying its pid); log returns the tail of a command's log. "
       + "Use this Tool to start and stop long-running services (dev servers, watchers, backends). "
       + "Do NOT use terminal tools for long-running services — terminal tools are for short-lived commands; "
       + "services started in a terminal die with the tool session and have no managed log/port diagnostics. "
@@ -522,11 +526,13 @@ function registerRunTool(ctx, runner, logger) {
       action: {
         type: "string",
         required: true,
-        enum: ["status", "start", "stop", "restart", "startAll", "stopAll", "diagnose", "log"],
-        description: "status | start | stop | restart | startAll | stopAll | diagnose | log"
+        enum: ["status", "start", "stop", "restart", "startAll", "stopAll", "diagnose", "killPort", "log"],
+        description: "status | start | stop | restart | startAll | stopAll | diagnose | killPort | log"
       },
       projectPath: { type: "string", description: "Project path; defaults to the workspace that owns the current session." },
       commandId: { type: "string", description: "Command id for start/stop/restart/log; get it from dsh_runner_config action=list." },
+      port: { type: "integer", description: "killPort only: TCP port whose non-managed occupant should be ended." },
+      pid: { type: "integer", description: "killPort only: expected occupant pid from diagnose; rejects if the port changed hands." },
       maxBytes: { type: "integer", description: "log only: max bytes of the tail to read (1024-1048576), default 65536." }
     },
     output: {
@@ -577,6 +583,16 @@ function registerRunTool(ctx, runner, logger) {
         const loaded = await loadHostConfig(logger);
         const entries = await runner.diagnose(loaded.config.commands, projectPath);
         return { entries: entries };
+      }
+      if (args.action === "killPort") {
+        if (!Number.isInteger(args.port) || args.port < 0 || args.port > 65535) {
+          throw new Error("killPort 需要 0-65535 的整数 port");
+        }
+        if (args.pid !== undefined && args.pid !== null && (!Number.isInteger(args.pid) || args.pid <= 0)) {
+          throw new Error("killPort 的 pid 必须是正整数");
+        }
+        const result = await runner.killPort(projectPath, args.port, args.pid === undefined || args.pid === null ? undefined : args.pid);
+        return { killed: result.killed, pid: result.pid, occupant: result.occupant };
       }
       if (args.action === "log") {
         const commandId = typeof args.commandId === "string" ? args.commandId.trim() : "";
